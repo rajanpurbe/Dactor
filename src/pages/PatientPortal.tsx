@@ -1211,7 +1211,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       return
     }
 
-    // If unauthenticated (Guest / Demo mode), save booking position and prompt Google Sign-In
+    // If unauthenticated (Guest / Demo mode), save booking position and redirect to login page
     if (!patientUser) {
       const pendingRedirect = {
         clinicId: selectedClinic?.id,
@@ -1223,12 +1223,18 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         selectedSlotId: selectedSlot?.id,
         isReturningPatient,
         followupCodeInput,
+        returnRoute: 'patient-portal',
       }
       try {
         localStorage.setItem('dactor_pending_booking_redirect', JSON.stringify(pendingRedirect))
+        localStorage.setItem('dactor_booking_login_notice', 'Please sign in with Google to book an appointment')
       } catch {}
       setPendingBookingRedirectNotice(true)
-      setShowAuthModal(true)
+      if (onNavigate) {
+        onNavigate('login')
+      } else {
+        setShowAuthModal(true)
+      }
       return
     }
 
@@ -2031,6 +2037,23 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
               <button
                 key={tab.id}
                 onClick={() => {
+                  if (tab.id === 'book' && !patientUser) {
+                    const pendingRedirect = {
+                      bookingMode: 'opd',
+                      returnRoute: 'patient-portal',
+                    }
+                    try {
+                      localStorage.setItem('dactor_pending_booking_redirect', JSON.stringify(pendingRedirect))
+                      localStorage.setItem('dactor_booking_login_notice', 'Please sign in with Google to book an appointment')
+                    } catch {}
+                    if (onNavigate) {
+                      onNavigate('login')
+                    } else {
+                      setPendingBookingRedirectNotice(true)
+                      setShowAuthModal(true)
+                    }
+                    return
+                  }
                   setActiveTab(tab.id as any)
                   if (tab.id === 'book') setBookingStep(1)
                 }}
