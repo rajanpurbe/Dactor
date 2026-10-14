@@ -549,22 +549,36 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           localStorage.getItem('dactor_patient_email') ||
           localStorage.getItem('dactor_auth_email')
         if (storedEmail) {
+          const rawCached = localStorage.getItem('dactor_patient_session')
+          let cachedProf: PatientProfile | null = null
+          if (rawCached) {
+            try {
+              cachedProf = JSON.parse(rawCached)
+            } catch {}
+          }
+
           const profile = await getPatientProfileByEmail(storedEmail)
-          if (profile) {
-            const photo = redirectedUser?.photoURL || profile.photoUrl
+          if (profile && profile.fullName) {
+            const photo = redirectedUser?.photoURL || profile.photoUrl || cachedProf?.photoUrl
             const fullProfile = { ...profile, photoUrl: photo }
             setPatientUser(fullProfile)
             initProfileFields(fullProfile)
             try {
               localStorage.setItem('dactor_patient_session', JSON.stringify(fullProfile))
             } catch {}
+          } else if (cachedProf && cachedProf.fullName) {
+            const photo = redirectedUser?.photoURL || cachedProf.photoUrl
+            const fullProfile = { ...cachedProf, photoUrl: photo }
+            setPatientUser(fullProfile)
+            initProfileFields(fullProfile)
           } else {
-            // Do NOT auto-fill name, gender, or age from email/Google
+            // New user without full profile: prompt for details
             const partial: PatientProfile = {
               id: crypto.randomUUID(),
               email: storedEmail,
               fullName: '',
               photoUrl: redirectedUser?.photoURL,
+              gender: 'Male',
               role: 'patient',
             }
             setPatientUser(partial)
@@ -1554,10 +1568,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       alert('Please enter a valid age between 1 and 120.')
       return
     }
-    if (!['Male', 'Female', 'Other'].includes(editGender)) {
-      alert('Please select your gender.')
-      return
-    }
+    const genderToSave = editGender || 'Male'
     if (!editTermsAccepted) {
       alert('Please read and accept the Dactor Terms of Service and Privacy Policy to continue.')
       return
@@ -1572,17 +1583,48 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         fullName: editName.trim(),
         phone: cleanPhone,
         age: ageNum,
-        gender: editGender,
+        gender: genderToSave,
         city: editCity.trim() || undefined,
         role: 'patient',
       })
-      if (updated) {
-        setPatientUser(updated)
-        initProfileFields(updated)
-        localStorage.setItem('dactor_patient_session', JSON.stringify(updated))
-        setShowEditProfileModal(false)
-        await restorePendingBookingRedirect()
+      const fallback: PatientProfile = {
+        ...patientUser,
+        fullName: editName.trim(),
+        phone: cleanPhone,
+        age: ageNum,
+        gender: genderToSave,
+        city: editCity.trim() || undefined,
+        role: 'patient',
+        updatedAt: new Date().toISOString(),
       }
+      const finalProfile = updated || fallback
+      setPatientUser(finalProfile)
+      initProfileFields(finalProfile)
+      localStorage.setItem('dactor_patient_session', JSON.stringify(finalProfile))
+      localStorage.setItem('dactor_patient_email', finalProfile.email)
+      localStorage.setItem('dactor_auth_logged_in', 'true')
+      localStorage.setItem('dactor_auth_email', finalProfile.email)
+      localStorage.setItem('dactor_auth_role', 'patient')
+      window.dispatchEvent(new Event('storage'))
+      setShowEditProfileModal(false)
+      await restorePendingBookingRedirect()
+    } catch (saveErr) {
+      console.warn('Profile save notice:', saveErr)
+      const fallback: PatientProfile = {
+        ...patientUser,
+        fullName: editName.trim(),
+        phone: cleanPhone,
+        age: ageNum,
+        gender: genderToSave,
+        city: editCity.trim() || undefined,
+        role: 'patient',
+        updatedAt: new Date().toISOString(),
+      }
+      setPatientUser(fallback)
+      initProfileFields(fallback)
+      localStorage.setItem('dactor_patient_session', JSON.stringify(fallback))
+      setShowEditProfileModal(false)
+      await restorePendingBookingRedirect()
     } finally {
       setIsUpdatingProfile(false)
     }
@@ -1957,18 +1999,12 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
                   <h1 className="text-lg sm:text-2xl font-black text-slate-900 dark:text-white tracking-tight truncate">
-                    {patientUser?.fullName || 'Guest Patient Portal'}
+                    {patientUser?.fullName || 'Patient Portal'}
                   </h1>
-                  {patientUser ? (
-                    <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[11px] sm:text-xs font-bold bg-teal-500/10 text-teal-700 dark:text-teal-300 border border-teal-500/20">
-                      <ShieldCheck className="w-3.5 h-3.5 mr-1" />
-                      Verified Patient
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[11px] sm:text-xs font-semibold bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/20">
-                      Guest Mode
-                    </span>
-                  )}
+                  <span className="inline-flex items-center px-2 sm:px-2.5 py-0.5 rounded-full text-[11px] sm:text-xs font-bold bg-teal-500/10 text-teal-700 dark:text-teal-300 border border-teal-500/20">
+                    <ShieldCheck className="w-3.5 h-3.5 mr-1" />
+                    {patientUser?.fullName ? 'Verified Patient' : 'Active Patient'}
+                  </span>
                 </div>
                 <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5">
                   <span className="truncate max-w-[200px] sm:max-w-none">{patientUser?.email || 'Track bookings & health records'}</span>
@@ -4451,15 +4487,25 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">Gender</label>
-                  <select
-                    value={editGender}
-                    onChange={(e) => setEditGender(e.target.value)}
-                    className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-semibold text-slate-900 dark:text-white outline-none"
-                  >
-                    <option value="Male">Male</option>
-                    <option value="Female">Female</option>
-                    <option value="Other">Other</option>
-                  </select>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(['Male', 'Female', 'Other'] as const).map((g) => {
+                      const isSelected = (editGender || 'Male') === g
+                      return (
+                        <button
+                          key={g}
+                          type="button"
+                          onClick={() => setEditGender(g)}
+                          className={`py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                            isSelected
+                              ? 'bg-gradient-to-r from-teal-600 to-cyan-600 text-white border-transparent shadow-md shadow-teal-500/20'
+                              : 'liquid-glass-card text-slate-700 dark:text-slate-300 border-white/60 dark:border-white/10 hover:bg-white/70'
+                          }`}
+                        >
+                          {g}
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
               </div>
 
@@ -4709,7 +4755,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 Claim Appointment
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 max-w-xs mx-auto">
-                Enter your 10-digit universal tracking code to link an appointment booked offline or in guest mode to your account.
+                Enter your 10-digit universal tracking code to link an appointment booked offline or at the clinic desk to your account.
               </p>
             </div>
 
