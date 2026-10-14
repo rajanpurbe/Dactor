@@ -62,6 +62,7 @@ import {
   getSupportUrl,
 } from '../services/db'
 import { compressImage } from '../utils/imageCompressor'
+import { extractCleanClinicalRemarks } from '../utils/paymentLedger'
 import { supabase } from '../lib/supabase'
 import { signInWithFirebaseGoogle, signOutFirebase } from '../lib/firebase'
 
@@ -80,8 +81,9 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
     'auth_screen' | 'register_form' | 'kyc_pending' | 'consultation_desk'
   >(() => {
     try {
+      const isDoctorLoggedIn = localStorage.getItem('dactor_doctor_logged_in') === 'true'
       const savedDoc = localStorage.getItem('dactor_doctor_session')
-      if (savedDoc) return 'consultation_desk'
+      if (savedDoc && isDoctorLoggedIn) return 'consultation_desk'
       const pending = localStorage.getItem('dactor_doctor_pending_kyc')
       if (pending) return 'kyc_pending'
       return 'auth_screen'
@@ -321,9 +323,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
     try {
       localStorage.setItem('dactor_doctor_session', JSON.stringify(doctor))
       localStorage.setItem('dactor_doctor_email', doctor.email || '')
-      localStorage.setItem('dactor_auth_logged_in', 'true')
-      localStorage.setItem('dactor_auth_email', doctor.email || '')
-      localStorage.setItem('dactor_auth_role', 'doctor')
+      localStorage.setItem('dactor_doctor_logged_in', 'true')
       window.dispatchEvent(new Event('storage'))
     } catch {}
   }
@@ -681,10 +681,8 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   const handleLogout = () => {
     localStorage.removeItem('dactor_doctor_session')
     localStorage.removeItem('dactor_doctor_email')
+    localStorage.removeItem('dactor_doctor_logged_in')
     localStorage.removeItem('dactor_doctor_pending_kyc')
-    localStorage.removeItem('dactor_auth_logged_in')
-    localStorage.removeItem('dactor_auth_email')
-    localStorage.removeItem('dactor_auth_role')
     setCurrentDoctor(null)
     setCurrentView('auth_screen')
     signOutFirebase().catch(() => {})
@@ -1867,7 +1865,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                         <div className="pt-1">
                           <span className="text-[10px] uppercase font-bold text-slate-400 block">Clinical Remarks:</span>
                           <p className="text-[11px] text-teal-800 dark:text-teal-300 font-medium line-clamp-2">
-                            {p.notes.slice(-1)[0]}
+                            {extractCleanClinicalRemarks(p.notes.slice(-1)[0])}
                           </p>
                         </div>
                       )}

@@ -546,8 +546,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         const redirectedUser = await checkRedirectGoogleUser()
         const storedEmail =
           redirectedUser?.email ||
-          localStorage.getItem('dactor_patient_email') ||
-          localStorage.getItem('dactor_auth_email')
+          localStorage.getItem('dactor_patient_email')
         if (storedEmail) {
           const rawCached = localStorage.getItem('dactor_patient_session')
           let cachedProf: PatientProfile | null = null
@@ -1085,6 +1084,12 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       return
     }
 
+    // Direct booking for free follow-up (no payment needed)
+    if (calculatedFee === 0 || (isReturningPatient && retainedAppointment)) {
+      handleExecutePayment(true)
+      return
+    }
+
     // Set new payment timer session
     const expiresAt = Date.now() + 300_000
     localStorage.setItem('dactor_patient_payment_session', JSON.stringify({ expiresAt }))
@@ -1113,7 +1118,11 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         ? `${selectedSlot.startTime} - ${selectedSlot.endTime}`
         : '10:00 AM'
 
-      const isFreeFollowup = isReturningPatient && retainedAppointment && calculatedFee === 0
+      const isFreeFollowup = Boolean(isReturningPatient && retainedAppointment && calculatedFee === 0)
+      const targetPatientName = isFreeFollowup && retainedAppointment ? retainedAppointment.patientName : bookPatientName.trim()
+      const targetPatientAge = isFreeFollowup && retainedAppointment ? (retainedAppointment.patientAge || parseInt(bookPatientAge) || 28) : (parseInt(bookPatientAge) || 28)
+      const targetPatientGender = isFreeFollowup && retainedAppointment ? (retainedAppointment.patientGender || bookPatientGender) : bookPatientGender
+      const targetPatientMobile = isFreeFollowup && retainedAppointment ? (retainedAppointment.patientMobile || bookPatientPhone.trim()) : bookPatientPhone.trim()
 
       // 1. Create Appointment in Supabase
       const newAppt = await createAppointment({
@@ -1121,10 +1130,10 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         userId: patientUser?.id,
         clinicId: selectedClinic!.id,
         doctorId: isLabClinic ? undefined : selectedDoctor?.id,
-        patientName: bookPatientName.trim(),
-        patientAge: parseInt(bookPatientAge) || 28,
-        patientGender: bookPatientGender,
-        patientMobile: bookPatientPhone.trim(),
+        patientName: targetPatientName,
+        patientAge: targetPatientAge,
+        patientGender: targetPatientGender,
+        patientMobile: targetPatientMobile,
         patientEmail: patientUser?.email,
         appointmentDate: bookingDate,
         appointmentTime: slotTimeStr,
@@ -1500,9 +1509,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         initProfileFields(fullProfile)
         localStorage.setItem('dactor_patient_email', profile.email)
         localStorage.setItem('dactor_patient_session', JSON.stringify(fullProfile))
-        localStorage.setItem('dactor_auth_logged_in', 'true')
-        localStorage.setItem('dactor_auth_email', profile.email)
-        localStorage.setItem('dactor_auth_role', 'patient')
+        localStorage.setItem('dactor_patient_logged_in', 'true')
         window.dispatchEvent(new Event('storage'))
         setShowAuthModal(false)
         await restorePendingBookingRedirect()
@@ -1515,7 +1522,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           fullName: profile?.fullName || '',
           phone: profile?.phone || '',
           age: profile?.age,
-          gender: profile?.gender || '',
+          gender: profile?.gender || 'Male',
           city: profile?.city || '',
           photoUrl: photo,
           role: 'patient',
@@ -1524,13 +1531,11 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         setEditName(partial.fullName || '')
         setEditPhone(partial.phone || '')
         setEditAge(partial.age ? String(partial.age) : '')
-        setEditGender(partial.gender || '')
+        setEditGender(partial.gender || 'Male')
         setEditCity(partial.city || '')
-        setEditTermsAccepted(false)
+        setEditTermsAccepted(true)
         localStorage.setItem('dactor_patient_email', partial.email)
-        localStorage.setItem('dactor_auth_logged_in', 'true')
-        localStorage.setItem('dactor_auth_email', partial.email)
-        localStorage.setItem('dactor_auth_role', 'patient')
+        localStorage.setItem('dactor_patient_logged_in', 'true')
         window.dispatchEvent(new Event('storage'))
         setShowAuthModal(false)
         setShowEditProfileModal(true)
@@ -1602,9 +1607,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       initProfileFields(finalProfile)
       localStorage.setItem('dactor_patient_session', JSON.stringify(finalProfile))
       localStorage.setItem('dactor_patient_email', finalProfile.email)
-      localStorage.setItem('dactor_auth_logged_in', 'true')
-      localStorage.setItem('dactor_auth_email', finalProfile.email)
-      localStorage.setItem('dactor_auth_role', 'patient')
+      localStorage.setItem('dactor_patient_logged_in', 'true')
       window.dispatchEvent(new Event('storage'))
       setShowEditProfileModal(false)
       await restorePendingBookingRedirect()
@@ -1863,9 +1866,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     firebaseSignOut()
     localStorage.removeItem('dactor_patient_email')
     localStorage.removeItem('dactor_patient_session')
-    localStorage.removeItem('dactor_auth_logged_in')
-    localStorage.removeItem('dactor_auth_email')
-    localStorage.removeItem('dactor_auth_role')
+    localStorage.removeItem('dactor_patient_logged_in')
     setPatientUser(null)
     setMyAppointments([])
     setTransactions([])
@@ -2615,9 +2616,11 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                         if (!item) return null
                         const { c, isLab, isSingle, matchReason, matchedDoctor } = item
 
-                        const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                          `${c.name} ${c.addressText || ''}`
-                        )}`
+                        const mapsUrl = c.latitude && c.longitude
+                          ? `https://www.google.com/maps/dir/?api=1&destination=${c.latitude},${c.longitude}`
+                          : `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(
+                              `${c.name} ${c.addressText || ''}`
+                            )}`
 
                         return (
                           <div
@@ -3212,8 +3215,30 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                   </span>
                 </div>
 
-                {/* Book for Self or Family */}
-                {familyMembers.length > 0 && (
+                {/* Verified Follow-Up Patient Details Locked Banner */}
+                {isReturningPatient && retainedAppointment && (
+                  <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex items-start space-x-3">
+                    <div className="w-8 h-8 rounded-lg bg-emerald-100 flex items-center justify-center shrink-0">
+                      <Lock className="w-4 h-4 text-emerald-700" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center space-x-2">
+                        <span className="text-xs font-black uppercase tracking-wider text-emerald-900">
+                          Verified Follow-Up Patient Details Locked
+                        </span>
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-200 text-emerald-900 text-[10px] font-bold">
+                          FREE (Rs. 0)
+                        </span>
+                      </div>
+                      <p className="text-xs text-emerald-700 mt-1">
+                        Linked to Previous Appointment #{retainedAppointment.trackingCode10Digit} ({retainedAppointment.patientName}). Patient details cannot be altered for follow-up visits.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Book for Self or Family (Hidden for Verified Follow-Up Visits) */}
+                {!isReturningPatient && familyMembers.length > 0 && (
                   <div className="space-y-2">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
                       Who is this appointment for?
@@ -3279,21 +3304,43 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
                 {/* Patient Full Name */}
                 <div className="space-y-1">
-                  <label className="block text-xs font-bold text-slate-700">Patient Full Name *</label>
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold text-slate-700">Patient Full Name *</label>
+                    {isReturningPatient && retainedAppointment && (
+                      <span className="inline-flex items-center space-x-1 text-[11px] font-bold text-slate-500">
+                        <Lock className="w-3 h-3 text-slate-400" />
+                        <span>Locked</span>
+                      </span>
+                    )}
+                  </div>
                   <input
                     type="text"
                     required
                     value={bookPatientName}
                     onChange={(e) => setBookPatientName(e.target.value)}
                     placeholder="e.g. Sita Sharma"
-                    className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-semibold outline-none focus:ring-2 focus:ring-brand-500"
+                    readOnly={Boolean(isReturningPatient && retainedAppointment)}
+                    disabled={Boolean(isReturningPatient && retainedAppointment)}
+                    className={`w-full px-4 py-3 border rounded-xl text-sm font-semibold outline-none transition ${
+                      isReturningPatient && retainedAppointment
+                        ? 'bg-slate-100 text-slate-700 border-slate-200 cursor-not-allowed select-none'
+                        : 'bg-white border-slate-200 text-slate-900 focus:ring-2 focus:ring-brand-500'
+                    }`}
                   />
                 </div>
 
                 {/* Mobile Number & Age */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="space-y-1">
-                    <label className="block text-xs font-bold text-slate-700">Mobile Number (10 digits) *</label>
+                    <div className="flex items-center justify-between">
+                      <label className="block text-xs font-bold text-slate-700">Mobile Number (10 digits) *</label>
+                      {isReturningPatient && retainedAppointment && (
+                        <span className="inline-flex items-center space-x-1 text-[11px] font-bold text-slate-500">
+                          <Lock className="w-3 h-3 text-slate-400" />
+                          <span>Locked</span>
+                        </span>
+                      )}
+                    </div>
                     <input
                       type="tel"
                       required
@@ -3301,11 +3348,25 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                       onChange={(e) => setBookPatientPhone(e.target.value.replace(/\D/g, ''))}
                       placeholder="98xxxxxxxx"
                       maxLength={10}
-                      className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-semibold outline-none focus:ring-2 focus:ring-brand-500"
+                      readOnly={Boolean(isReturningPatient && retainedAppointment)}
+                      disabled={Boolean(isReturningPatient && retainedAppointment)}
+                      className={`w-full px-4 py-3 border rounded-xl text-sm font-semibold outline-none transition ${
+                        isReturningPatient && retainedAppointment
+                          ? 'bg-slate-100 text-slate-700 border-slate-200 cursor-not-allowed select-none'
+                          : 'bg-white border-slate-200 text-slate-900 focus:ring-2 focus:ring-brand-500'
+                      }`}
                     />
                   </div>
                   <div className="space-y-1">
-                    <label className="block text-xs font-bold text-slate-700">Patient Age (Years) *</label>
+                    <div className="flex items-center justify-between">
+                      <label className="block text-xs font-bold text-slate-700">Patient Age (Years) *</label>
+                      {isReturningPatient && retainedAppointment && (
+                        <span className="inline-flex items-center space-x-1 text-[11px] font-bold text-slate-500">
+                          <Lock className="w-3 h-3 text-slate-400" />
+                          <span>Locked</span>
+                        </span>
+                      )}
+                    </div>
                     <input
                       type="number"
                       required
@@ -3314,25 +3375,40 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                       placeholder="e.g. 32"
                       min="1"
                       max="120"
-                      className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm font-semibold outline-none focus:ring-2 focus:ring-brand-500"
+                      readOnly={Boolean(isReturningPatient && retainedAppointment)}
+                      disabled={Boolean(isReturningPatient && retainedAppointment)}
+                      className={`w-full px-4 py-3 border rounded-xl text-sm font-semibold outline-none transition ${
+                        isReturningPatient && retainedAppointment
+                          ? 'bg-slate-100 text-slate-700 border-slate-200 cursor-not-allowed select-none'
+                          : 'bg-white border-slate-200 text-slate-900 focus:ring-2 focus:ring-brand-500'
+                      }`}
                     />
                   </div>
                 </div>
 
                 {/* Gender */}
                 <div className="space-y-1">
-                  <label className="block text-xs font-bold text-slate-700">Gender *</label>
+                  <div className="flex items-center justify-between">
+                    <label className="block text-xs font-bold text-slate-700">Gender *</label>
+                    {isReturningPatient && retainedAppointment && (
+                      <span className="inline-flex items-center space-x-1 text-[11px] font-bold text-slate-500">
+                        <Lock className="w-3 h-3 text-slate-400" />
+                        <span>Locked</span>
+                      </span>
+                    )}
+                  </div>
                   <div className="flex items-center space-x-3">
                     {['Male', 'Female', 'Other'].map((g) => (
                       <button
                         key={g}
                         type="button"
-                        onClick={() => setBookPatientGender(g)}
+                        disabled={Boolean(isReturningPatient && retainedAppointment)}
+                        onClick={() => !Boolean(isReturningPatient && retainedAppointment) && setBookPatientGender(g)}
                         className={`flex-1 py-2.5 rounded-xl text-xs font-bold border transition ${
-                          bookPatientGender === g
+                          (bookPatientGender || 'Male').toLowerCase() === g.toLowerCase()
                             ? 'bg-slate-900 text-white border-slate-900'
                             : 'bg-white text-slate-600 border-slate-200'
-                        }`}
+                        } ${isReturningPatient && retainedAppointment ? 'cursor-not-allowed opacity-90' : ''}`}
                       >
                         {g}
                       </button>
@@ -3374,10 +3450,30 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
                 <button
                   type="submit"
-                  className="w-full py-3.5 bg-brand-600 hover:bg-brand-700 text-white font-bold text-sm rounded-xl shadow-md shadow-brand-600/20 transition flex items-center justify-center space-x-2"
+                  disabled={isPaymentProcessing}
+                  className={`w-full py-3.5 font-bold text-sm rounded-xl shadow-md transition flex items-center justify-center space-x-2 ${
+                    isReturningPatient && retainedAppointment
+                      ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/20'
+                      : 'bg-brand-600 hover:bg-brand-700 text-white shadow-brand-600/20'
+                  }`}
                 >
-                  <span>Proceed to Payment Confirmation</span>
-                  <ArrowRight className="w-4 h-4" />
+                  {isPaymentProcessing ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Confirming Free Follow-Up...</span>
+                    </>
+                  ) : isReturningPatient && retainedAppointment ? (
+                    <>
+                      <ShieldCheck className="w-4 h-4" />
+                      <span>Directly Confirm Free Follow-Up Booking (NPR 0)</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </>
+                  ) : (
+                    <>
+                      <span>Proceed to Payment Confirmation</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </>
+                  )}
                 </button>
               </form>
             )}
@@ -3530,19 +3626,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
                     {/* ACTION BUTTONS (With double-click prevention) */}
                     <div className="space-y-3 pt-2">
-                      {/* Testing Bypass Button requested by user */}
-                      <button
-                        type="button"
-                        disabled={isPaymentProcessing}
-                        onClick={() => handleExecutePayment(true)}
-                        className="w-full py-3.5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 disabled:opacity-50 text-white font-bold text-sm rounded-xl shadow-md transition flex items-center justify-center space-x-2 cursor-pointer"
-                      >
-                        <Sparkles className="w-4 h-4" />
-                        <span>
-                          {isPaymentProcessing ? 'Confirming...' : 'Bypass Payment for Testing (Confirm Appointment)'}
-                        </span>
-                      </button>
-
                       {/* Standard Pay & Confirm Button */}
                       <button
                         type="button"
@@ -4489,7 +4572,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                   <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">Gender</label>
                   <div className="grid grid-cols-3 gap-1.5">
                     {(['Male', 'Female', 'Other'] as const).map((g) => {
-                      const isSelected = (editGender || 'Male') === g
+                      const isSelected = (editGender || 'Male').toLowerCase() === g.toLowerCase()
                       return (
                         <button
                           key={g}

@@ -228,8 +228,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
       if (autoOpenBooking) {
         const isUserLoggedIn = Boolean(
           localStorage.getItem('dactor_patient_session') ||
-            (localStorage.getItem('dactor_auth_logged_in') === 'true' &&
-              localStorage.getItem('dactor_auth_role') === 'patient')
+            localStorage.getItem('dactor_patient_logged_in') === 'true'
         )
         if (!isUserLoggedIn) {
           const pendingData = {
@@ -735,7 +734,14 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
     const n = Number(val)
     return val.trim() !== '' && Number.isInteger(n) && n >= 1 && n <= 120
   }
-  const isGenderValid = (val: string) => ['Male', 'Female', 'Other'].includes(val || 'Male')
+  const normalizeGender = (g?: string): 'Male' | 'Female' | 'Other' => {
+    if (!g) return 'Male'
+    const l = g.trim().toLowerCase()
+    if (l === 'female') return 'Female'
+    if (l === 'other') return 'Other'
+    return 'Male'
+  }
+  const isGenderValid = (val: string) => ['Male', 'Female', 'Other'].includes(normalizeGender(val))
   const isMobileValid = (val: string) => /^9\d{9}$/.test(val.replace(/\D/g, ''))
 
   // Validate form and scroll/focus first missing/invalid field
@@ -878,9 +884,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
           : selectedPaymentMethod === 'khalti'
           ? 'Khalti Digital Wallet'
           : selectedPaymentMethod === 'fonepay'
-          ? 'Fonepay QR'
-          : selectedPaymentMethod === 'bypass'
-          ? 'Bypass Test Gateway'
+          ? 'Fonepay Direct QR'
           : 'Pay at Clinic Counter'
 
         await recordPaymentTransaction({
@@ -1299,9 +1303,13 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                   <span className="font-semibold truncate max-w-[200px] sm:max-w-none">{clinic.addressText || 'Nepal'}</span>
                 </span>
                 <a
-                  href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                    `${clinic.name} ${clinic.addressText || ''}`.trim()
-                  )}`}
+                  href={
+                    clinic.latitude && clinic.longitude
+                      ? `https://www.google.com/maps/dir/?api=1&destination=${clinic.latitude},${clinic.longitude}`
+                      : `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(
+                          `${clinic.name} ${clinic.addressText || ''}`.trim()
+                        )}`
+                  }
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex items-center space-x-1 px-2.5 sm:px-3 py-1 rounded-xl bg-blue-500/10 text-blue-700 dark:text-blue-300 hover:bg-blue-500/20 font-bold border border-blue-500/20 transition text-[11px] backdrop-blur-sm"
@@ -1653,149 +1661,8 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                 )}
               </div>
             ) : (
-              /* 2. MULTI-VISIT POLYCLINIC: VISIT TYPE + SPECIALISTS ROSTER */
+              /* 2. MULTI-VISIT POLYCLINIC: SPECIALISTS ROSTER */
               <div className="space-y-6">
-                {/* Visit Type Toggle: New Consultation vs Free Follow-Up OR Reschedule Active */}
-                <div className="p-5 rounded-3xl liquid-glass-elevated space-y-4">
-                  {isReschedule ? (
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-2 text-cyan-900 dark:text-cyan-300 font-black text-sm">
-                          <Calendar className="w-4 h-4 text-cyan-600 dark:text-cyan-400 shrink-0" />
-                          <span>Reschedule Mode Active</span>
-                        </div>
-                        <span className="text-[10px] font-black uppercase px-2.5 py-0.5 rounded-full bg-cyan-600 text-white">
-                          FEE RETAINED
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                        Shifting appointment time for Token ID <strong className="font-mono font-bold">#{retainedAppointment?.trackingCode10Digit || followupCodeInput || initialTrackingCode}</strong>.
-                      </p>
-                      {retainedAppointment && (
-                        <div className="p-3.5 rounded-2xl liquid-glass-subtle text-xs flex items-center justify-between border-cyan-500/30">
-                          <div>
-                            <span className="font-bold text-sm block text-cyan-900 dark:text-cyan-300">
-                              ✓ Patient: {retainedAppointment.patientName}
-                            </span>
-                            <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium">
-                              {retainedAppointment.patientAge} yrs • {retainedAppointment.patientGender} • {retainedAppointment.patientMobile}
-                            </span>
-                          </div>
-                          <span className="px-2.5 py-1 rounded-full text-[10px] font-black uppercase bg-cyan-500/10 text-cyan-800 dark:text-cyan-300 border border-cyan-500/20">
-                            Verified
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <>
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <h4 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">
-                            Visit Type (Multi-Visit Polyclinic)
-                          </h4>
-                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                            Choose New Consultation or claim a 100% Free Follow-Up with your 10-digit Appointment ID.
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-3">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setIsReturningPatient(false)
-                            setFollowupLookupError(null)
-                          }}
-                          className={`p-3.5 rounded-2xl border text-left transition cursor-pointer active:scale-95 ${
-                            !isReturningPatient
-                              ? 'border-teal-500 bg-teal-500/10 ring-2 ring-teal-500/20 shadow-glass-sm'
-                              : 'liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-black text-slate-900 dark:text-white">New Patient</span>
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-600 text-white">
-                              Rs. {selectedDoctor?.consultationFee || 500}
-                            </span>
-                          </div>
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">Standard initial consultation</p>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setIsReturningPatient(true)
-                            setFollowupLookupError(null)
-                          }}
-                          className={`p-3.5 rounded-2xl border text-left transition cursor-pointer active:scale-95 ${
-                            isReturningPatient
-                              ? 'border-emerald-500 bg-emerald-500/10 ring-2 ring-emerald-500/20 shadow-glass-sm'
-                              : 'liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-black text-slate-900 dark:text-white">Follow-Up Visit</span>
-                            <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-emerald-600 text-white uppercase tracking-wider">
-                              FREE
-                            </span>
-                          </div>
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">Free with 10-digit Appointment ID</p>
-                        </button>
-                      </div>
-
-                      {/* Follow-Up 10-digit Input and Retained Box */}
-                      {isReturningPatient && (
-                        <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 space-y-3 animate-in fade-in duration-150 backdrop-blur-sm">
-                          <div>
-                            <label className="text-xs font-bold text-emerald-900 dark:text-emerald-300 block mb-1">
-                              Enter 10-Digit Appointment ID for Follow-Up *
-                            </label>
-                            <input
-                              type="text"
-                              maxLength={10}
-                              value={followupCodeInput}
-                              onChange={(e) => {
-                                const val = e.target.value.replace(/\D/g, '').slice(0, 10)
-                                setFollowupCodeInput(val)
-                              }}
-                              placeholder="e.g. 8492049182 (10 digits)"
-                              className="w-full px-3.5 py-2.5 rounded-xl text-sm font-mono font-bold liquid-glass-input text-slate-900 dark:text-white"
-                            />
-                          </div>
-
-                          {isLookingUpCode && (
-                            <div className="flex items-center space-x-2 text-xs text-emerald-700 dark:text-emerald-400">
-                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                              <span>Looking up previous appointment details in Supabase...</span>
-                            </div>
-                          )}
-
-                          {retainedAppointment && (
-                            <div className="p-3 rounded-xl liquid-glass-subtle text-xs flex items-center justify-between border-emerald-500/30">
-                              <div>
-                                <span className="font-bold text-sm block text-emerald-900 dark:text-emerald-300">
-                                  ✓ Patient Retained: {retainedAppointment.patientName}
-                                </span>
-                                <span className="text-[11px] text-emerald-700 dark:text-emerald-400 font-medium">
-                                  {retainedAppointment.patientAge} yrs • {retainedAppointment.patientGender} • {retainedAppointment.patientMobile}
-                                </span>
-                              </div>
-                              <span className="px-2.5 py-1 rounded-full text-[10px] font-black uppercase bg-emerald-500/10 text-emerald-800 dark:text-emerald-300 border border-emerald-500/20">
-                                Verified
-                              </span>
-                            </div>
-                          )}
-
-                          {followupLookupError && (
-                            <p className="text-xs text-rose-600 font-bold">{followupLookupError}</p>
-                          )}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-
                 {/* Specialists Roster Header */}
                 <div className="flex items-center justify-between pt-2">
                   <h3 className="text-lg font-black text-slate-900 dark:text-white">Specialist Doctors on Roster</h3>
@@ -2178,8 +2045,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
 
                   const isUserLoggedIn = Boolean(
                     localStorage.getItem('dactor_patient_session') ||
-                      (localStorage.getItem('dactor_auth_logged_in') === 'true' &&
-                        localStorage.getItem('dactor_auth_role') === 'patient')
+                      localStorage.getItem('dactor_patient_logged_in') === 'true'
                   )
 
                   if (!isUserLoggedIn) {
@@ -2459,8 +2325,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                 onClick={() => {
                   const isUserLoggedIn = Boolean(
                     localStorage.getItem('dactor_patient_session') ||
-                      (localStorage.getItem('dactor_auth_logged_in') === 'true' &&
-                        localStorage.getItem('dactor_auth_role') === 'patient')
+                      localStorage.getItem('dactor_patient_logged_in') === 'true'
                   )
 
                   if (!isUserLoggedIn) {
@@ -2537,7 +2402,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                         setPatientUserId(savedProfile.id)
                         setPatientName(savedProfile.fullName)
                         setPatientAge(String(savedProfile.age))
-                        setPatientGender(savedProfile.gender)
+                        setPatientGender(normalizeGender(savedProfile.gender))
                         setPatientMobile(savedProfile.phone)
                         setPatientEmail(savedProfile.email || '')
                         setFormErrors({})
@@ -2657,7 +2522,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                       </label>
                       <div className="grid grid-cols-3 gap-2" id="field-patient-gender">
                         {(['Male', 'Female', 'Other'] as const).map((g) => {
-                          const isSelected = (patientGender || 'Male') === g
+                          const isSelected = normalizeGender(patientGender) === g
                           return (
                             <button
                               key={g}
@@ -2927,22 +2792,17 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                         {
                           id: 'esewa',
                           title: paymentConfig?.esewa?.title || 'eSewa Mobile Wallet',
-                          sub: `Merchant ID: ${paymentConfig?.esewa?.merchantCode || 'EPAYTEST'}`,
+                          sub: 'Digital Wallet & NetBanking',
                         },
                         {
                           id: 'khalti',
                           title: paymentConfig?.khalti?.title || 'Khalti Digital Wallet',
-                          sub: 'Instant Wallet / Banking Checkout',
+                          sub: 'Instant Wallet & Mobile Banking',
                         },
                         {
                           id: 'fonepay',
                           title: paymentConfig?.fonepay?.title || 'Fonepay QR / Direct Banking',
                           sub: 'Nepal Interbank QR Payment',
-                        },
-                        {
-                          id: 'bypass',
-                          title: 'Instant Bypass Test Payment (Mark Paid)',
-                          sub: 'Records immediate verified paid invoice in Supabase',
                         },
                         {
                           id: 'pay_at_clinic',

@@ -187,28 +187,61 @@ export const App: React.FC = () => {
     }
   })
 
-  // Authentication State
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
+  // Isolated Authentication State per Active Portal Tab
+  const getTabAuthState = (tab: string) => {
     try {
-      return localStorage.getItem('dactor_auth_logged_in') === 'true'
+      if (tab === 'portal') {
+        const isClinic = localStorage.getItem('dactor_clinic_logged_in') === 'true'
+        const email = localStorage.getItem('dactor_clinic_email') || null
+        return {
+          isLoggedIn: isClinic,
+          currentUserEmail: isClinic ? email : null,
+          authRole: isClinic ? ('clinic_manager' as const) : null,
+        }
+      }
+      if (tab === 'doctor-portal') {
+        const isDoc =
+          localStorage.getItem('dactor_doctor_logged_in') === 'true' &&
+          Boolean(localStorage.getItem('dactor_doctor_session'))
+        const email = localStorage.getItem('dactor_doctor_email') || null
+        return {
+          isLoggedIn: isDoc,
+          currentUserEmail: isDoc ? email : null,
+          authRole: isDoc ? ('doctor' as const) : null,
+        }
+      }
+      if (tab === 'patient-portal') {
+        const isPat =
+          localStorage.getItem('dactor_patient_logged_in') === 'true' ||
+          Boolean(localStorage.getItem('dactor_patient_session'))
+        const email = localStorage.getItem('dactor_patient_email') || null
+        return {
+          isLoggedIn: isPat,
+          currentUserEmail: isPat ? email : null,
+          authRole: isPat ? ('patient' as const) : null,
+        }
+      }
+      // Public browsing tabs: associate with patient session if active
+      const isPat =
+        localStorage.getItem('dactor_patient_logged_in') === 'true' ||
+        Boolean(localStorage.getItem('dactor_patient_session'))
+      if (isPat) {
+        return {
+          isLoggedIn: true,
+          currentUserEmail: localStorage.getItem('dactor_patient_email') || null,
+          authRole: 'patient' as const,
+        }
+      }
+      return { isLoggedIn: false, currentUserEmail: null, authRole: null }
     } catch {
-      return false
+      return { isLoggedIn: false, currentUserEmail: null, authRole: null }
     }
-  })
-  const [currentUserEmail, setCurrentUserEmail] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem('dactor_auth_email') || null
-    } catch {
-      return null
-    }
-  })
-  const [authRole, setAuthRole] = useState<'clinic_manager' | 'doctor' | 'patient' | null>(() => {
-    try {
-      return (localStorage.getItem('dactor_auth_role') as any) || null
-    } catch {
-      return null
-    }
-  })
+  }
+
+  const initialTabAuth = getTabAuthState(getTabFromUrl())
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(initialTabAuth.isLoggedIn)
+  const [currentUserEmail, setCurrentUserEmail] = useState<string | null>(initialTabAuth.currentUserEmail)
+  const [authRole, setAuthRole] = useState<'clinic_manager' | 'doctor' | 'patient' | null>(initialTabAuth.authRole)
 
   // Live unread notification count from Supabase (never hardcoded)
   const [unreadCount, setUnreadCount] = useState<number>(0)
@@ -242,13 +275,19 @@ export const App: React.FC = () => {
     const handleHashChange = () => {
       const tab = getTabFromUrl()
       setActiveTab(tab)
+      const st = getTabAuthState(tab)
+      setIsLoggedIn(st.isLoggedIn)
+      setCurrentUserEmail(st.currentUserEmail)
+      setAuthRole(st.authRole)
     }
 
     const syncAuth = () => {
       try {
-        setIsLoggedIn(localStorage.getItem('dactor_auth_logged_in') === 'true')
-        setCurrentUserEmail(localStorage.getItem('dactor_auth_email') || null)
-        setAuthRole((localStorage.getItem('dactor_auth_role') as any) || null)
+        const currentTab = getTabFromUrl()
+        const st = getTabAuthState(currentTab)
+        setIsLoggedIn(st.isLoggedIn)
+        setCurrentUserEmail(st.currentUserEmail)
+        setAuthRole(st.authRole)
         refreshUnreadNotifications()
       } catch {}
     }
@@ -337,6 +376,11 @@ export const App: React.FC = () => {
     }
 
     setActiveTab(tab)
+    const nextAuth = getTabAuthState(tab)
+    setIsLoggedIn(nextAuth.isLoggedIn)
+    setCurrentUserEmail(nextAuth.currentUserEmail)
+    setAuthRole(nextAuth.authRole)
+
     try {
       const url = new URL(window.location.href)
       if (tab === 'home') {
@@ -359,17 +403,24 @@ export const App: React.FC = () => {
   // Handle logout
   const handleLogout = () => {
     try {
-      localStorage.removeItem('dactor_auth_logged_in')
-      localStorage.removeItem('dactor_auth_email')
-      localStorage.removeItem('dactor_auth_role')
-      localStorage.removeItem('dactor_doctor_session')
-      localStorage.removeItem('dactor_doctor_email')
-      localStorage.removeItem('dactor_doctor_pending_kyc')
-      localStorage.removeItem('dactor_patient_session')
-      localStorage.removeItem('dactor_patient_email')
-      setIsLoggedIn(false)
-      setCurrentUserEmail(null)
-      setAuthRole(null)
+      if (activeTab === 'portal') {
+        localStorage.removeItem('dactor_clinic_logged_in')
+        localStorage.removeItem('dactor_clinic_email')
+        localStorage.removeItem('dactor_clinic_role')
+      } else if (activeTab === 'doctor-portal') {
+        localStorage.removeItem('dactor_doctor_session')
+        localStorage.removeItem('dactor_doctor_email')
+        localStorage.removeItem('dactor_doctor_logged_in')
+        localStorage.removeItem('dactor_doctor_pending_kyc')
+      } else {
+        localStorage.removeItem('dactor_patient_session')
+        localStorage.removeItem('dactor_patient_email')
+        localStorage.removeItem('dactor_patient_logged_in')
+      }
+      const st = getTabAuthState(activeTab)
+      setIsLoggedIn(st.isLoggedIn)
+      setCurrentUserEmail(st.currentUserEmail)
+      setAuthRole(st.authRole)
       window.dispatchEvent(new Event('storage'))
     } catch {}
   }

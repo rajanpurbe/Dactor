@@ -872,9 +872,13 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                   </a>
 
                   <a
-                    href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                      `${clinic?.name || ''} ${clinic?.addressText || ''}`
-                    )}`}
+                    href={
+                      (clinic?.latitude && clinic?.longitude) || (appointment.clinic?.latitude && appointment.clinic?.longitude)
+                        ? `https://www.google.com/maps/dir/?api=1&destination=${clinic?.latitude || appointment.clinic?.latitude},${clinic?.longitude || appointment.clinic?.longitude}`
+                        : `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(
+                            `${clinic?.name || appointment.clinic?.name || ''} ${clinic?.addressText || appointment.clinic?.addressText || ''}`.trim()
+                          )}`
+                    }
                     target="_blank"
                     rel="noopener noreferrer"
                     className="py-2.5 px-3 rounded-xl liquid-glass-subtle text-teal-700 dark:text-teal-300 hover:bg-white/80 dark:hover:bg-slate-800/80 text-xs font-bold transition flex items-center justify-center space-x-1.5 active:scale-95"

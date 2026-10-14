@@ -46,16 +46,18 @@ export const Navbar: React.FC<NavbarProps> = ({
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
 
   // Priority logic for portal association:
-  // 1. If actively viewing a portal tab, strictly associate with that portal!
-  // 2. Otherwise if logged in, use authRole.
+  // 1. If actively logged in to the viewed portal tab, strictly associate with that portal!
+  // 2. Otherwise if not logged in, treat as visitor (null).
   const activePortalRole: 'clinic_manager' | 'doctor' | 'patient' | null =
-    activeTab === 'portal'
-      ? 'clinic_manager'
-      : activeTab === 'doctor-portal'
-      ? 'doctor'
-      : activeTab === 'patient-portal'
-      ? 'patient'
-      : authRole || null
+    isLoggedIn
+      ? (activeTab === 'portal'
+          ? 'clinic_manager'
+          : activeTab === 'doctor-portal'
+          ? 'doctor'
+          : activeTab === 'patient-portal'
+          ? 'patient'
+          : authRole || null)
+      : null
 
   const allNavLinks = [
     { id: 'home', label: 'Home', icon: Activity },

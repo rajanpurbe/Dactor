@@ -395,7 +395,9 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     'auth_choice' | 'register_form' | 'pending_verification' | 'operational_desk'
   >(() => {
     try {
-      if (localStorage.getItem('dactor_auth_logged_in') === 'true') {
+      const isClinicAuth = localStorage.getItem('dactor_clinic_logged_in') === 'true'
+      const role = localStorage.getItem('dactor_clinic_role')
+      if (isClinicAuth && (role === 'clinic_manager' || role === 'lab_tech' || role === 'doctor')) {
         return 'operational_desk'
       }
       if (localStorage.getItem('dactor_pending_verification')) {
@@ -425,7 +427,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
 
   const [verifiedEmail, setVerifiedEmail] = useState<string>(() => {
     try {
-      return localStorage.getItem('dactor_auth_email') || ''
+      return localStorage.getItem('dactor_clinic_email') || ''
     } catch {
       return ''
     }
@@ -447,21 +449,23 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
 
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
     try {
-      return localStorage.getItem('dactor_auth_logged_in') === 'true'
+      const isClinicAuth = localStorage.getItem('dactor_clinic_logged_in') === 'true'
+      const role = localStorage.getItem('dactor_clinic_role')
+      return isClinicAuth && (role === 'clinic_manager' || role === 'lab_tech' || role === 'doctor')
     } catch {
       return false
     }
   })
   const [authEmail, setAuthEmail] = useState<string | null>(() => {
     try {
-      return localStorage.getItem('dactor_auth_email') || null
+      return localStorage.getItem('dactor_clinic_email') || null
     } catch {
       return null
     }
   })
   const [authRole, setAuthRole] = useState<'clinic_manager' | 'doctor' | 'lab_tech'>(() => {
     try {
-      return (localStorage.getItem('dactor_auth_role') as any) || 'clinic_manager'
+      return (localStorage.getItem('dactor_clinic_role') as any) || 'clinic_manager'
     } catch {
       return 'clinic_manager'
     }
@@ -878,7 +882,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
       setMedicalQualifications(quals)
       setAllSystemDoctors(allDocs)
 
-      const savedEmail = (localStorage.getItem('dactor_auth_email') || '').trim().toLowerCase()
+      const savedEmail = (localStorage.getItem('dactor_clinic_email') || '').trim().toLowerCase()
       let initialClinic: Clinic | null = null
       if (savedEmail) {
         initialClinic =
@@ -991,9 +995,9 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     setAuthRole(role)
     setCurrentView('operational_desk')
     try {
-      localStorage.setItem('dactor_auth_logged_in', 'true')
-      localStorage.setItem('dactor_auth_email', email)
-      localStorage.setItem('dactor_auth_role', role)
+      localStorage.setItem('dactor_clinic_logged_in', 'true')
+      localStorage.setItem('dactor_clinic_email', email)
+      localStorage.setItem('dactor_clinic_role', role)
       localStorage.removeItem('dactor_pending_verification')
       window.dispatchEvent(new Event('storage'))
     } catch {}
@@ -1005,13 +1009,11 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     setPendingEntity(null)
     setCurrentView('auth_choice')
     try {
-      localStorage.removeItem('dactor_auth_logged_in')
-      localStorage.removeItem('dactor_auth_email')
-      localStorage.removeItem('dactor_auth_role')
+      localStorage.removeItem('dactor_clinic_logged_in')
+      localStorage.removeItem('dactor_clinic_email')
+      localStorage.removeItem('dactor_clinic_role')
       localStorage.removeItem('dactor_pending_verification')
       window.dispatchEvent(new Event('storage'))
-      signOutFirebase().catch(() => {})
-      supabase.auth.signOut().catch(() => {})
     } catch {}
   }
 

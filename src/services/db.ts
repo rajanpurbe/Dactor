@@ -388,7 +388,7 @@ export async function getAppointmentsByDoctor(doctorId: string, date?: string): 
 
 export async function createAppointment(appt: Partial<Appointment> & { slotId?: string }): Promise<Appointment | null> {
   try {
-    const code10 = appt.trackingCode10Digit || generate10DigitTrackingCode()
+    let code10 = appt.trackingCode10Digit ? appt.trackingCode10Digit.trim() : ''
     const apptId = appt.id || crypto.randomUUID()
     const isWalkin = appt.isWalkin ?? (appt.notes?.toLowerCase().includes('walk-in') || false)
     const apptDate = appt.appointmentDate || new Date().toISOString().split('T')[0]
@@ -401,9 +401,9 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
     const patientNameClean = appt.patientName?.trim() || 'Patient'
 
     // ==========================================
-    // IDEMPOTENCY SAFETY CHECKS
+    // IDEMPOTENCY SAFETY CHECKS & PATIENT ISOLATION
     // ==========================================
-    // 1. If an appointment already exists with this ID, return it immediately
+    // 1. If an appointment already exists with this exact UUID ID, return it immediately
     if (appt.id) {
       const { data: existingById } = await supabase
         .from('appointments')
@@ -415,16 +415,31 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
       }
     }
 
-    // 2. If an appointment already exists with this 10-digit tracking code, return it
-    if (appt.trackingCode10Digit) {
+    // 2. Guarantee that two separate patients NEVER share the same appointment ID
+    if (code10) {
       const { data: existingByCode } = await supabase
         .from('appointments')
         .select('*, clinic:clinics(*), doctor:doctors(*)')
-        .eq('tracking_code_10_digit', appt.trackingCode10Digit)
+        .eq('tracking_code_10_digit', code10)
+        .order('appointment_date', { ascending: false })
+        .limit(1)
         .maybeSingle()
       if (existingByCode) {
-        return mapAppointment(existingByCode)
+        const cleanExistingPhone = (existingByCode.patient_mobile || '').replace(/\D/g, '')
+        const isSamePatient = (cleanExistingPhone && cleanExistingPhone === cleanMobile) ||
+          (existingByCode.user_id && existingByCode.user_id === resolvedUserId)
+        if (isSamePatient) {
+          // If rapid double-tap on exact same date & slot, return it
+          if (existingByCode.appointment_date === apptDate && existingByCode.slot_id === (appt.slotId || null)) {
+            return mapAppointment(existingByCode)
+          }
+        } else {
+          // Two separate patients MUST NEVER get the same appointment ID!
+          code10 = await generateGuaranteedUniqueTrackingCode()
+        }
       }
+    } else {
+      code10 = await generateGuaranteedUniqueTrackingCode()
     }
 
     // 3. Deduplication guard against rapid double-taps on poor connections
@@ -511,11 +526,7 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
       payment_status: normalizePaymentStatus(appt.paymentStatus),
       fee_amount: Number(appt.feeAmount) || 0,
       is_walkin: isWalkin,
-      opt_in_early_call: Boolean(appt.optInEarlyCall),
-    }
-
-    if (appt.selectedTests && appt.selectedTests.length > 0) {
-      dbPayload.selected_lab_tests = JSON.stringify(appt.selectedTests)
+      slot_id: appt.slotId || null,
     }
 
     const { data, error } = await supabase
@@ -627,7 +638,14 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
       })
     } catch {}
 
-    return data ? mapAppointment({ ...data, queue_entries: [{ status: 'waiting', queue_position: nextPos }] }) : null
+    if (!data) return null
+    const mapped = mapAppointment({ ...data, queue_entries: [{ status: 'waiting', queue_position: nextPos }] })
+    return {
+      ...mapped,
+      optInEarlyCall: Boolean(appt.optInEarlyCall),
+      selectedTests: appt.selectedTests || [],
+      notes: appt.notes,
+    }
   } catch (err) {
     console.error('Error creating appointment:', err)
     return null
@@ -2222,6 +2240,25 @@ export function generate10DigitTrackingCode(): string {
   const first = Math.floor(Math.random() * 9) + 1 // 1-9
   const rest = Math.floor(Math.random() * 1000000000).toString().padStart(9, '0')
   return `${first}${rest}`
+}
+
+export async function generateGuaranteedUniqueTrackingCode(): Promise<string> {
+  for (let i = 0; i < 15; i++) {
+    const candidate = generate10DigitTrackingCode()
+    try {
+      const { data } = await supabase
+        .from('appointments')
+        .select('id')
+        .eq('tracking_code_10_digit', candidate)
+        .limit(1)
+        .maybeSingle()
+      if (!data) return candidate
+    } catch {
+      break
+    }
+  }
+  const epochPart = (Date.now() % 1000000000).toString().padStart(9, '0')
+  return `9${epochPart}`
 }
 
 // ==========================================
