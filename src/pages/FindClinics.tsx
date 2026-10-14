@@ -17,8 +17,8 @@ import {
   X,
   History,
 } from 'lucide-react'
-import { Clinic } from '../types'
-import { getClinics } from '../services/db'
+import { Clinic, Doctor } from '../types'
+import { getClinics, getDoctors } from '../services/db'
 import {
   matchClinic,
   QUICK_SPECIALTY_SUGGESTIONS,
@@ -36,16 +36,36 @@ export const FindClinics: React.FC<FindClinicsProps> = ({
   initialFilter = 'all',
 }) => {
   const [clinics, setClinics] = useState<Clinic[]>([])
+  const [allDoctors, setAllDoctors] = useState<Doctor[]>([])
   const [loading, setLoading] = useState(true)
-  const [searchTerm, setSearchTerm] = useState('')
+  const [searchTerm, setSearchTerm] = useState(() => {
+    try {
+      const p = new URLSearchParams(window.location.search)
+      return p.get('q') || p.get('search') || p.get('doctor') || p.get('specialty') || p.get('test') || ''
+    } catch {
+      return ''
+    }
+  })
   const [filterType, setFilterType] = useState(initialFilter)
   const [recentSearches, setRecentSearches] = useState<string[]>(() => getRecentSearches())
+
+  const clinicDoctorsMap = useMemo(() => {
+    const map: Record<string, Doctor[]> = {}
+    for (const doc of allDoctors) {
+      if (doc.clinicId) {
+        if (!map[doc.clinicId]) map[doc.clinicId] = []
+        map[doc.clinicId].push(doc)
+      }
+    }
+    return map
+  }, [allDoctors])
 
   useEffect(() => {
     async function load() {
       try {
-        const data = await getClinics()
+        const [data, docList] = await Promise.all([getClinics(), getDoctors()])
         setClinics(data)
+        setAllDoctors(docList)
       } catch (err) {
         console.error('Failed to load clinics', err)
       } finally {
@@ -93,11 +113,39 @@ export const FindClinics: React.FC<FindClinicsProps> = ({
         if (filterType === 'single_doctor' && !isSingle) return null
         if (filterType === 'polyclinic' && !isPoly) return null
 
+        const clinicDocs = clinicDoctorsMap[clinic.id] || []
+        const hasDoctorInClinic = clinicDocs.some(
+          (d) => d.isInClinic !== false && (!d.activeClinicId || d.activeClinicId === clinic.id)
+        )
+        const inClinicDocsCount = clinicDocs.filter(
+          (d) => d.isInClinic !== false && (!d.activeClinicId || d.activeClinicId === clinic.id)
+        ).length
+
+        // Category / In-Clinic Availability filter check
+        if (filterType === 'doctor_in_clinic' && !hasDoctorInClinic) return null
+        if (filterType === 'diagnostic_lab' && !isLab) return null
+        if (filterType === 'single_doctor' && !isSingle) return null
+        if (filterType === 'polyclinic' && !isPoly) return null
+
         if (!searchTerm.trim()) {
-          return { clinic, score: 10, isLab, isSingle, isPoly, matchReason: undefined }
+          const baseScore = hasDoctorInClinic ? 30 + inClinicDocsCount * 5 : 10
+          return {
+            clinic,
+            score: baseScore,
+            isLab,
+            isSingle,
+            isPoly,
+            matchReason: undefined,
+            matchedDoctor:
+              clinicDocs.find(
+                (d) => d.isInClinic !== false && (!d.activeClinicId || d.activeClinicId === clinic.id)
+              ) || clinicDocs[0],
+            hasDoctorInClinic,
+            inClinicDocsCount,
+          }
         }
 
-        const match = matchClinic(clinic, [], [], searchTerm)
+        const match = matchClinic(clinic, clinicDocs, [], searchTerm)
         if (!match.isMatch) return null
 
         return {
@@ -107,6 +155,9 @@ export const FindClinics: React.FC<FindClinicsProps> = ({
           isSingle,
           isPoly,
           matchReason: match.matchHighlightReason,
+          matchedDoctor: match.matchedDoctors?.[0] || clinicDocs[0],
+          hasDoctorInClinic,
+          inClinicDocsCount,
         }
       })
       .filter(Boolean)
@@ -186,10 +237,11 @@ export const FindClinics: React.FC<FindClinicsProps> = ({
           ))}
         </div>
 
-        {/* 4 Clinic Category Filter Tabs */}
+        {/* 5 Clinic Category & Availability Filter Tabs */}
         <div className="pt-2 border-t border-slate-200/40 dark:border-white/10 flex items-center space-x-2 overflow-x-auto pb-1 scrollbar-none -mx-1 px-1 sm:mx-0 sm:px-0">
           {[
             { id: 'all', label: `All Centers (${clinics.length})`, icon: Building2 },
+            { id: 'doctor_in_clinic', label: 'Doctor In Clinic Now', icon: Stethoscope },
             { id: 'single_doctor', label: 'Single-Visit OPD Clinics', icon: Stethoscope },
             { id: 'polyclinic', label: 'Multi-Specialty Polyclinics', icon: Users },
             { id: 'diagnostic_lab', label: 'Diagnostic Pathology Labs', icon: FlaskConical },
@@ -242,7 +294,7 @@ export const FindClinics: React.FC<FindClinicsProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {scoredClinics.map((item) => {
             if (!item) return null
-            const { clinic, isLab, isSingle, isPoly, matchReason } = item
+            const { clinic, isLab, isSingle, isPoly, matchReason, matchedDoctor } = item
 
             let hoursText = `Avg ~${clinic.avgConsultationTimeMinutes || 10} min / token`
             if (clinic.weeklyScheduleJson) {
@@ -313,6 +365,12 @@ export const FindClinics: React.FC<FindClinicsProps> = ({
                       </span>
 
                       <div className="flex items-center space-x-1.5">
+                        {item.hasDoctorInClinic && (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] sm:text-[11px] font-bold bg-emerald-600/90 text-white shadow-glass-sm border border-white/20 backdrop-blur-md">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-300 mr-1 animate-ping" />
+                            Doctor In Clinic
+                          </span>
+                        )}
                         {clinic.isOnBreak && (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/90 text-white shadow-glass-sm border border-white/20 backdrop-blur-md">
                             On Break
@@ -340,6 +398,25 @@ export const FindClinics: React.FC<FindClinicsProps> = ({
                       <div className="p-2 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-center space-x-1.5 text-[11px] font-bold text-emerald-800 dark:text-emerald-300 backdrop-blur-sm">
                         <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
                         <span className="truncate">{matchReason}</span>
+                      </div>
+                    )}
+
+                    {matchedDoctor && (
+                      <div className="p-2 bg-teal-500/10 border border-teal-500/20 rounded-xl flex items-center justify-between text-[11px] font-bold text-teal-800 dark:text-teal-300 backdrop-blur-sm">
+                        <div className="flex items-center space-x-1.5 truncate">
+                          <Stethoscope className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400 shrink-0" />
+                          <span className="truncate">Attending Doctor: Dr. {matchedDoctor.fullName} ({matchedDoctor.specialty || 'Specialist'})</span>
+                        </div>
+                        {matchedDoctor.isInClinic !== false && (!matchedDoctor.activeClinicId || matchedDoctor.activeClinicId === clinic.id) ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[9px] font-bold bg-emerald-500/20 text-emerald-800 dark:text-emerald-300 border border-emerald-500/30 shrink-0 ml-1.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 mr-1 animate-ping" />
+                            In Clinic
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[9px] font-semibold liquid-glass-subtle text-slate-500 shrink-0 ml-1.5">
+                            Away
+                          </span>
+                        )}
                       </div>
                     )}
 

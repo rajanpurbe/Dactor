@@ -14,9 +14,16 @@ import {
   QueueEntry,
   PatientProfile,
   PatientTransactionRecord,
-  PaymentGatewaysConfig,
   SupportTicket,
+  PaymentGatewaysConfig,
 } from '../types'
+import {
+  parsePaymentRecords,
+  extractCleanClinicalRemarks,
+  buildCombinedRemarks,
+  WebPaymentRecord,
+} from '../utils/paymentLedger'
+
 
 // ==========================================
 // CLINICS API
@@ -261,6 +268,7 @@ function formatTimeForPostgres(timeStr?: string): string {
   if (isNaN(hours)) hours = 10
   if (isPM && hours < 12) hours += 12
   if (isAM && hours === 12) hours = 0
+  if (!isPM && !isAM && hours >= 1 && hours <= 6) hours += 12
   return `${String(hours).padStart(2, '0')}:${String(isNaN(mins) ? 0 : mins).padStart(2, '0')}:00`
 }
 
@@ -282,6 +290,56 @@ export async function getAppointmentByTrackingCode(code: string): Promise<Appoin
 
     if (error) return null
     return data ? mapAppointment(data) : null
+  } catch {
+    return null
+  }
+}
+
+export async function getAppointmentByTrackingCodeOrContact(identifier: string): Promise<Appointment | null> {
+  try {
+    const clean = identifier.trim()
+    if (!clean) return null
+
+    // 1. Try 10-digit code directly
+    if (/^\d{10}$/.test(clean)) {
+      const byCode = await getAppointmentByTrackingCode(clean)
+      if (byCode) return byCode
+    }
+
+    // 2. Try Email
+    if (clean.includes('@') && clean.includes('.')) {
+      const { data, error } = await supabase
+        .from('appointments')
+        .select('*, clinic:clinics(*), doctor:doctors(*), queue_entries(*)')
+        .ilike('patient_email', clean)
+        .order('appointment_date', { ascending: false })
+        .limit(10)
+
+      if (!error && data && data.length > 0) {
+        const active = data.find((a: any) => a.checkin_status !== 'completed' && a.checkin_status !== 'cancelled') || data[0]
+        return mapAppointment(active)
+      }
+    }
+
+    // 3. Try Mobile Phone
+    const digitsOnly = clean.replace(/\D/g, '')
+    if (digitsOnly.length >= 10) {
+      const phone10 = digitsOnly.slice(-10)
+      const { data, error } = await supabase
+        .from('appointments')
+        .select('*, clinic:clinics(*), doctor:doctors(*), queue_entries(*)')
+        .ilike('patient_mobile', `%${phone10}%`)
+        .order('appointment_date', { ascending: false })
+        .limit(10)
+
+      if (!error && data && data.length > 0) {
+        const active = data.find((a: any) => a.checkin_status !== 'completed' && a.checkin_status !== 'cancelled') || data[0]
+        return mapAppointment(active)
+      }
+    }
+
+    // Fallback: direct code lookup
+    return await getAppointmentByTrackingCode(clean)
   } catch {
     return null
   }
@@ -340,6 +398,48 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
     const cleanEmail = appt.patientEmail?.trim().toLowerCase() || null
     const cleanMobile = appt.patientMobile?.trim().replace(/\D/g, '') || ''
     const patientNameClean = appt.patientName?.trim() || 'Patient'
+
+    // ==========================================
+    // IDEMPOTENCY SAFETY CHECKS
+    // ==========================================
+    // 1. If an appointment already exists with this ID, return it immediately
+    if (appt.id) {
+      const { data: existingById } = await supabase
+        .from('appointments')
+        .select('*, clinic:clinics(*), doctor:doctors(*)')
+        .eq('id', appt.id)
+        .maybeSingle()
+      if (existingById) {
+        return mapAppointment(existingById)
+      }
+    }
+
+    // 2. If an appointment already exists with this 10-digit tracking code, return it
+    if (appt.trackingCode10Digit) {
+      const { data: existingByCode } = await supabase
+        .from('appointments')
+        .select('*, clinic:clinics(*), doctor:doctors(*)')
+        .eq('tracking_code_10_digit', appt.trackingCode10Digit)
+        .maybeSingle()
+      if (existingByCode) {
+        return mapAppointment(existingByCode)
+      }
+    }
+
+    // 3. Deduplication guard against rapid double-taps on poor connections
+    if (cleanMobile && appt.clinicId && apptDate && appt.slotId) {
+      const { data: existingDup } = await supabase
+        .from('appointments')
+        .select('*, clinic:clinics(*), doctor:doctors(*)')
+        .eq('clinic_id', appt.clinicId)
+        .eq('slot_id', appt.slotId)
+        .eq('patient_mobile', cleanMobile)
+        .eq('appointment_date', apptDate)
+        .maybeSingle()
+      if (existingDup) {
+        return mapAppointment(existingDup)
+      }
+    }
 
     try {
       let existingProf: any = null
@@ -487,24 +587,26 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
       console.warn('Queue entry slot-aware auto-enroll warning:', qErr)
     }
 
-    // Increment slot booked_count if applicable
+    // Idempotent slot capacity recount
     try {
-      if (appt.slotId) {
-        const { data: slotRow } = await supabase.from('slots').select('booked_count').eq('id', appt.slotId).maybeSingle()
-        if (slotRow) {
-          await supabase.from('slots').update({ booked_count: (Number(slotRow.booked_count) || 0) + 1 }).eq('id', appt.slotId)
-        }
-      } else if (appt.clinicId) {
-        const { data: slotRow } = await supabase
+      let targetSlotId = appt.slotId
+      if (!targetSlotId && appt.clinicId) {
+        const { data: foundSlot } = await supabase
           .from('slots')
-          .select('id, booked_count')
+          .select('id')
           .eq('clinic_id', appt.clinicId)
           .eq('slot_date', apptDate)
           .eq('start_time', apptTime)
           .maybeSingle()
-        if (slotRow) {
-          await supabase.from('slots').update({ booked_count: (Number(slotRow.booked_count) || 0) + 1 }).eq('id', slotRow.id)
-        }
+        if (foundSlot?.id) targetSlotId = foundSlot.id
+      }
+      if (targetSlotId) {
+        const { data: slotAppts } = await supabase
+          .from('appointments')
+          .select('id, checkin_status')
+          .eq('slot_id', targetSlotId)
+        const realCount = (slotAppts || []).filter((a: any) => a.checkin_status !== 'cancelled').length
+        await supabase.from('slots').update({ booked_count: realCount }).eq('id', targetSlotId)
       }
     } catch {}
 
@@ -535,20 +637,36 @@ export async function updateAppointmentStatus(id: string, status: string): Promi
   try {
     const nowIso = new Date().toISOString()
 
-    // Map UI status to valid queue_status_enum
+    // Map UI status to valid queue_status_enum and appointment checkin_status
     let qStatus = 'waiting'
-    if (status === 'in_consultation' || status === 'inside') qStatus = 'inside'
-    else if (status === 'completed' || status === 'done') qStatus = 'done'
-    else if (status === 'cancelled' || status === 'no_show') qStatus = 'no_show'
-    else if (status === 'sample_collected') qStatus = 'sample_collected'
-    else if (status === 'processing') qStatus = 'processing'
-    else if (status === 'report_prepared') qStatus = 'report_prepared'
-    else qStatus = 'waiting'
+    let apptCheckinStatus = 'checked_in'
+    if (status === 'in_consultation' || status === 'inside') {
+      qStatus = 'inside'
+      apptCheckinStatus = 'in_consultation'
+    } else if (status === 'completed' || status === 'done') {
+      qStatus = 'done'
+      apptCheckinStatus = 'completed'
+    } else if (status === 'cancelled' || status === 'no_show') {
+      qStatus = 'no_show'
+      apptCheckinStatus = 'cancelled'
+    } else if (status === 'sample_collected') {
+      qStatus = 'sample_collected'
+      apptCheckinStatus = 'sample_collected'
+    } else if (status === 'processing') {
+      qStatus = 'processing'
+      apptCheckinStatus = 'processing'
+    } else if (status === 'report_prepared') {
+      qStatus = 'report_prepared'
+      apptCheckinStatus = 'report_prepared'
+    } else {
+      qStatus = 'waiting'
+      apptCheckinStatus = 'checked_in'
+    }
 
-    // Ensure appointment checkin_status is checked_in
+    // Keep appointment checkin_status synchronized with live workflow
     await supabase
       .from('appointments')
-      .update({ checkin_status: 'checked_in', updated_at: nowIso })
+      .update({ checkin_status: apptCheckinStatus, updated_at: nowIso })
       .eq('id', id)
 
     // Update or create queue_entries row
@@ -566,11 +684,10 @@ export async function updateAppointmentStatus(id: string, status: string): Promi
     }
 
     if (existingQ?.id) {
-      const { error: qErr } = await supabase
+      await supabase
         .from('queue_entries')
         .update(qUpdate)
         .eq('id', existingQ.id)
-      return !qErr
     } else {
       // Fetch appointment to get clinic_id & doctor_id
       const { data: appt } = await supabase
@@ -580,7 +697,7 @@ export async function updateAppointmentStatus(id: string, status: string): Promi
         .maybeSingle()
 
       if (appt?.clinic_id) {
-        const { error: insErr } = await supabase.from('queue_entries').insert({
+        await supabase.from('queue_entries').insert({
           id: crypto.randomUUID(),
           appointment_id: id,
           clinic_id: appt.clinic_id,
@@ -588,8 +705,80 @@ export async function updateAppointmentStatus(id: string, status: string): Promi
           queue_position: 1,
           ...qUpdate,
         })
-        return !insErr
       }
+    }
+
+    // Keep slot capacity accurately recounted on cancellation
+    if (status === 'cancelled' || status === 'no_show') {
+      try {
+        const { data: targetAppt } = await supabase
+          .from('appointments')
+          .select('slot_id')
+          .eq('id', id)
+          .maybeSingle()
+        if (targetAppt?.slot_id) {
+          const { data: slotAppts } = await supabase
+            .from('appointments')
+            .select('id, checkin_status')
+            .eq('slot_id', targetAppt.slot_id)
+          const realCount = (slotAppts || []).filter((a: any) => a.id !== id && a.checkin_status !== 'cancelled').length
+          await supabase.from('slots').update({ booked_count: realCount }).eq('id', targetAppt.slot_id)
+        }
+      } catch {}
+    }
+
+    // Automatic Live Notification Dispatch
+    try {
+      const { data: targetAppt } = await supabase
+        .from('appointments')
+        .select('id, user_id, clinic_id, tracking_code_10_digit, patient_name, clinics(name)')
+        .eq('id', id)
+        .maybeSingle()
+
+      if (targetAppt) {
+        const clinicName = (targetAppt as any)?.clinics?.name || 'Clinic'
+        const code10 = targetAppt.tracking_code_10_digit || ''
+        const patientName = targetAppt.patient_name || 'Patient'
+
+        let notifTitle = ''
+        let notifMessage = ''
+
+        if (qStatus === 'inside') {
+          notifTitle = "It's Your Turn! • Please Enter Cabin"
+          notifMessage = `Dear ${patientName}, the doctor is ready for your consultation at ${clinicName}. Please proceed into the doctor's cabin now.${code10 ? ` (Tracking Code: ${code10})` : ''}`
+        } else if (qStatus === 'sample_collected') {
+          notifTitle = 'Sample Collected • Processing in Lab'
+          notifMessage = `Dear ${patientName}, your test sample has been safely collected at ${clinicName} and is now being processed.${code10 ? ` (Tracking Code: ${code10})` : ''}`
+        } else if (qStatus === 'report_prepared') {
+          notifTitle = 'Lab Report Ready • Download Available'
+          notifMessage = `Dear ${patientName}, your diagnostic lab test report from ${clinicName} is now ready to view and download.${code10 ? ` (Tracking Code: ${code10})` : ''}`
+        } else if (qStatus === 'done') {
+          notifTitle = 'Consultation Completed'
+          notifMessage = `Dear ${patientName}, your visit at ${clinicName} has been marked completed. Thank you for choosing Dactor.${code10 ? ` (Tracking Code: ${code10})` : ''}`
+        }
+
+        if (notifTitle) {
+          await supabase.from('notifications').insert({
+            id: crypto.randomUUID(),
+            appointment_id: targetAppt.id,
+            user_id: targetAppt.user_id && targetAppt.user_id.length === 36 ? targetAppt.user_id : null,
+            title: notifTitle,
+            message: notifMessage,
+            type: 'queue_alert',
+            target_audience: 'specific',
+            is_read: false,
+            meta_json: JSON.stringify({ tracking_code: code10, status: qStatus }),
+            created_at: nowIso,
+          })
+        }
+
+        // When a patient enters cabin or completes, notify approaching patients in queue
+        if (targetAppt.clinic_id && (qStatus === 'inside' || qStatus === 'done')) {
+          checkAndNotifyApproachingPatients(targetAppt.clinic_id).catch(() => {})
+        }
+      }
+    } catch (notifErr) {
+      console.warn('Automatic notification dispatch warning:', notifErr)
     }
 
     return true
@@ -604,18 +793,63 @@ export async function updateAppointmentStatus(id: string, status: string): Promi
 // ==========================================
 export async function getSlots(clinicId: string, date: string): Promise<Slot[]> {
   try {
+    const [slotsRes, apptsRes] = await Promise.all([
+      supabase
+        .from('slots')
+        .select('*')
+        .eq('clinic_id', clinicId)
+        .eq('slot_date', date)
+        .order('start_time', { ascending: true }),
+      supabase
+        .from('appointments')
+        .select('id, slot_id, checkin_status')
+        .eq('clinic_id', clinicId)
+        .eq('appointment_date', date)
+    ])
+
+    if (slotsRes.error) throw slotsRes.error
+    const activeAppts = (apptsRes.data || []).filter((a: any) => a.checkin_status !== 'cancelled')
+
+    return (slotsRes.data || []).map((raw) => {
+      const slot = mapSlot(raw)
+      const actualCount = activeAppts.filter((a: any) => a.slot_id === slot.id).length
+      return {
+        ...slot,
+        bookedCount: Math.max(slot.bookedCount, actualCount),
+      }
+    })
+  } catch (err) {
+    console.error('Error fetching slots:', err)
+    return []
+  }
+}
+
+export async function getMonthSlots(
+  clinicId: string,
+  startDate: string,
+  endDate: string
+): Promise<Record<string, Slot[]>> {
+  try {
     const { data, error } = await supabase
       .from('slots')
       .select('*')
       .eq('clinic_id', clinicId)
-      .eq('slot_date', date)
+      .gte('slot_date', startDate)
+      .lte('slot_date', endDate)
       .order('start_time', { ascending: true })
 
     if (error) throw error
-    return (data || []).map(mapSlot)
+    const map: Record<string, Slot[]> = {}
+    for (const raw of data || []) {
+      const slot = mapSlot(raw)
+      const d = slot.slotDate
+      if (!map[d]) map[d] = []
+      map[d].push(slot)
+    }
+    return map
   } catch (err) {
-    console.error('Error fetching slots:', err)
-    return []
+    console.error('Error fetching month slots:', err)
+    return {}
   }
 }
 
@@ -630,6 +864,8 @@ export async function createSlot(slot: Partial<Slot>): Promise<Slot | null> {
       end_time: formatTimeForPostgres(slot.endTime),
       max_capacity: slot.maxCapacity || 10,
       booked_count: slot.bookedCount || 0,
+      is_published: slot.isPublished ?? true,
+      is_available: slot.isAvailable ?? true,
     }
 
     const { data, error } = await supabase
@@ -742,6 +978,7 @@ export async function shiftAppointmentDate(
   try {
     const updatePayload: any = {
       appointment_date: newDate,
+      checkin_status: 'waiting',
       updated_at: new Date().toISOString(),
     }
     if (newTime) {
@@ -756,6 +993,87 @@ export async function shiftAppointmentDate(
       .single()
 
     if (error) throw error
+
+    // Manage Queue Entry on Reschedule
+    try {
+      const todayStr = new Date().toISOString().split('T')[0]
+      const targetTime = newTime || updatedAppt?.appointment_time
+      const targetMinutes = parseTimeToMinutes(targetTime)
+
+      const { data: existingQ } = await supabase
+        .from('queue_entries')
+        .select('*')
+        .eq('appointment_id', appointmentId)
+        .maybeSingle()
+
+      if (newDate === todayStr) {
+        // Patient rescheduled to today: reposition slot-aware
+        const { data: activeEntries } = await supabase
+          .from('queue_entries')
+          .select('id, appointment_id, queue_position, status')
+          .eq('clinic_id', updatedAppt.clinic_id)
+          .neq('appointment_id', appointmentId)
+          .in('status', ['waiting', 'inside'])
+          .order('queue_position', { ascending: true })
+
+        const apptIds = (activeEntries || []).map((e) => e.appointment_id).filter(Boolean)
+        const { data: activeAppts } = apptIds.length > 0
+          ? await supabase.from('appointments').select('id, appointment_time').in('id', apptIds)
+          : { data: [] }
+        const apptMap = new Map<string, any>((activeAppts || []).map((a) => [a.id, a]))
+
+        const preceding = (activeEntries || []).filter((entry) => {
+          if (entry.status === 'inside') return true
+          const a = apptMap.get(entry.appointment_id)
+          const slotMins = parseTimeToMinutes(a?.appointment_time)
+          return slotMins <= targetMinutes
+        })
+
+        const nextPos = (preceding.length > 0 ? Math.max(...preceding.map((p) => p.queue_position || 0)) : 0) + 1
+
+        // Shift all entries with queue_position >= nextPos down (+1)
+        const laterEntries = (activeEntries || [])
+          .filter((entry) => (entry.queue_position || 0) >= nextPos)
+          .sort((a, b) => (b.queue_position || 0) - (a.queue_position || 0))
+
+        for (const entry of laterEntries) {
+          await supabase
+            .from('queue_entries')
+            .update({ queue_position: (entry.queue_position || 0) + 1, updated_at: new Date().toISOString() })
+            .eq('id', entry.id)
+        }
+
+        if (existingQ) {
+          await supabase
+            .from('queue_entries')
+            .update({
+              queue_position: nextPos,
+              status: 'waiting',
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', existingQ.id)
+        } else {
+          await supabase.from('queue_entries').insert({
+            id: crypto.randomUUID(),
+            appointment_id: appointmentId,
+            clinic_id: updatedAppt.clinic_id,
+            doctor_id: updatedAppt.doctor_id || null,
+            queue_position: nextPos,
+            status: 'waiting',
+          })
+        }
+      } else {
+        // Rescheduled to a future date: remove from today's active queue
+        if (existingQ) {
+          await supabase
+            .from('queue_entries')
+            .update({ status: 'scheduled', updated_at: new Date().toISOString() })
+            .eq('id', existingQ.id)
+        }
+      }
+    } catch (qErr) {
+      console.warn('Queue adjustment warning during reschedule:', qErr)
+    }
 
     // Create reschedule alert notification for the patient
     try {
@@ -787,7 +1105,7 @@ export async function checkAndNotifyApproachingPatients(
   try {
     const { data: waitingEntries } = await supabase
       .from('queue_entries')
-      .select('id, appointment_id, queue_position, appointments(patient_name, user_id, clinic_id, clinics(name))')
+      .select('id, appointment_id, queue_position, appointments(patient_name, user_id, clinic_id, tracking_code_10_digit, clinics(name))')
       .eq('clinic_id', clinicId)
       .eq('status', 'waiting')
       .order('queue_position', { ascending: true })
@@ -799,22 +1117,34 @@ export async function checkAndNotifyApproachingPatients(
       if (pos > 0 && pos <= threshold) {
         const appt: any = entry.appointments
         const clinicName = appt?.clinics?.name || 'Clinic'
+        const code10 = appt?.tracking_code_10_digit || ''
         const patientsAhead = Math.max(0, pos - 1)
         const msg = patientsAhead === 0
-          ? `You are next in line at ${clinicName}! Please prepare to enter the doctor's cabin.`
-          : `Your turn is approaching! Only ${patientsAhead} ${patientsAhead === 1 ? 'patient' : 'patients'} ahead of you at ${clinicName}. Please proceed to the clinic waiting area.`
+          ? `You are next in line at ${clinicName}! Please prepare to enter the doctor's cabin.${code10 ? ` (Tracking Code: ${code10})` : ''}`
+          : `Your turn is approaching! Only ${patientsAhead} ${patientsAhead === 1 ? 'patient' : 'patients'} ahead of you at ${clinicName}. Please proceed to the clinic waiting area.${code10 ? ` (Tracking Code: ${code10})` : ''}`
 
-        await supabase.from('notifications').insert({
-          id: crypto.randomUUID(),
-          appointment_id: entry.appointment_id,
-          user_id: appt?.user_id && appt.user_id.length === 36 ? appt.user_id : null,
-          title: `Your Turn is Approaching! Token #${pos}`,
-          message: msg,
-          type: 'queue_alert',
-          target_audience: 'specific',
-          is_read: false,
-          created_at: new Date().toISOString(),
-        })
+        // Deduplicate: avoid resending same token alert repeatedly
+        const { data: recentAlert } = await supabase
+          .from('notifications')
+          .select('id')
+          .eq('appointment_id', entry.appointment_id)
+          .ilike('title', `%Token #${pos}%`)
+          .maybeSingle()
+
+        if (!recentAlert) {
+          await supabase.from('notifications').insert({
+            id: crypto.randomUUID(),
+            appointment_id: entry.appointment_id,
+            user_id: appt?.user_id && appt.user_id.length === 36 ? appt.user_id : null,
+            title: `Your Turn is Approaching! Token #${pos}`,
+            message: msg,
+            type: 'queue_alert',
+            target_audience: 'specific',
+            is_read: false,
+            meta_json: JSON.stringify({ tracking_code: code10, token: pos }),
+            created_at: new Date().toISOString(),
+          })
+        }
       }
     }
   } catch (err) {
@@ -1167,11 +1497,14 @@ export async function saveOrUpdateInvoicePayment(params: {
   paidAmount: number
   remarks?: string
   receiptUrl?: string
+  items?: { id?: string; itemName?: string; name?: string; quantity: number; price: number; total?: number }[]
+  paymentRecords?: WebPaymentRecord[]
+  newPaymentAmount?: number
+  newPaymentNote?: string
+  newPaymentDateTime?: string
 }): Promise<BillingInvoice | null> {
   try {
     const { appointmentId, clinicId, totalAmount, paidAmount, remarks, receiptUrl } = params
-    const balanceDue = Math.max(0, totalAmount - paidAmount)
-    const dbPaymentStatus = paidAmount >= totalAmount && totalAmount > 0 ? 'paid' : 'pending'
     const nowIso = new Date().toISOString()
 
     // Check if invoice already exists
@@ -1181,23 +1514,69 @@ export async function saveOrUpdateInvoicePayment(params: {
       .eq('appointment_id', appointmentId)
       .maybeSingle()
 
-    const combinedRemarks = [
-      remarks?.trim(),
+    // Parse existing payments ledger
+    const existingPayments = parsePaymentRecords(
+      existing?.remarks,
+      Number(existing?.paid_amount || 0),
+      existing?.paid_at
+    )
+
+    let updatedPayments: WebPaymentRecord[] = params.paymentRecords ? [...params.paymentRecords] : [...existingPayments]
+    if (params.newPaymentAmount && params.newPaymentAmount > 0) {
+      updatedPayments.push({
+        id: crypto.randomUUID(),
+        amount: Number(params.newPaymentAmount),
+        dateTime: params.newPaymentDateTime || `${new Date().toISOString().slice(0, 10)} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
+        note: params.newPaymentNote?.trim() || 'Payment Received',
+      })
+    }
+
+    const calculatedTotalPaid = updatedPayments.length > 0
+      ? updatedPayments.reduce((acc, p) => acc + p.amount, 0)
+      : paidAmount
+
+    const rawClinicalRem = extractCleanClinicalRemarks(remarks !== undefined ? remarks : existing?.remarks)
+    const combinedRemarksWithReceipt = [
+      rawClinicalRem,
       receiptUrl ? `Receipt: ${receiptUrl}` : undefined,
     ]
       .filter(Boolean)
       .join(' | ')
 
+    const finalRemarks = buildCombinedRemarks(combinedRemarksWithReceipt, updatedPayments)
+
+    const itemsToSave = params.items && params.items.length > 0
+      ? params.items.map((it) => ({
+          itemName: it.itemName || it.name || 'Clinical Service',
+          quantity: Number(it.quantity || 1),
+          price: Number(it.price || 0),
+          total: Number(it.total || (Number(it.price || 0) * Number(it.quantity || 1))),
+        }))
+      : (Array.isArray(existing?.items) && existing.items.length > 0
+          ? existing.items
+          : [
+              {
+                itemName: 'Consultation & Clinical Services',
+                quantity: 1,
+                price: totalAmount,
+                total: totalAmount,
+              },
+            ])
+
+    const balanceDue = Math.max(0, totalAmount - calculatedTotalPaid)
+    const dbPaymentStatus = (calculatedTotalPaid >= totalAmount && totalAmount > 0) ? 'paid' : (calculatedTotalPaid > 0 ? 'partial' : 'pending')
+
     const invoicePayload: any = {
       id: existing?.id || crypto.randomUUID(),
       appointment_id: appointmentId,
       clinic_id: clinicId,
+      items: itemsToSave,
       total_amount: totalAmount,
-      paid_amount: paidAmount,
+      paid_amount: calculatedTotalPaid,
       balance_due: balanceDue,
       payment_status: dbPaymentStatus,
-      paid_at: paidAmount > 0 ? (existing?.paid_at || nowIso) : null,
-      remarks: combinedRemarks || existing?.remarks || null,
+      paid_at: calculatedTotalPaid > 0 ? (existing?.paid_at || nowIso) : null,
+      remarks: finalRemarks,
       created_at: existing?.created_at || nowIso,
       updated_at: nowIso,
     }
@@ -1487,7 +1866,7 @@ export async function searchPatientRecords(clinicId: string, searchQuery: string
       .from('appointments')
       .select('*, doctor:doctors(*), clinic:clinics(*), queue_entries(*)')
       .eq('clinic_id', clinicId)
-      .or(`tracking_code_10_digit.ilike.%${q}%,patient_mobile.ilike.%${q}%,patient_name.ilike.%${q}%`)
+      .or(`tracking_code_10_digit.ilike.%${q}%,patient_mobile.ilike.%${q}%,patient_name.ilike.%${q}%,patient_email.ilike.%${q}%`)
       .order('appointment_date', { ascending: false })
 
     if (error) throw error
@@ -1722,6 +2101,7 @@ function mapSlot(s: any): Slot {
     maxCapacity: s.max_capacity,
     bookedCount: s.booked_count,
     isAvailable: s.is_available ?? true,
+    isPublished: s.is_published ?? true,
   }
 }
 
@@ -1801,6 +2181,16 @@ function mapBillingInvoice(b: any): BillingInvoice {
     id: b.id,
     appointmentId: b.appointment_id,
     clinicId: b.clinic_id,
+    items: Array.isArray(b.items)
+      ? b.items.map((it: any) => ({
+          id: it.id || crypto.randomUUID(),
+          itemName: it.itemName || it.item_name || it.name || 'Clinical Service',
+          name: it.name || it.itemName || it.item_name || 'Clinical Service',
+          quantity: Number(it.quantity || 1),
+          price: Number(it.price || it.unitPrice || 0),
+          total: Number(it.total || (Number(it.price || 0) * Number(it.quantity || 1))),
+        }))
+      : [],
     totalAmount: Number(b.total_amount || 0),
     paidAmount: Number(b.paid_amount || 0),
     balanceDue: Number(b.balance_due || 0),
@@ -1841,42 +2231,19 @@ export function parseTimeToMinutes(timeStr?: string): number {
   if (!timeStr) return 23 * 60 + 59
   try {
     const clean = timeStr.trim().toUpperCase()
-    const parts = clean.split(/[-–]|TO/)
-    const firstPart = parts[0]?.trim() || clean
-    const secondPart = parts[1]?.trim() || ''
-
-    const m = firstPart.match(/^(\d{1,2})(?::(\d{2}))?/)
+    const isPm = clean.includes('PM')
+    const isAm = clean.includes('AM')
+    const stripped = clean.replace(/AM|PM/g, '').trim()
+    const m = stripped.match(/^(\d{1,2})(?:[:.](\d{1,2}))?/)
     if (!m) return 12 * 60
     let hours = parseInt(m[1], 10)
     const minutes = parseInt(m[2] || '0', 10)
 
-    const firstHasAm = firstPart.includes('AM')
-    const firstHasPm = firstPart.includes('PM')
-    const secondHasAm = secondPart.includes('AM')
-    const secondHasPm = secondPart.includes('PM')
-
-    const isAm = firstHasAm
-      ? true
-      : firstHasPm
-      ? false
-      : secondHasAm
-      ? true
-      : secondHasPm && hours >= 7 && hours <= 11
-      ? true
-      : false
-
-    const isPm = firstHasPm
-      ? true
-      : firstHasAm
-      ? false
-      : secondHasPm && hours >= 1 && hours <= 6
-      ? true
-      : secondHasPm && hours === 12
-      ? true
-      : false
-
     if (isPm && hours < 12) hours += 12
     if (isAm && hours === 12) hours = 0
+
+    // In medical clinic contexts, if AM/PM is omitted and hour is 1..6,
+    // it represents afternoon hours (1:00 PM to 6:00 PM / 13:00 to 18:00)
     if (!isPm && !isAm && hours >= 1 && hours <= 6) hours += 12
 
     return hours * 60 + minutes
@@ -1885,20 +2252,67 @@ export function parseTimeToMinutes(timeStr?: string): number {
   }
 }
 
-export function isSlotTimeExpired(slotDate: string, endTimeStr: string): boolean {
-  if (!slotDate || !endTimeStr) return false
+export function isSlotTimeExpired(slotDate: string, endTimeStr?: string, startTimeStr?: string): boolean {
+  if (!slotDate) return false
   const now = new Date()
-  const todayStr = now.toISOString().split('T')[0]
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  const todayStr = `${year}-${month}-${day}`
 
   // Compare dates: YYYY-MM-DD
   if (slotDate < todayStr) return true
   if (slotDate > todayStr) return false
 
+  let cleanEnd = (endTimeStr || '').trim()
+  let cleanStart = (startTimeStr || '').trim()
+
+  const rangePattern = /\s*(?:[-–—]|\bto\b)\s*/i
+  if (!cleanEnd && rangePattern.test(cleanStart)) {
+    const parts = cleanStart.split(rangePattern)
+    if (parts.length >= 2) {
+      cleanStart = parts[0].trim()
+      cleanEnd = parts[1].trim()
+    }
+  } else if (rangePattern.test(cleanEnd)) {
+    const parts = cleanEnd.split(rangePattern)
+    if (parts.length >= 2) {
+      if (!cleanStart) cleanStart = parts[0].trim()
+      cleanEnd = parts[parts.length - 1].trim()
+    }
+  }
+
+  const startMins = cleanStart ? parseTimeToMinutes(cleanStart) : null
+  let endMins = cleanEnd ? parseTimeToMinutes(cleanEnd) : null
+
+  if (endMins === null) {
+    if (startMins !== null) {
+      endMins = startMins + 30
+    } else {
+      return false
+    }
+  }
+
+  if (startMins !== null && endMins === startMins) {
+    endMins = startMins + 30
+  }
+
+  // Handle 12-hour rollover without AM/PM:
+  // e.g. start at 12:00 (720m) and end at 1:00 (which if not converted would be 60m)
+  // If endMins < startMins, check if adding 12 hours (720 mins) makes it a valid afternoon/evening slot
+  if (endMins === 0 && (startMins === null || startMins > 0)) {
+    endMins = 24 * 60
+  } else if (startMins !== null && endMins < startMins) {
+    if (endMins + 720 > startMins && (endMins + 720 - startMins) <= 720) {
+      endMins += 720
+    } else {
+      endMins += 24 * 60
+    }
+  }
+
   // If slot is today, check if slot end time has passed
   const currentMinutes = now.getHours() * 60 + now.getMinutes()
-  const endMinutes = parseTimeToMinutes(endTimeStr)
-
-  return currentMinutes >= endMinutes
+  return currentMinutes >= endMins
 }
 
 export async function getPatientProfileByEmail(email: string): Promise<PatientProfile | null> {
@@ -2985,5 +3399,44 @@ export async function updateSupportTicketStatus(
   }
 
   return true
+}
+
+export async function getSupportTicketByCodeOrContact(query: string): Promise<SupportTicket | null> {
+  if (!query || !query.trim()) return null
+  const clean = query.trim().toUpperCase()
+  const cleanAlphanumeric = clean.replace(/[^A-Z0-9]/g, '')
+  const cleanPhone = query.replace(/\D/g, '')
+  const cleanEmail = query.trim().toLowerCase()
+
+  const list = await getSupportTickets()
+
+  // 1. Exact or normalized match on ticketCode
+  const byCode = list.find((t) => {
+    const tCode = (t.ticketCode || '').toUpperCase()
+    const tCodeClean = tCode.replace(/[^A-Z0-9]/g, '')
+    return (
+      tCode === clean ||
+      (cleanAlphanumeric.length >= 4 && tCodeClean.includes(cleanAlphanumeric)) ||
+      (cleanAlphanumeric.length >= 4 && cleanAlphanumeric.includes(tCodeClean))
+    )
+  })
+  if (byCode) return byCode
+
+  // 2. Match by contact phone (at least 7 digits)
+  if (cleanPhone.length >= 7) {
+    const byPhone = list.find((t) => {
+      const p = (t.phone || '').replace(/\D/g, '')
+      return p.length >= 7 && (p.includes(cleanPhone) || cleanPhone.includes(p))
+    })
+    if (byPhone) return byPhone
+  }
+
+  // 3. Match by Gmail / Email
+  if (query.includes('@')) {
+    const byEmail = list.find((t) => (t.email || '').toLowerCase() === cleanEmail)
+    if (byEmail) return byEmail
+  }
+
+  return null
 }
 

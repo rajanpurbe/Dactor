@@ -8,6 +8,7 @@ export interface Clinic {
   addressText?: string
   latitude?: number
   longitude?: number
+  city?: string
   autoNotifyThreshold?: number
   description?: string
   panNumber?: string
@@ -104,6 +105,8 @@ export interface Slot {
   maxCapacity: number
   bookedCount: number
   isAvailable?: boolean
+  isBreak?: boolean
+  isPublished?: boolean
 }
 
 export interface ClinicService {
@@ -122,6 +125,7 @@ export interface Appointment {
   userId?: string | null
   clinicId: string
   doctorId?: string | null
+  slotId?: string | null
   patientName: string
   patientAge?: number | null
   patientGender?: string | null
@@ -131,6 +135,7 @@ export interface Appointment {
   appointmentTime: string
   checkinStatus: string // booked, waiting, in_consultation, completed, cancelled, no_show
   paymentStatus: string // unpaid, paid, partial
+  paymentMethod?: string
   feeAmount: number
   queueNumber?: number
   queuePosition?: number
@@ -204,6 +209,7 @@ export interface BillingInvoice {
   paidAt?: string
   remarks?: string
   receiptUrl?: string
+  items?: { id?: string; itemName?: string; name?: string; quantity: number; price: number; total?: number }[]
   createdAt?: string
 }
 

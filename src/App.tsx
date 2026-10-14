@@ -16,7 +16,7 @@ import { NotFound } from './pages/NotFound'
 import { LiveTrackerModal } from './components/LiveTrackerModal'
 import { LabReportModal } from './components/LabReportModal'
 import { NotificationModal } from './components/NotificationModal'
-import { getPatientNotifications } from './services/db'
+import { getPatientNotifications, getDoctorById } from './services/db'
 import { supabase } from './lib/supabase'
 import { LiquidAuroraBackground } from './components/glass'
 
@@ -24,9 +24,14 @@ import { LiquidAuroraBackground } from './components/glass'
 const getTabFromUrl = (): string => {
   if (typeof window === 'undefined') return 'home'
 
-  // 1. Check URL query parameters (e.g. ?page=support or ?tab=clinics)
+  // 1. Check URL query parameters (e.g. ?clinic=123 or ?page=support or ?tab=clinics)
   try {
     const params = new URLSearchParams(window.location.search)
+    if (params.get('clinic') || params.get('clinicId')) return 'clinic-detail'
+    if (params.get('doctor') || params.get('doctorId')) return 'clinic-detail'
+    if (params.get('code') || params.get('track')) return 'live-queue'
+    if (params.get('q') || params.get('search') || params.get('specialty')) return 'clinics'
+
     const tabParam = params.get('tab') || params.get('page')
     if (tabParam) {
       const cleanParam = tabParam.toLowerCase().trim()
@@ -35,6 +40,7 @@ const getTabFromUrl = (): string => {
       if (cleanParam === 'doctor' || cleanParam === 'doctor-portal' || cleanParam === 'practitioner') return 'doctor-portal'
       if (cleanParam === 'portal' || cleanParam === 'admin-portal' || cleanParam === 'clinic-portal' || cleanParam === 'clinic') return 'portal'
       if (cleanParam === 'clinics') return 'clinics'
+      if (cleanParam === 'clinic-detail') return 'clinic-detail'
       if (cleanParam === 'lab-reports' || cleanParam === 'reports') return 'lab-reports'
       if (cleanParam === 'average-time' || cleanParam === 'wait-time') return 'average-time'
       if (cleanParam === 'live-queue' || cleanParam === 'queue') return 'live-queue'
@@ -43,7 +49,7 @@ const getTabFromUrl = (): string => {
     }
   } catch {}
 
-  // 2. Check URL Hash (e.g. #clinics, #live-queue, #broken-link)
+  // 2. Check URL Hash (e.g. #clinics, #live-queue, #clinic-detail)
   const rawHash = window.location.hash.toLowerCase()
   if (rawHash) {
     const hash = rawHash.replace(/^#\/?/, '').replace(/\/$/, '').split('?')[0]
@@ -51,9 +57,19 @@ const getTabFromUrl = (): string => {
     if (hash === 'support' || hash === 'contact' || hash === 'helpdesk') return 'support'
     if (hash === 'patient' || hash === 'patient-portal' || hash === 'my-health') return 'patient-portal'
     if (hash === 'doctor' || hash === 'doctor-portal' || hash === 'practitioner') return 'doctor-portal'
-    if (hash === 'portal' || hash === 'admin-portal' || hash === 'clinic-portal' || hash === 'clinic') return 'portal'
+    if (
+      hash === 'portal' ||
+      hash === 'admin-portal' ||
+      hash === 'clinic-portal' ||
+      hash === 'clinic' ||
+      hash === 'tickets' ||
+      hash === 'admin-tickets' ||
+      hash === 'helpdesk-admin' ||
+      hash === 'admin'
+    )
+      return 'portal'
     if (hash === 'clinics') return 'clinics'
-    if (hash === 'clinic-detail') return 'clinic-detail'
+    if (hash === 'clinic-detail' || hash.startsWith('clinic')) return 'clinic-detail'
     if (hash === 'lab-reports' || hash === 'reports') return 'lab-reports'
     if (hash === 'average-time' || hash === 'wait-time') return 'average-time'
     if (hash === 'live-queue' || hash === 'queue') return 'live-queue'
@@ -64,13 +80,27 @@ const getTabFromUrl = (): string => {
   }
 
   // 3. Check pathname (e.g. /support, /clinics, /unknown-page)
-  const path = window.location.pathname.toLowerCase().replace(/\/$/, '')
+  let path = window.location.pathname.toLowerCase().replace(/\/$/, '')
+  // Support GitHub Pages project subpath /dactor or /dactor/
+  if (path === '/dactor' || path === '/dactor/index.html' || path === '/dactor/index') {
+    path = ''
+  } else if (path.startsWith('/dactor/')) {
+    path = path.slice('/dactor'.length).replace(/\/$/, '')
+  }
+
   if (!path || path === '' || path === '/' || path === '/index.html' || path === '/index') return 'home'
 
   if (path.includes('support') || path.includes('contact') || path.includes('helpdesk')) return 'support'
   if (path.includes('patient') || path.includes('my-health')) return 'patient-portal'
   if (path.includes('doctor') || path.includes('practitioner')) return 'doctor-portal'
-  if (path.includes('admin-portal') || path.includes('/portal') || path.includes('clinic-portal')) return 'portal'
+  if (
+    path.includes('admin-portal') ||
+    path.includes('/portal') ||
+    path.includes('clinic-portal') ||
+    path.includes('tickets') ||
+    path.includes('admin')
+  )
+    return 'portal'
   if (path.includes('clinics')) return 'clinics'
   if (path.includes('lab-reports')) return 'lab-reports'
   if (path.includes('average-time')) return 'average-time'
@@ -87,9 +117,44 @@ export const App: React.FC = () => {
   const [selectedClinicId, setSelectedClinicId] = useState<string | null>(() => {
     try {
       const p = new URLSearchParams(window.location.search)
-      return p.get('clinic') || p.get('clinicId') || null
+      if (p.get('clinic')) return p.get('clinic')
+      if (p.get('clinicId')) return p.get('clinicId')
+      if (window.location.hash) {
+        const hashParams = new URLSearchParams(window.location.hash.split('?')[1] || '')
+        return hashParams.get('clinic') || hashParams.get('clinicId') || null
+      }
+      return null
     } catch {
       return null
+    }
+  })
+  const [selectedDoctorId, setSelectedDoctorId] = useState<string | null>(() => {
+    try {
+      const p = new URLSearchParams(window.location.search)
+      if (p.get('doctor')) return p.get('doctor')
+      if (p.get('doctorId')) return p.get('doctorId')
+      if (window.location.hash) {
+        const hashParams = new URLSearchParams(window.location.hash.split('?')[1] || '')
+        return hashParams.get('doctor') || hashParams.get('doctorId') || null
+      }
+      return null
+    } catch {
+      return null
+    }
+  })
+  const [autoOpenBooking, setAutoOpenBooking] = useState<boolean>(() => {
+    try {
+      const p = new URLSearchParams(window.location.search)
+      const action = p.get('action') || p.get('intent')
+      if (action === 'book' || action === 'appointment' || action === 'reserve') return true
+      if (window.location.hash) {
+        const hashParams = new URLSearchParams(window.location.hash.split('?')[1] || '')
+        const hashAction = hashParams.get('action') || hashParams.get('intent')
+        return hashAction === 'book' || hashAction === 'appointment' || hashAction === 'reserve'
+      }
+      return false
+    } catch {
+      return false
     }
   })
   const [activeTrackingCode, setActiveTrackingCode] = useState<string>(() => {
@@ -101,6 +166,22 @@ export const App: React.FC = () => {
     }
   })
   const [clinicFilter, setClinicFilter] = useState<string>('all')
+  const [rescheduleTrackingCode, setRescheduleTrackingCode] = useState<string>(() => {
+    try {
+      const p = new URLSearchParams(window.location.search)
+      return p.get('rescheduleCode') || p.get('followupCode') || ''
+    } catch {
+      return ''
+    }
+  })
+  const [isRescheduleMode, setIsRescheduleMode] = useState<boolean>(() => {
+    try {
+      const p = new URLSearchParams(window.location.search)
+      return p.get('reschedule') === 'true'
+    } catch {
+      return false
+    }
+  })
 
   // Authentication State
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
@@ -187,11 +268,62 @@ export const App: React.FC = () => {
     }
   }, [])
 
-  // Navigation handler
+  // Resolve clinic if only doctor ID was provided in URL (e.g. direct Google Search or AI overview link)
+  useEffect(() => {
+    if (selectedDoctorId && !selectedClinicId) {
+      let isMounted = true
+      getDoctorById(selectedDoctorId).then((doc) => {
+        if (isMounted && doc?.clinicId) {
+          setSelectedClinicId(doc.clinicId)
+        }
+      })
+      return () => {
+        isMounted = false
+      }
+    }
+  }, [selectedDoctorId, selectedClinicId])
+
+  // Navigation handler with deep link support
   const handleNavigate = (tab: string, params?: any) => {
-    if (tab === 'clinic-detail' && params?.clinicId) {
-      setSelectedClinicId(params.clinicId)
+    if (tab === 'clinic-detail' && (params?.clinicId || selectedClinicId)) {
+      const cId = params?.clinicId || selectedClinicId
+      setSelectedClinicId(cId)
+      if (params?.doctorId !== undefined) {
+        setSelectedDoctorId(params.doctorId || null)
+      }
+      if (params?.action === 'book' || params?.autoOpenBooking) {
+        setAutoOpenBooking(true)
+      } else {
+        setAutoOpenBooking(false)
+      }
+      if (params?.trackingCode || params?.followupCode) {
+        setRescheduleTrackingCode(params.trackingCode || params.followupCode)
+      } else if (params?.resetTrackingCode) {
+        setRescheduleTrackingCode('')
+      }
+      if (params?.isReschedule !== undefined) {
+        setIsRescheduleMode(Boolean(params.isReschedule))
+      } else if (params?.resetTrackingCode) {
+        setIsRescheduleMode(false)
+      }
       setActiveTab('clinic-detail')
+      try {
+        const url = new URL(window.location.href)
+        url.searchParams.set('clinic', cId!)
+        if (params?.doctorId) url.searchParams.set('doctor', params.doctorId)
+        else url.searchParams.delete('doctor')
+        if (params?.action === 'book') url.searchParams.set('action', 'book')
+        else url.searchParams.delete('action')
+        if (params?.trackingCode) {
+          url.searchParams.set(params.isReschedule ? 'rescheduleCode' : 'followupCode', params.trackingCode)
+        }
+        if (params?.isReschedule !== undefined) {
+          url.searchParams.set('reschedule', String(params.isReschedule))
+        }
+        url.searchParams.delete('tab')
+        url.searchParams.delete('page')
+        window.history.pushState({}, '', url.toString())
+      } catch {}
       window.scrollTo({ top: 0, behavior: 'smooth' })
       return
     }
@@ -201,6 +333,19 @@ export const App: React.FC = () => {
     }
 
     setActiveTab(tab)
+    try {
+      const url = new URL(window.location.href)
+      if (tab === 'home') {
+        url.search = ''
+      } else {
+        url.searchParams.delete('clinic')
+        url.searchParams.delete('doctor')
+        url.searchParams.delete('action')
+        url.searchParams.set('tab', tab)
+      }
+      window.history.pushState({}, '', url.toString())
+    } catch {}
+
     if (window.location.hash !== `#${tab}`) {
       window.location.hash = `#${tab}`
     }
@@ -282,25 +427,43 @@ export const App: React.FC = () => {
         {activeTab === 'clinic-detail' && selectedClinicId && (
           <ClinicDetail
             clinicId={selectedClinicId}
-            onBack={() => handleNavigate('clinics')}
+            initialDoctorId={selectedDoctorId || undefined}
+            autoOpenBooking={autoOpenBooking}
+            initialTrackingCode={rescheduleTrackingCode || undefined}
+            isReschedule={isRescheduleMode}
+            onBack={() => {
+              setRescheduleTrackingCode('')
+              setIsRescheduleMode(false)
+              handleNavigate('clinics')
+            }}
             onOpenLiveQueue={handleOpenLiveQueue}
           />
         )}
 
-        {activeTab === 'clinic-detail' && !selectedClinicId && (
+        {activeTab === 'clinic-detail' && !selectedClinicId && selectedDoctorId ? (
+          <div className="min-h-[60vh] flex items-center justify-center">
+            <div className="flex flex-col items-center gap-3">
+              <div className="w-10 h-10 border-4 border-teal-500 border-t-transparent rounded-full animate-spin" />
+              <p className="text-sm font-semibold text-slate-600 dark:text-slate-300">
+                Opening doctor consultation & direct booking details...
+              </p>
+            </div>
+          </div>
+        ) : activeTab === 'clinic-detail' && !selectedClinicId ? (
           <NotFound
             attemptedPath="Clinic ID was not specified"
             onNavigate={handleNavigate}
             onOpenTrackerModal={() => setTrackerModalOpen(true)}
             onOpenReportModal={handleOpenReportModal}
           />
-        )}
+        ) : null}
 
         {(activeTab === 'live-queue' || activeTab === 'lab-reports') && (
           <LiveQueue
             initialCode={activeTrackingCode}
             onOpenReportModal={handleOpenReportModal}
             onNavigateHome={() => handleNavigate('home')}
+            onNavigate={handleNavigate}
           />
         )}
 
@@ -315,6 +478,7 @@ export const App: React.FC = () => {
             onNavigateHome={() => handleNavigate('home')}
             onOpenLiveQueue={handleOpenLiveQueue}
             onOpenReportModal={handleOpenReportModal}
+            onNavigate={handleNavigate}
           />
         )}
 
@@ -360,11 +524,18 @@ export const App: React.FC = () => {
         authRole={authRole}
       />
 
-      {/* Global Interactive Modals */}
       <LiveTrackerModal
         isOpen={trackerModalOpen}
         onClose={() => setTrackerModalOpen(false)}
         onOpenFullQueue={handleOpenLiveQueue}
+        onNavigateSupport={(ticketCode) => {
+          if (ticketCode) {
+            window.location.hash = `#support?track=${encodeURIComponent(ticketCode)}`
+          } else {
+            window.location.hash = '#support?view=track'
+          }
+          setActiveTab('support')
+        }}
       />
 
       <LabReportModal

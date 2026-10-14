@@ -49,6 +49,8 @@ import {
   Tag,
   Headphones,
   HelpCircle,
+  LifeBuoy,
+  MessageSquare,
 } from 'lucide-react'
 function triggerConfettiBurst() {
   try {
@@ -126,14 +128,18 @@ import {
   PatientProfile,
   PatientTransactionRecord,
   PaymentGatewaysConfig,
+  SupportTicket,
+  BillingInvoice,
 } from '../types'
 import {
   getClinics,
+  getDoctors,
   getDoctorsByClinic,
   getClinicServices,
   getSlots,
   createAppointment,
   generate10DigitTrackingCode,
+  getInvoiceForAppointment,
   getPatientProfileByEmail,
   savePatientProfile,
   getAppointmentsByPatient,
@@ -153,6 +159,8 @@ import {
   cancelPatientArchive,
   deletePatientProfilePermanently,
   getSupportUrl,
+  getSupportTickets,
+  getSupportTicketByCodeOrContact,
 } from '../services/db'
 import {
   firebaseSignOut,
@@ -167,11 +175,17 @@ import {
   getRecentSearches,
   saveRecentSearch,
 } from '../utils/searchEngine'
+import {
+  parsePaymentRecords,
+  extractCleanClinicalRemarks,
+  WebPaymentRecord,
+} from '../utils/paymentLedger'
 
 interface PatientPortalProps {
   onNavigateHome?: () => void
   onOpenLiveQueue?: (trackingCode: string) => void
   onOpenReportModal?: (trackingCode: string) => void
+  onNavigate?: (tab: string, params?: any) => void
 }
 
 interface FamilyMember {
@@ -187,6 +201,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   onNavigateHome,
   onOpenLiveQueue,
   onOpenReportModal,
+  onNavigate,
 }) => {
   // ==========================================
   // AUTHENTICATION & PATIENT PROFILE STATE
@@ -226,8 +241,16 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
   // Active Tab
   const [activeTab, setActiveTab] = useState<
-    'appointments' | 'book' | 'transactions' | 'reports' | 'notifications' | 'family'
+    'appointments' | 'book' | 'transactions' | 'reports' | 'notifications' | 'family' | 'help'
   >('appointments')
+
+  // Support / Help Requests State
+  const [patientTickets, setPatientTickets] = useState<SupportTicket[]>([])
+  const [loadingPatientTickets, setLoadingPatientTickets] = useState(false)
+  const [ticketSearchInput, setTicketSearchInput] = useState('')
+  const [ticketLookupResult, setTicketLookupResult] = useState<SupportTicket | null>(null)
+  const [isSearchingTicket, setIsSearchingTicket] = useState(false)
+  const [ticketSearchError, setTicketSearchError] = useState<string | null>(null)
 
   // Copied code feedback
   const [copiedCode, setCopiedCode] = useState<string | null>(null)
@@ -255,6 +278,44 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   const [selectedService, setSelectedService] = useState<ClinicService | null>(null)
   const [selectedLabTests, setSelectedLabTests] = useState<ClinicService[]>([])
   const [bookingMode, setBookingMode] = useState<'opd' | 'lab'>('opd')
+  const [allDoctors, setAllDoctors] = useState<Doctor[]>([])
+  const [selectedCityFilter, setSelectedCityFilter] = useState<string>('all')
+  const [viewingBillAppt, setViewingBillAppt] = useState<Appointment | null>(null)
+  const [viewingInvoice, setViewingInvoice] = useState<BillingInvoice | null>(null)
+
+  useEffect(() => {
+    if (viewingBillAppt) {
+      getInvoiceForAppointment(viewingBillAppt.id)
+        .then((inv) => setViewingInvoice(inv))
+        .catch(() => setViewingInvoice(null))
+    } else {
+      setViewingInvoice(null)
+    }
+  }, [viewingBillAppt])
+
+  const clinicDoctorsMap = useMemo(() => {
+    const map: Record<string, Doctor[]> = {}
+    for (const doc of allDoctors) {
+      if (doc.clinicId) {
+        if (!map[doc.clinicId]) map[doc.clinicId] = []
+        map[doc.clinicId].push(doc)
+      }
+    }
+    return map
+  }, [allDoctors])
+
+  const availableCities = useMemo(() => {
+    const set = new Set<string>()
+    for (const c of clinics) {
+      if (c.city && c.city.trim()) set.add(c.city.trim())
+      else if (c.addressText) {
+        const parts = c.addressText.split(',')
+        const last = parts[parts.length - 1]?.trim()
+        if (last && last.length < 25) set.add(last)
+      }
+    }
+    return Array.from(set)
+  }, [clinics])
 
   // Polyclinic Follow-Up Visit State
   const [isReturningPatient, setIsReturningPatient] = useState(false)
@@ -435,6 +496,31 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   const [newRescheduleTime, setNewRescheduleTime] = useState<string>('10:00 AM - 11:00 AM')
   const [rescheduleReason, setRescheduleReason] = useState<string>('')
   const [isRescheduling, setIsRescheduling] = useState(false)
+  const [rescheduleAvailableSlots, setRescheduleAvailableSlots] = useState<Slot[]>([])
+  const [isLoadingRescheduleSlots, setIsLoadingRescheduleSlots] = useState(false)
+
+  // Dynamically load published timed slots when rescheduling
+  useEffect(() => {
+    if (rescheduleAppt && rescheduleAppt.clinicId && newRescheduleDate) {
+      setIsLoadingRescheduleSlots(true)
+      getSlots(rescheduleAppt.clinicId, newRescheduleDate)
+        .then((slots) => {
+          const avail = (slots || []).filter(
+            (s) =>
+              s.isAvailable !== false &&
+              (!rescheduleAppt.doctorId || !s.doctorId || s.doctorId === rescheduleAppt.doctorId)
+          )
+          setRescheduleAvailableSlots(avail)
+          if (avail.length > 0) {
+            setNewRescheduleTime(`${avail[0].startTime} - ${avail[0].endTime}`)
+          }
+        })
+        .catch(() => setRescheduleAvailableSlots([]))
+        .finally(() => setIsLoadingRescheduleSlots(false))
+    } else {
+      setRescheduleAvailableSlots([])
+    }
+  }, [rescheduleAppt, newRescheduleDate])
 
   // ==========================================
   // LAB REPORTS PRIVACY VERIFICATION & SEARCH
@@ -484,10 +570,11 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
             setShowEditProfileModal(true)
           }
         }
-        // Load clinics for booking
-        const cList = await getClinics()
+        // Load clinics and doctors for booking
+        const [cList, docList] = await Promise.all([getClinics(), getDoctors()])
         const activeClinics = cList.filter((c) => !c.isArchived)
         setClinics(activeClinics)
+        setAllDoctors(docList)
 
         // Restore pending booking redirect if exists
         const pendingRaw = localStorage.getItem('dactor_pending_booking_redirect')
@@ -521,7 +608,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 if (parsed.selectedSlotId) {
                   const rawSlots = await getSlots(clinicMatch.id, parsed.bookingDate)
                   const validSlots = rawSlots.filter((slot) => {
-                    const isExpired = isSlotTimeExpired(parsed.bookingDate, slot.endTime)
+                    const isExpired = isSlotTimeExpired(parsed.bookingDate, slot.endTime, slot.startTime)
                     const hasCapacity = slot.bookedCount < slot.maxCapacity
                     return !isExpired && hasCapacity && slot.isAvailable !== false
                   })
@@ -639,7 +726,14 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     loadAppointments()
     loadTransactions()
     loadNotifications()
+    loadMySupportTickets()
   }, [patientUser])
+
+  useEffect(() => {
+    if (activeTab === 'help') {
+      loadMySupportTickets()
+    }
+  }, [activeTab])
 
   // ==========================================
   // DATA LOADERS
@@ -728,6 +822,57 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     } catch {}
   }
 
+  async function loadMySupportTickets() {
+    setLoadingPatientTickets(true)
+    try {
+      const all = await getSupportTickets()
+      const pEmail = patientUser?.email?.trim().toLowerCase()
+      const pPhone = (patientUser?.phone || '').replace(/\D/g, '')
+
+      let deviceTicketCodes: string[] = []
+      try {
+        const raw = localStorage.getItem('dactor_recent_tickets')
+        if (raw) deviceTicketCodes = JSON.parse(raw)
+      } catch {}
+
+      const filtered = all.filter((t) => {
+        if (deviceTicketCodes.includes(t.ticketCode)) return true
+        const tEmail = t.email?.trim().toLowerCase()
+        const tPhone = (t.phone || '').replace(/\D/g, '')
+        if (pEmail && tEmail && tEmail === pEmail) return true
+        if (pPhone && pPhone.length >= 7 && tPhone && tPhone.includes(pPhone)) return true
+        return false
+      })
+      setPatientTickets(filtered)
+    } catch {} finally {
+      setLoadingPatientTickets(false)
+    }
+  }
+
+  const handleSearchPatientTicket = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault()
+    const q = ticketSearchInput.trim()
+    if (!q) {
+      setTicketSearchError('Please enter a Ticket ID, phone number, or email.')
+      return
+    }
+    setIsSearchingTicket(true)
+    setTicketSearchError(null)
+    setTicketLookupResult(null)
+    try {
+      const res = await getSupportTicketByCodeOrContact(q)
+      if (res) {
+        setTicketLookupResult(res)
+      } else {
+        setTicketSearchError('No support ticket found matching this code or contact info.')
+      }
+    } catch {
+      setTicketSearchError('Unable to check ticket status. Please try again.')
+    } finally {
+      setIsSearchingTicket(false)
+    }
+  }
+
   // ==========================================
   // REAL-TIME SUPABASE SUBSCRIPTION
   // ==========================================
@@ -813,9 +958,9 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   // BOOKING WIZARD HANDLERS
   // ==========================================
   // When Clinic is selected, load its doctors, services, and payment config
-  const handleSelectClinic = async (clinic: Clinic) => {
+  const handleSelectClinic = async (clinic: Clinic, preselectedDoctor?: Doctor) => {
     setSelectedClinic(clinic)
-    setSelectedDoctor(null)
+    setSelectedDoctor(preselectedDoctor || null)
     setSelectedService(null)
     setSelectedLabTests([])
     setSelectedSlot(null)
@@ -852,7 +997,12 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         }
       } else {
         setBookingMode('opd')
-        if (docs.length > 0) setSelectedDoctor(docs[0])
+        if (preselectedDoctor) {
+          const matched = docs.find((d) => d.id === preselectedDoctor.id) || preselectedDoctor
+          setSelectedDoctor(matched)
+        } else if (docs.length > 0) {
+          setSelectedDoctor(docs[0])
+        }
       }
 
       setBookingStep(2)
@@ -872,7 +1022,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
         // FILTER: Remove slots whose end time has already expired!
         const validSlots = rawSlots.filter((slot) => {
-          const isExpired = isSlotTimeExpired(bookingDate, slot.endTime)
+          const isExpired = isSlotTimeExpired(bookingDate, slot.endTime, slot.startTime)
           const hasCapacity = slot.bookedCount < slot.maxCapacity
           return !isExpired && hasCapacity && slot.isAvailable !== false
         })
@@ -1118,7 +1268,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           if (parsed.selectedSlotId) {
             const rawSlots = await getSlots(clinicMatch.id, parsed.bookingDate)
             const validSlots = rawSlots.filter((slot) => {
-              const isExpired = isSlotTimeExpired(parsed.bookingDate, slot.endTime)
+              const isExpired = isSlotTimeExpired(parsed.bookingDate, slot.endTime, slot.startTime)
               const hasCapacity = slot.bookedCount < slot.maxCapacity
               return !isExpired && hasCapacity && slot.isAvailable !== false
             })
@@ -1472,6 +1622,183 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     win.document.close()
   }
 
+  const handlePrintAppointmentBill = (appt: Appointment, invoice?: BillingInvoice | null) => {
+    const win = window.open('', '_blank', 'width=800,height=750')
+    if (!win) return
+    const clinicTitle = appt.clinic?.name || 'Dactor Certified Healthcare Center'
+    const clinicAddr = appt.clinic?.addressText || 'Kathmandu, Nepal'
+    const docTitle = appt.doctor?.fullName || 'General OPD Specialist'
+    const docSpec = appt.doctor?.specialty || 'General Medicine'
+
+    const inv = invoice || viewingInvoice
+    const effectiveTotal = inv?.totalAmount && inv.totalAmount > 0 ? inv.totalAmount : (appt.feeAmount || 0)
+    const effectivePaid = inv ? inv.paidAmount : (appt.paymentStatus === 'paid' ? effectiveTotal : 0)
+    const effectiveBalance = Math.max(0, effectiveTotal - effectivePaid)
+    const isPaid = effectiveBalance <= 0 && effectiveTotal > 0
+
+    const paymentLogs = parsePaymentRecords(inv?.remarks, effectivePaid, inv?.paidAt)
+    const cleanRemarks = extractCleanClinicalRemarks(inv?.remarks)
+
+    const rawItems = inv?.items && inv.items.length > 0 ? inv.items : []
+    const items = rawItems.length > 0
+      ? rawItems.map((it) => ({
+          name: it.itemName || it.name || 'Clinical Service',
+          quantity: it.quantity || 1,
+          price: it.price || 0,
+          total: it.total || (it.price * (it.quantity || 1)),
+        }))
+      : [
+          {
+            name: `Doctor Consultation & OPD Entry (${appt.appointmentDate})`,
+            quantity: 1,
+            price: effectiveTotal,
+            total: effectiveTotal,
+          },
+        ]
+
+    const itemsRowsHtml = items
+      .map(
+        (it, idx) => `
+        <tr>
+          <td>${idx + 1}</td>
+          <td><strong>${it.name}</strong></td>
+          <td style="text-align:center;">${it.quantity}</td>
+          <td style="text-align:right;">Rs. ${it.price}</td>
+          <td style="text-align:right;font-weight:700;">Rs. ${it.total}</td>
+        </tr>`
+      )
+      .join('')
+
+    const paymentLogsHtml = paymentLogs.length > 0
+      ? `
+        <div style="margin-top:20px;">
+          <h4 style="margin:0 0 8px;font-size:12px;color:#166534;text-transform:uppercase;letter-spacing:0.5px;">Payment Receipts & Time Log</h4>
+          <table style="width:100%;border-collapse:collapse;border:1px solid #bbf7d0;">
+            <thead>
+              <tr style="background:#dcfce7;color:#14532d;font-size:10px;text-transform:uppercase;">
+                <th style="padding:6px;">Date & Time Log</th>
+                <th style="padding:6px;">Note / Mode</th>
+                <th style="padding:6px;text-align:right;">Paid (NPR)</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${paymentLogs
+                .map(
+                  (p) => `
+                <tr style="font-size:12px;border-bottom:1px solid #e2e8f0;">
+                  <td style="padding:6px;font-family:monospace;">${p.dateTime}</td>
+                  <td style="padding:6px;color:#475569;">${p.note || 'Payment Received'}</td>
+                  <td style="padding:6px;text-align:right;font-weight:700;color:#15803d;">Rs. ${p.amount}</td>
+                </tr>`
+                )
+                .join('')}
+            </tbody>
+          </table>
+        </div>`
+      : ''
+
+    const cleanRemarksHtml = cleanRemarks
+      ? `
+        <div style="margin-top:14px;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:11px;">
+          <strong style="color:#0f172a;">Doctor Clinical Remarks & Prescriptions:</strong>
+          <p style="margin:4px 0 0;color:#334155;white-space:pre-wrap;">${cleanRemarks}</p>
+        </div>`
+      : ''
+
+    win.document.write(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Dactor Official Bill - #${appt.trackingCode10Digit}</title>
+          <style>
+            body { font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif; padding: 28px; color: #0f172a; background: #fff; }
+            .box { max-width: 680px; margin: 0 auto; border: 2px solid #0d9488; border-radius: 16px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.06); }
+            .header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2px solid #f0fdfa; padding-bottom: 14px; margin-bottom: 14px; }
+            .badge { background: ${isPaid ? '#ecfdf5' : '#fffbeb'}; color: ${isPaid ? '#047857' : '#b45309'}; border: 1px solid ${isPaid ? '#a7f3d0' : '#fde68a'}; padding: 5px 12px; border-radius: 999px; font-weight: 800; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+            .code-box { background: #f0fdf4; border: 1px dashed #14b8a6; border-radius: 12px; padding: 10px 14px; margin: 12px 0; text-align: center; }
+            .code { font-family: monospace; font-size: 26px; font-weight: 900; letter-spacing: 4px; color: #0f766e; }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid #f1f5f9; font-size: 12px; }
+            th { color: #64748b; text-transform: uppercase; font-size: 10px; font-weight: 700; letter-spacing: 0.5px; }
+            .footer { margin-top: 20px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px dashed #cbd5e1; padding-top: 12px; }
+          </style>
+        </head>
+        <body>
+          <div class="box">
+            <div class="header">
+              <div>
+                <h2 style="margin:0;font-size:20px;color:#0f172a;">${clinicTitle}</h2>
+                <p style="margin:3px 0 0;font-size:12px;color:#64748b;">${clinicAddr}</p>
+                <p style="margin:2px 0 0;font-size:11px;font-weight:700;color:#0d9488;">Official Medical Invoice & OPD Receipt</p>
+              </div>
+              <span class="badge">${isPaid ? 'PAID FULL' : (effectivePaid > 0 ? 'PARTIAL PAID' : 'PAYABLE AT CLINIC')}</span>
+            </div>
+
+            <div class="code-box">
+              <div style="font-size:10px;text-transform:uppercase;color:#0f766e;font-weight:800;letter-spacing:1px;">10-Digit Live OPD Queue Token</div>
+              <div class="code">#${appt.trackingCode10Digit}</div>
+              <div style="font-size:11px;color:#475569;margin-top:2px;">Present this token at the reception desk for instant check-in</div>
+            </div>
+
+            <!-- Patient & Visit Details -->
+            <table style="margin-bottom:16px;">
+              <tr><th style="width:30%;">Patient Name</th><td><strong>${appt.patientName}</strong> (${appt.patientAge || '–'} Yrs, ${appt.patientGender || '–'})</td></tr>
+              <tr><th>Attending Doctor</th><td>Dr. ${docTitle} (${docSpec})</td></tr>
+              <tr><th>Date & Time</th><td><strong>${appt.appointmentDate}</strong> • ${appt.appointmentTime}</td></tr>
+              <tr><th>Contact Phone</th><td><span style="font-family:monospace;">${appt.patientMobile || '–'}</span></td></tr>
+            </table>
+
+            <!-- Services & Procedures Table -->
+            <div style="margin-top:10px;">
+              <h4 style="margin:0 0 6px;font-size:11px;color:#334155;text-transform:uppercase;letter-spacing:0.5px;">Services & Procedures</h4>
+              <table style="border:1px solid #e2e8f0;">
+                <thead style="background:#f8fafc;">
+                  <tr>
+                    <th style="width:30px;">#</th>
+                    <th>Description</th>
+                    <th style="text-align:center;">Qty</th>
+                    <th style="text-align:right;">Rate</th>
+                    <th style="text-align:right;">Total (NPR)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${itemsRowsHtml}
+                </tbody>
+              </table>
+            </div>
+
+            ${paymentLogsHtml}
+
+            <!-- Financial Summary Box -->
+            <div style="margin-top:16px;background:#f0fdfa;border:1px solid #ccfbf1;border-radius:10px;padding:12px;font-size:12px;">
+              <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                <span style="color:#475569;">Total Combined Bill:</span>
+                <strong style="font-size:14px;color:#0f172a;">Rs. ${effectiveTotal}</strong>
+              </div>
+              <div style="display:flex;justify-content:space-between;margin-bottom:4px;color:#15803d;font-weight:700;">
+                <span>Total Paid to Date:</span>
+                <span>Rs. ${effectivePaid}</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;padding-top:6px;border-top:1px dashed #99f6e4;color:#b91c1c;font-weight:800;font-size:13px;">
+                <span>Balance Due:</span>
+                <span>Rs. ${effectiveBalance}</span>
+              </div>
+            </div>
+
+            ${cleanRemarksHtml}
+
+            <div class="footer">
+              <p style="margin:0;font-weight:700;color:#334155;">Verified by Dactor Unified Health Cloud Network • Computer Generated Official Receipt</p>
+              <p style="margin:3px 0 0;font-size:10px;">Printed on ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString()}</p>
+            </div>
+          </div>
+          <script>window.onload = function() { window.print(); }</script>
+        </body>
+      </html>
+    `)
+    win.document.close()
+  }
+
   const handleLogout = () => {
     firebaseSignOut()
     localStorage.removeItem('dactor_patient_email')
@@ -1679,6 +2006,12 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
             { id: 'reports', label: 'Diagnostic Lab Reports', icon: FileText, badge: patientLabReports.length },
             { id: 'notifications', label: 'Queue Alerts & Updates', icon: Bell, badge: unreadCount },
             { id: 'family', label: 'Family Profiles', icon: Users, badge: familyMembers.length },
+            {
+              id: 'help',
+              label: 'Help Requests',
+              icon: Headphones,
+              badge: patientTickets.filter((t) => t.status === 'open' || t.status === 'in_progress').length,
+            },
           ].map((tab) => {
             const Icon = tab.icon
             const isActive = activeTab === tab.id
@@ -1918,20 +2251,38 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                               window.location.hash = '#live-queue'
                             }
                           }}
-                          className="flex-1 flex items-center justify-center space-x-1.5 px-4 py-2.5 text-xs font-bold text-white bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 rounded-xl transition shadow-xs cursor-pointer active:scale-[0.98]"
+                          className="flex-1 flex items-center justify-center space-x-1.5 px-3 py-2 text-xs font-bold text-white bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 rounded-xl transition shadow-xs cursor-pointer active:scale-[0.98]"
                         >
                           <Activity className="w-3.5 h-3.5" />
-                          <span>Live Queue Board</span>
+                          <span>Queue Board</span>
+                        </button>
+
+                        <button
+                          onClick={() => setViewingBillAppt(appt)}
+                          className="px-3 py-2 text-xs font-bold text-teal-700 dark:text-teal-300 liquid-glass-card hover:bg-teal-500/20 rounded-xl transition border border-teal-500/30 flex items-center gap-1 cursor-pointer active:scale-[0.98]"
+                          title="View Official Medical Bill / Slip"
+                        >
+                          <Receipt className="w-3.5 h-3.5" />
+                          <span>Bill Slip</span>
                         </button>
 
                         {!isCancelled && appt.checkinStatus !== 'completed' && (
                           <div className="flex items-center space-x-1.5">
                             <button
                               onClick={() => {
-                                setRescheduleAppt(appt)
-                                setNewRescheduleDate(appt.appointmentDate)
-                                setNewRescheduleTime(appt.appointmentTime || '10:00 AM - 11:00 AM')
-                                setRescheduleReason('')
+                                if (onNavigate && appt.clinicId) {
+                                  onNavigate('clinic-detail', {
+                                    clinicId: appt.clinicId,
+                                    doctorId: appt.doctorId,
+                                    trackingCode: appt.trackingCode10Digit,
+                                    isReschedule: true,
+                                  })
+                                } else {
+                                  setRescheduleAppt(appt)
+                                  setNewRescheduleDate(appt.appointmentDate)
+                                  setNewRescheduleTime(appt.appointmentTime || '10:00 AM - 11:00 AM')
+                                  setRescheduleReason('')
+                                }
                               }}
                               className="px-3 py-2 text-xs font-bold text-teal-700 dark:text-teal-300 liquid-glass-card hover:bg-teal-500/20 rounded-xl transition border border-teal-500/30 cursor-pointer active:scale-[0.98]"
                             >
@@ -1945,6 +2296,25 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                               {cancellingApptId === appt.id ? 'Cancelling...' : 'Cancel'}
                             </button>
                           </div>
+                        )}
+
+                        {appt.checkinStatus === 'completed' && appt.clinicId && (
+                          <button
+                            onClick={() => {
+                              if (onNavigate) {
+                                onNavigate('clinic-detail', {
+                                  clinicId: appt.clinicId,
+                                  doctorId: appt.doctorId,
+                                  trackingCode: appt.trackingCode10Digit,
+                                  isReschedule: false,
+                                })
+                              }
+                            }}
+                            className="px-3 py-2 text-xs font-bold text-emerald-700 dark:text-emerald-300 liquid-glass-card hover:bg-emerald-500/20 rounded-xl transition border border-emerald-500/30 flex items-center gap-1 cursor-pointer active:scale-[0.98]"
+                          >
+                            <Calendar className="w-3.5 h-3.5" />
+                            <span>Follow-Up Visit</span>
+                          </button>
                         )}
                       </div>
                     </div>
@@ -2053,6 +2423,29 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                       )
                     })}
                   </div>
+
+                  {/* City Selector if multiple cities available */}
+                  {availableCities.length > 1 && (
+                    <div className="flex items-center justify-center pt-1">
+                      <div className="flex items-center space-x-1.5 liquid-glass-subtle px-3 py-1.5 rounded-xl border border-white/40 dark:border-white/10 text-xs font-bold">
+                        <MapPin className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                        <span className="text-slate-500">City / Region:</span>
+                        <select
+                          value={selectedCityFilter}
+                          onChange={(e) => setSelectedCityFilter(e.target.value)}
+                          className="bg-transparent font-bold text-slate-800 dark:text-white outline-none cursor-pointer"
+                        >
+                          <option value="all" className="dark:bg-slate-900">All Locations</option>
+                          {availableCities.map((city) => (
+                            <option key={city} value={city} className="dark:bg-slate-900">
+                              {city}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Quick Symptoms Suggestion Chips */}
                   <div className="flex items-center space-x-2 overflow-x-auto pb-1 text-xs justify-center pt-1 scrollbar-none">
                     <span className="font-bold text-slate-400 dark:text-slate-500 shrink-0 text-[11px] uppercase tracking-wider">
@@ -2095,11 +2488,20 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                       if (clinicCategoryFilter === 'single_doctor' && !isSingle) return null
                       if (clinicCategoryFilter === 'polyclinic' && !isPoly) return null
 
-                      if (!clinicSearchQuery.trim()) {
-                        return { c, isLab, isSingle, isPoly, score: 10, matchReason: undefined }
+                      if (selectedCityFilter !== 'all') {
+                        const cityMatch =
+                          (c.city || '').toLowerCase() === selectedCityFilter.toLowerCase() ||
+                          (c.addressText || '').toLowerCase().includes(selectedCityFilter.toLowerCase())
+                        if (!cityMatch) return null
                       }
 
-                      const match = matchClinic(c, [], [], clinicSearchQuery)
+                      const clinicDocs = clinicDoctorsMap[c.id] || []
+
+                      if (!clinicSearchQuery.trim()) {
+                        return { c, isLab, isSingle, isPoly, score: 10, matchReason: undefined, matchedDoctor: undefined }
+                      }
+
+                      const match = matchClinic(c, clinicDocs, [], clinicSearchQuery)
                       if (!match.isMatch) return null
 
                       return {
@@ -2109,6 +2511,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                         isPoly,
                         score: match.score,
                         matchReason: match.matchHighlightReason,
+                        matchedDoctor: match.matchedDoctors?.[0],
                       }
                     })
                     .filter(Boolean)
@@ -2139,7 +2542,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
                       {scored.map((item) => {
                         if (!item) return null
-                        const { c, isLab, isSingle, matchReason } = item
+                        const { c, isLab, isSingle, matchReason, matchedDoctor } = item
 
                         const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
                           `${c.name} ${c.addressText || ''}`
@@ -2148,11 +2551,17 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                         return (
                           <div
                             key={c.id}
-                            onClick={() => handleSelectClinic(c)}
+                            onClick={() => handleSelectClinic(c, matchedDoctor)}
                             className="liquid-glass-card rounded-3xl border border-white/40 dark:border-white/10 hover:border-teal-500/60 hover:shadow-lg hover:shadow-teal-500/10 cursor-pointer transition flex flex-col justify-between group overflow-hidden"
                           >
                             {/* Card Header with Type Badge */}
                             <div className="p-6 space-y-3">
+                              {matchedDoctor && (
+                                <div className="p-2 bg-teal-500/10 border border-teal-500/20 rounded-xl flex items-center space-x-1.5 text-[11px] font-bold text-teal-800 dark:text-teal-300">
+                                  <Stethoscope className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                                  <span className="truncate">Matched Doctor: Dr. {matchedDoctor.fullName} ({matchedDoctor.specialty || 'Specialist'})</span>
+                                </div>
+                              )}
                               <div className="flex items-center justify-between">
                                 {isLab ? (
                                   <span className="inline-flex items-center space-x-1 text-[11px] font-bold px-2.5 py-1 rounded-full bg-purple-500/10 text-purple-700 dark:text-purple-300 border border-purple-500/20">
@@ -3131,6 +3540,17 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                   </p>
                 </div>
 
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setViewingBillAppt(confirmedBooking)}
+                    className="w-full py-3 bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 text-white font-bold text-xs rounded-xl shadow-glass-brand border border-white/20 transition flex items-center justify-center gap-2 cursor-pointer active:scale-[0.98]"
+                  >
+                    <Receipt className="w-4 h-4" />
+                    <span>View & Download Official Invoice Slip</span>
+                  </button>
+                </div>
+
                 <div className="flex items-center space-x-3">
                   <button
                     onClick={() => {
@@ -3533,14 +3953,301 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
             )}
           </div>
         )}
+
+        {/* ==========================================
+            TAB 7: HELP REQUESTS & SUPPORT TICKETS
+        ========================================== */}
+        {activeTab === 'help' && (
+          <div className="liquid-glass-card rounded-3xl p-6 sm:p-8 shadow-sm border border-white/40 dark:border-white/10 space-y-6">
+            {/* Header */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-white/20 dark:border-white/5">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <div className="w-9 h-9 rounded-xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center border border-indigo-500/20">
+                    <LifeBuoy className="w-5 h-5" />
+                  </div>
+                  <h3 className="text-lg sm:text-xl font-black text-slate-900 dark:text-white">
+                    Help Requests & Support Status
+                  </h3>
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Track resolution updates for your submitted inquiries, live queue issues, or clinic support.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={loadMySupportTickets}
+                  disabled={loadingPatientTickets}
+                  className="p-2 text-slate-400 hover:text-teal-600 dark:hover:text-teal-400 liquid-glass-subtle rounded-xl transition cursor-pointer"
+                  title="Refresh Help Requests"
+                >
+                  <RefreshCw className={`w-4 h-4 ${loadingPatientTickets ? 'animate-spin' : ''}`} />
+                </button>
+                <a
+                  href="#support"
+                  onClick={() => {
+                    window.location.hash = '#support'
+                    window.dispatchEvent(new HashChangeEvent('hashchange'))
+                  }}
+                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-teal-500/20 transition cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Submit New Request</span>
+                </a>
+              </div>
+            </div>
+
+            {/* Instant Ticket Search Bar */}
+            <div className="p-4 sm:p-5 rounded-2xl liquid-glass-subtle border border-indigo-200/60 dark:border-indigo-500/20 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                  <Search className="w-4 h-4 text-indigo-500" />
+                  <span>Check Any Ticket by ID, Phone, or Gmail</span>
+                </span>
+                <span className="text-[11px] text-slate-500 font-mono">e.g. #DAC-TKT-1082</span>
+              </div>
+              <form onSubmit={handleSearchPatientTicket} className="flex gap-2">
+                <input
+                  type="text"
+                  value={ticketSearchInput}
+                  onChange={(e) => setTicketSearchInput(e.target.value)}
+                  placeholder="Enter Ticket ID (#DAC-TKT-...) or contact phone / email"
+                  className="flex-1 px-4 py-2.5 rounded-xl liquid-glass-input text-xs sm:text-sm font-semibold border border-white/60 dark:border-white/10 text-slate-900 dark:text-white"
+                />
+                <button
+                  type="submit"
+                  disabled={isSearchingTicket || !ticketSearchInput.trim()}
+                  className="px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-sky-600 hover:brightness-105 disabled:opacity-50 text-white font-bold text-xs rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap"
+                >
+                  {isSearchingTicket ? 'Searching...' : 'Check Status'}
+                </button>
+              </form>
+
+              {ticketSearchError && (
+                <div className="p-3 bg-rose-50/80 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 rounded-xl text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{ticketSearchError}</span>
+                </div>
+              )}
+
+              {ticketLookupResult && (
+                <div className="p-4 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-indigo-300/60 dark:border-indigo-500/30 space-y-3 animate-in fade-in">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono font-black text-sm text-indigo-600 dark:text-indigo-400">
+                        {ticketLookupResult.ticketCode}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyCode(ticketLookupResult.ticketCode)}
+                        className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+                        title="Copy Ticket ID"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <span
+                      className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${
+                        ticketLookupResult.status === 'resolved'
+                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                          : ticketLookupResult.status === 'in_progress'
+                          ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                          : ticketLookupResult.status === 'closed'
+                          ? 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
+                          : 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300'
+                      }`}
+                    >
+                      {ticketLookupResult.status === 'resolved'
+                        ? 'Resolved'
+                        : ticketLookupResult.status === 'in_progress'
+                        ? 'In Progress'
+                        : ticketLookupResult.status === 'closed'
+                        ? 'Closed'
+                        : 'Open / In Queue'}
+                    </span>
+                  </div>
+
+                  <div className="text-xs text-slate-600 dark:text-slate-300">
+                    <span className="font-bold text-slate-700 dark:text-slate-200">Category: </span>
+                    {(ticketLookupResult as any).reasonCategory || ticketLookupResult.category || 'General Inquiry'}
+                  </div>
+
+                  <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/60 text-xs text-slate-700 dark:text-slate-300 italic">
+                    "{ticketLookupResult.message}"
+                  </div>
+
+                  {ticketLookupResult.adminNotes && (
+                    <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 rounded-xl border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-300">
+                      <div className="font-bold mb-1 flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Admin Resolution Notes:</span>
+                      </div>
+                      <p>{ticketLookupResult.adminNotes}</p>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-end gap-2 pt-1">
+                    <a
+                      href={`#support?track=${encodeURIComponent(ticketLookupResult.ticketCode)}`}
+                      onClick={() => {
+                        window.location.hash = `#support?track=${encodeURIComponent(ticketLookupResult.ticketCode)}`
+                        window.dispatchEvent(new HashChangeEvent('hashchange'))
+                      }}
+                      className="text-xs font-bold text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1"
+                    >
+                      <span>Open Full Support Desk & WhatsApp →</span>
+                    </a>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* List of Tickets linked to Patient Profile / Device */}
+            <div className="space-y-4">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                Your Registered Help Requests ({patientTickets.length})
+              </h4>
+
+              {loadingPatientTickets ? (
+                <div className="py-12 text-center text-slate-400 text-xs flex items-center justify-center gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin text-teal-500" />
+                  <span>Loading your help requests...</span>
+                </div>
+              ) : patientTickets.length === 0 ? (
+                <div className="text-center py-10 space-y-3 liquid-glass-subtle rounded-2xl border border-white/30 dark:border-white/10 p-6">
+                  <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center mx-auto">
+                    <Headphones className="w-6 h-6" />
+                  </div>
+                  <h4 className="font-bold text-sm text-slate-900 dark:text-white">
+                    No Help Requests Found
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
+                    You haven't submitted any help requests from this account yet, or your past inquiries are under a different phone number.
+                  </p>
+                  <div className="pt-2">
+                    <a
+                      href="#support"
+                      onClick={() => {
+                        window.location.hash = '#support'
+                        window.dispatchEvent(new HashChangeEvent('hashchange'))
+                      }}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-teal-500 text-white font-bold text-xs shadow-xs hover:bg-teal-600 transition"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Contact Support Now</span>
+                    </a>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {patientTickets.map((t) => (
+                    <div
+                      key={t.id || t.ticketCode}
+                      className="p-5 rounded-2xl liquid-glass-subtle border border-white/40 dark:border-white/10 space-y-3 hover:border-indigo-400/50 transition shadow-xs"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-xs text-indigo-600 dark:text-indigo-400">
+                            {t.ticketCode}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyCode(t.ticketCode)}
+                            className="text-slate-400 hover:text-slate-600 transition"
+                            title="Copy Code"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        <span
+                          className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${
+                            t.status === 'resolved'
+                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
+                              : t.status === 'in_progress'
+                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                              : t.status === 'closed'
+                              ? 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
+                              : 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300'
+                          }`}
+                        >
+                          {t.status === 'resolved'
+                            ? 'Resolved'
+                            : t.status === 'in_progress'
+                            ? 'In Progress'
+                            : t.status === 'closed'
+                            ? 'Closed'
+                            : 'Open'}
+                        </span>
+                      </div>
+
+                      <div className="text-xs">
+                        <span className="text-slate-400 font-medium">Category: </span>
+                        <span className="font-bold text-slate-800 dark:text-slate-200">
+                          {(t as any).reasonCategory || t.category || 'General Inquiry'}
+                        </span>
+                        <div className="text-[11px] text-slate-400">
+                          {t.createdAt ? new Date(t.createdAt).toLocaleDateString() : 'Recent'}
+                        </div>
+                      </div>
+
+                      <p className="text-xs text-slate-600 dark:text-slate-300 line-clamp-2 italic bg-white/40 dark:bg-slate-900/40 p-2.5 rounded-xl border border-white/20 dark:border-white/5">
+                        "{t.message}"
+                      </p>
+
+                      {t.adminNotes && (
+                        <div className="p-3 bg-emerald-50/80 dark:bg-emerald-950/40 rounded-xl border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-300">
+                          <div className="font-bold flex items-center gap-1 mb-0.5">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Resolution Notes:</span>
+                          </div>
+                          <p className="font-medium text-emerald-900 dark:text-emerald-200">
+                            {t.adminNotes}
+                          </p>
+                        </div>
+                      )}
+
+                      <div className="pt-2 border-t border-white/30 dark:border-white/5 flex items-center justify-between text-xs">
+                        <a
+                          href={`#support?track=${encodeURIComponent(t.ticketCode)}`}
+                          onClick={() => {
+                            window.location.hash = `#support?track=${encodeURIComponent(t.ticketCode)}`
+                            window.dispatchEvent(new HashChangeEvent('hashchange'))
+                          }}
+                          className="font-bold text-teal-600 dark:text-teal-400 hover:underline flex items-center gap-1"
+                        >
+                          <span>Track Live Details</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </a>
+
+                        <a
+                          href={`https://wa.me/9779800000000?text=${encodeURIComponent(
+                            `Hello Dactor Support Desk, following up on Help Request Ticket ${t.ticketCode}.`
+                          )}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-bold text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1"
+                        >
+                          <MessageSquare className="w-3.5 h-3.5" />
+                          <span>WhatsApp</span>
+                        </a>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ==========================================
           MODAL: PATIENT AUTHENTICATION (LOGIN / SIGNUP)
       ========================================== */}
       {showAuthModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="liquid-glass-modal rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl border border-white/40 dark:border-white/10 space-y-6 relative animate-in fade-in zoom-in-95 overflow-hidden">
+        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="liquid-glass-modal rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl border border-white/60 space-y-6 relative animate-in fade-in zoom-in-95 overflow-hidden">
             {/* Top specular refraction sheen */}
             <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-cyan-400/50 to-transparent" />
 
@@ -3549,32 +4256,32 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 setShowAuthModal(false)
                 setPendingBookingRedirectNotice(false)
               }}
-              className="absolute top-5 right-5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+              className="absolute top-5 right-5 text-slate-400 hover:text-slate-700 cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
 
             <div className="text-center space-y-1">
-              <div className="w-14 h-14 rounded-2xl bg-teal-500/10 text-teal-600 dark:text-teal-400 flex items-center justify-center mx-auto mb-3 shadow-inner border border-teal-500/20">
+              <div className="w-14 h-14 rounded-2xl bg-teal-500/10 text-teal-600 flex items-center justify-center mx-auto mb-3 shadow-inner border border-teal-500/20">
                 <User className="w-7 h-7" />
               </div>
-              <h3 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">
+              <h3 className="text-2xl font-black text-slate-900 tracking-tight">
                 Patient Health Portal
               </h3>
-              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-xs mx-auto">
+              <p className="text-xs text-slate-600 max-w-xs mx-auto font-medium">
                 Sign in with your verified Google account to track live queue tokens, access lab reports & manage appointments.
               </p>
             </div>
 
             {/* Pending Booking Redirect Notice matching patient-app LoginScreen.kt lines 607-620 */}
             {pendingBookingRedirectNotice && (
-              <div className="p-4 rounded-2xl liquid-glass-subtle border border-teal-500/30 text-left flex items-start space-x-3 animate-in fade-in">
-                <Info className="w-5 h-5 text-teal-600 dark:text-teal-400 shrink-0 mt-0.5" />
+              <div className="p-4 rounded-2xl bg-teal-50/80 border border-teal-500/30 text-left flex items-start space-x-3 animate-in fade-in">
+                <Info className="w-5 h-5 text-teal-600 shrink-0 mt-0.5" />
                 <div className="space-y-0.5">
-                  <div className="font-bold text-xs text-slate-900 dark:text-white">
+                  <div className="font-bold text-xs text-slate-900">
                     Sign In Required to Book Appointment
                   </div>
-                  <p className="text-[11px] text-teal-700 dark:text-teal-300 leading-snug">
+                  <p className="text-[11px] text-teal-800 leading-snug font-medium">
                     Your selected clinic, doctor, date, and slot position are saved. You'll return right where you left off after signing in.
                   </p>
                 </div>
@@ -3582,7 +4289,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
             )}
 
             {authError && (
-              <div className="p-3.5 rounded-xl liquid-glass-subtle border border-rose-500/30 text-rose-700 dark:text-rose-300 text-xs font-semibold space-y-2.5">
+              <div className="p-3.5 rounded-xl bg-rose-50/80 border border-rose-500/30 text-rose-700 text-xs font-semibold space-y-2.5">
                 <div className="flex items-start space-x-2">
                   <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
                   <span>{authError}</span>
@@ -3594,7 +4301,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                     handleGoogleSignIn()
                   }}
                   disabled={authSubmitting}
-                  className="w-full py-2 px-3 rounded-lg liquid-glass-card hover:bg-rose-500/20 border border-rose-500/30 text-rose-800 dark:text-rose-200 font-bold text-xs flex items-center justify-center space-x-1.5 transition cursor-pointer"
+                  className="w-full py-2 px-3 rounded-lg bg-white hover:bg-rose-50 border border-rose-300 text-rose-800 font-bold text-xs flex items-center justify-center space-x-1.5 transition cursor-pointer shadow-xs"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
                   <span>Try With Different Google Account</span>
@@ -3608,7 +4315,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 type="button"
                 onClick={handleGoogleSignIn}
                 disabled={authSubmitting}
-                className="w-full py-3.5 liquid-glass-card hover:bg-white/80 dark:hover:bg-slate-800/80 text-slate-900 dark:text-white font-black text-xs rounded-2xl border border-white/60 dark:border-white/10 shadow-sm hover:shadow-md transition-all flex items-center justify-center space-x-3 cursor-pointer disabled:opacity-50 active:scale-[0.98]"
+                className="w-full py-3.5 bg-white hover:bg-slate-50 text-slate-900 font-black text-xs rounded-2xl border border-slate-200 shadow-sm hover:shadow-md transition-all flex items-center justify-center space-x-3 cursor-pointer disabled:opacity-50 active:scale-[0.98]"
               >
                 <svg className="w-5 h-5" viewBox="0 0 24 24">
                   <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
@@ -3619,13 +4326,37 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 <span>{authSubmitting ? 'Connecting...' : 'Continue with Google'}</span>
               </button>
 
-              <div className="p-3.5 liquid-glass-subtle rounded-2xl border border-white/40 dark:border-white/10 text-left space-y-1">
-                <div className="flex items-center space-x-1.5 text-slate-800 dark:text-slate-200 font-bold text-xs">
-                  <ShieldCheck className="w-4 h-4 text-teal-600 dark:text-teal-400" />
+              <div className="p-3.5 bg-slate-50/80 rounded-2xl border border-slate-200/80 text-left space-y-1">
+                <div className="flex items-center space-x-1.5 text-slate-900 font-bold text-xs">
+                  <ShieldCheck className="w-4 h-4 text-teal-600" />
                   <span>Single-Role Patient Identity</span>
                 </div>
-                <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                <p className="text-[11px] text-slate-600 leading-relaxed font-medium">
                   Your Google identity ensures verified authentication. First-time users will specify their full name, phone number, and age to maintain your personal health records.
+                </p>
+              </div>
+
+              {/* Cross-Portal Quick Navigation Links */}
+              <div className="pt-2 border-t border-slate-200/60 space-y-1.5 text-center text-[11px]">
+                <p className="text-slate-600">
+                  Are you a Medical Doctor?{' '}
+                  <a
+                    href="#doctor-portal"
+                    onClick={() => setShowAuthModal(false)}
+                    className="font-bold text-teal-700 hover:text-teal-900 hover:underline"
+                  >
+                    Doctor Login & NMC Registration →
+                  </a>
+                </p>
+                <p className="text-slate-600">
+                  Are you a Clinic / Hospital Manager?{' '}
+                  <a
+                    href="#portal"
+                    onClick={() => setShowAuthModal(false)}
+                    className="font-bold text-teal-700 hover:text-teal-900 hover:underline"
+                  >
+                    Clinic Portal & Onboarding →
+                  </a>
                 </p>
               </div>
             </div>
@@ -3705,8 +4436,23 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 {isUpdatingProfile ? 'Saving...' : 'Save Profile Changes'}
               </button>
 
-              {/* Helpdesk & Support Link */}
-              <div className="pt-1">
+              {/* Helpdesk & Support Links */}
+              <div className="pt-1 space-y-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowEditProfileModal(false)
+                    setActiveTab('help')
+                  }}
+                  className="w-full py-2.5 px-4 rounded-xl liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70 border border-teal-200 dark:border-teal-500/20 text-teal-700 dark:text-teal-300 font-bold text-xs flex items-center justify-between transition cursor-pointer"
+                >
+                  <div className="flex items-center gap-2">
+                    <LifeBuoy className="w-4 h-4 text-teal-500" />
+                    <span>Check My Help Request Status</span>
+                  </div>
+                  <ChevronRight className="w-3.5 h-3.5 opacity-70" />
+                </button>
+
                 <a
                   href={supportUrl.startsWith('http') || supportUrl.startsWith('mailto:') ? supportUrl : `https://${supportUrl}`}
                   target="_blank"
@@ -3998,20 +4744,47 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
               </div>
 
               <div className="space-y-1">
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300">Preferred Time Slot *</label>
-                <select
-                  value={newRescheduleTime}
-                  onChange={(e) => setNewRescheduleTime(e.target.value)}
-                  className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-bold text-slate-900 dark:text-white outline-none"
-                >
-                  <option value="09:00 AM - 10:00 AM">09:00 AM - 10:00 AM (Morning)</option>
-                  <option value="10:00 AM - 11:00 AM">10:00 AM - 11:00 AM (Morning)</option>
-                  <option value="11:00 AM - 12:00 PM">11:00 AM - 12:00 PM (Noon)</option>
-                  <option value="02:00 PM - 03:00 PM">02:00 PM - 03:00 PM (Afternoon)</option>
-                  <option value="03:00 PM - 04:00 PM">03:00 PM - 04:00 PM (Afternoon)</option>
-                  <option value="04:00 PM - 05:00 PM">04:00 PM - 05:00 PM (Evening)</option>
-                  <option value="05:00 PM - 06:00 PM">05:00 PM - 06:00 PM (Evening)</option>
-                </select>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300">Preferred Time Slot *</label>
+                  {isLoadingRescheduleSlots && (
+                    <span className="text-[10px] text-teal-600 animate-pulse font-semibold">Loading doctor slots...</span>
+                  )}
+                </div>
+                {rescheduleAvailableSlots.length > 0 ? (
+                  <select
+                    value={newRescheduleTime}
+                    onChange={(e) => setNewRescheduleTime(e.target.value)}
+                    className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-bold text-slate-900 dark:text-white outline-none"
+                  >
+                    <optgroup label="Published Doctor Slots">
+                      {rescheduleAvailableSlots.map((s) => (
+                        <option key={s.id} value={`${s.startTime} - ${s.endTime}`}>
+                          {s.startTime} - {s.endTime} ({s.bookedCount || 0}/{s.maxCapacity || 5} booked)
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="General Time Slots">
+                      <option value="09:00 AM - 10:00 AM">09:00 AM - 10:00 AM (Morning)</option>
+                      <option value="11:00 AM - 12:00 PM">11:00 AM - 12:00 PM (Noon)</option>
+                      <option value="02:00 PM - 03:00 PM">02:00 PM - 03:00 PM (Afternoon)</option>
+                      <option value="04:00 PM - 05:00 PM">04:00 PM - 05:00 PM (Evening)</option>
+                    </optgroup>
+                  </select>
+                ) : (
+                  <select
+                    value={newRescheduleTime}
+                    onChange={(e) => setNewRescheduleTime(e.target.value)}
+                    className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-bold text-slate-900 dark:text-white outline-none"
+                  >
+                    <option value="09:00 AM - 10:00 AM">09:00 AM - 10:00 AM (Morning)</option>
+                    <option value="10:00 AM - 11:00 AM">10:00 AM - 11:00 AM (Morning)</option>
+                    <option value="11:00 AM - 12:00 PM">11:00 AM - 12:00 PM (Noon)</option>
+                    <option value="02:00 PM - 03:00 PM">02:00 PM - 03:00 PM (Afternoon)</option>
+                    <option value="03:00 PM - 04:00 PM">03:00 PM - 04:00 PM (Afternoon)</option>
+                    <option value="04:00 PM - 05:00 PM">04:00 PM - 05:00 PM (Evening)</option>
+                    <option value="05:00 PM - 06:00 PM">05:00 PM - 06:00 PM (Evening)</option>
+                  </select>
+                )}
               </div>
 
               <div className="space-y-1">
@@ -4148,6 +4921,275 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ==========================================
+          MODAL: OFFICIAL APPOINTMENT BILL & SLIP
+      ========================================== */}
+      {viewingBillAppt && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
+          <div className="liquid-glass-modal rounded-3xl max-w-lg w-full p-6 sm:p-8 shadow-glass-modal border border-white/60 dark:border-white/15 space-y-6 relative animate-in fade-in zoom-in-95 my-8">
+            <button
+              onClick={() => setViewingBillAppt(null)}
+              className="absolute top-5 right-5 p-1.5 rounded-full liquid-glass-subtle text-slate-500 hover:text-slate-800 dark:hover:text-white transition cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            {/* Bill Header */}
+            <div className="flex items-start justify-between border-b border-white/40 dark:border-white/10 pb-4">
+              <div>
+                <span className="text-[10px] font-black uppercase tracking-wider text-brand-600 dark:text-brand-400 block">
+                  Official Medical Invoice & OPD Slip
+                </span>
+                <h3 className="text-xl font-black text-slate-900 dark:text-white mt-0.5">
+                  {viewingBillAppt.clinic?.name || 'Dactor Certified Healthcare Center'}
+                </h3>
+                {viewingBillAppt.clinic?.addressText && (
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 flex items-center gap-1">
+                    <MapPin className="w-3 h-3 text-slate-400" />
+                    <span>{viewingBillAppt.clinic.addressText}</span>
+                  </p>
+                )}
+              </div>
+              <div className="text-right">
+                <span className="px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-500/25">
+                  {viewingBillAppt.paymentStatus === 'paid' ? 'PAID' : 'PAYABLE AT CLINIC'}
+                </span>
+                <span className="text-[10px] font-mono text-slate-400 block mt-1">
+                  INV-#{viewingBillAppt.trackingCode10Digit}
+                </span>
+              </div>
+            </div>
+
+            {/* 10-Digit Live Token Badge */}
+            <div className="p-4 rounded-2xl bg-teal-500/10 border border-teal-500/20 flex items-center justify-between">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-teal-700 dark:text-teal-300 block">
+                  OPD Live Queue Token
+                </span>
+                <span className="font-mono text-2xl font-black text-slate-900 dark:text-white tracking-wider">
+                  #{viewingBillAppt.trackingCode10Digit}
+                </span>
+              </div>
+              <button
+                onClick={() => handleCopyCode(viewingBillAppt.trackingCode10Digit)}
+                className="px-3 py-1.5 rounded-xl liquid-glass-subtle text-xs font-bold text-teal-700 dark:text-teal-300 border border-teal-500/30 flex items-center gap-1.5 cursor-pointer"
+              >
+                {copiedCode === viewingBillAppt.trackingCode10Digit ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-teal-600" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy Token</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Details Table */}
+            <div className="grid grid-cols-2 gap-3 text-xs bg-white/40 dark:bg-slate-800/40 p-4 rounded-2xl border border-white/50 dark:border-white/10">
+              <div>
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Patient Name</span>
+                <span className="font-bold text-slate-900 dark:text-white text-sm">
+                  {viewingBillAppt.patientName}
+                </span>
+                <span className="text-slate-500 text-[11px] block">
+                  {viewingBillAppt.patientAge || '–'} Yrs • {viewingBillAppt.patientGender || '–'}
+                </span>
+              </div>
+
+              <div>
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Attending Doctor</span>
+                <span className="font-bold text-slate-900 dark:text-white text-sm">
+                  {viewingBillAppt.doctor?.fullName || 'General OPD Specialist'}
+                </span>
+                <span className="text-brand-600 dark:text-brand-400 text-[11px] font-semibold block">
+                  {viewingBillAppt.doctor?.specialty || 'General Medicine'}
+                </span>
+              </div>
+
+              <div className="pt-2 border-t border-white/30 dark:border-white/10">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Appointment Date</span>
+                <span className="font-bold text-slate-900 dark:text-white">
+                  {viewingBillAppt.appointmentDate}
+                </span>
+              </div>
+
+              <div className="pt-2 border-t border-white/30 dark:border-white/10">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Scheduled Slot</span>
+                <span className="font-bold text-slate-900 dark:text-white">
+                  {viewingBillAppt.appointmentTime}
+                </span>
+              </div>
+
+              <div className="col-span-2 pt-2 border-t border-white/30 dark:border-white/10 flex justify-between">
+                <div>
+                  <span className="text-[10px] uppercase font-bold text-slate-400 block">Contact Phone</span>
+                  <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
+                    {viewingBillAppt.patientMobile || 'Not provided'}
+                  </span>
+                </div>
+                <div className="text-right">
+                  <span className="text-[10px] uppercase font-bold text-slate-400 block">Payment Mode</span>
+                  <span className="font-bold text-slate-800 dark:text-slate-200">
+                    {viewingBillAppt.paymentMethod?.toUpperCase() || (viewingBillAppt.paymentStatus === 'paid' ? 'ONLINE DIGITAL' : 'CASH AT RECEPTION')}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Itemized Services & Procedures */}
+            <div className="space-y-2 text-xs">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block">
+                Itemized Services & Procedures
+              </span>
+              <div className="border border-white/50 dark:border-white/10 rounded-xl overflow-hidden bg-white/40 dark:bg-slate-800/40">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="bg-slate-100/70 dark:bg-slate-700/50 text-slate-600 dark:text-slate-300 border-b border-white/40 dark:border-white/10">
+                    <tr>
+                      <th className="p-2">Description</th>
+                      <th className="p-2 text-center">Qty</th>
+                      <th className="p-2 text-right">Rate</th>
+                      <th className="p-2 text-right">Total (NPR)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/40 dark:divide-white/10 font-medium">
+                    {viewingInvoice?.items && viewingInvoice.items.length > 0 ? (
+                      viewingInvoice.items.map((it, idx) => (
+                        <tr key={idx}>
+                          <td className="p-2 text-slate-800 dark:text-slate-100">{it.itemName || it.name}</td>
+                          <td className="p-2 text-center font-mono text-slate-500">{it.quantity || 1}</td>
+                          <td className="p-2 text-right font-mono text-slate-600 dark:text-slate-300">Rs. {it.price}</td>
+                          <td className="p-2 text-right font-mono font-bold text-slate-900 dark:text-white">
+                            Rs. {it.total || (it.price * (it.quantity || 1))}
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td className="p-2 text-slate-800 dark:text-slate-100">Doctor Consultation & OPD Entry</td>
+                        <td className="p-2 text-center font-mono text-slate-500">1</td>
+                        <td className="p-2 text-right font-mono text-slate-600 dark:text-slate-300">Rs. {viewingBillAppt.feeAmount || 0}</td>
+                        <td className="p-2 text-right font-mono font-bold text-slate-900 dark:text-white">Rs. {viewingBillAppt.feeAmount || 0}</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Payment Receipts & Time Log Table */}
+            {(() => {
+              const logs = parsePaymentRecords(
+                viewingInvoice?.remarks,
+                viewingInvoice ? viewingInvoice.paidAmount : (viewingBillAppt.paymentStatus === 'paid' ? Number(viewingBillAppt.feeAmount || 0) : 0),
+                viewingInvoice?.paidAt
+              )
+              if (logs.length === 0) return null
+              return (
+                <div className="space-y-1.5 text-xs">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-600 dark:text-emerald-400 block">
+                    Payment Receipts & Time Log
+                  </span>
+                  <div className="border border-emerald-500/20 rounded-xl overflow-hidden bg-emerald-50/20 dark:bg-emerald-950/20">
+                    <table className="w-full text-left text-[11px]">
+                      <thead className="bg-emerald-100/60 dark:bg-emerald-900/40 text-emerald-900 dark:text-emerald-200 border-b border-emerald-500/20">
+                        <tr>
+                          <th className="p-2">Date & Time Log</th>
+                          <th className="p-2">Note / Mode</th>
+                          <th className="p-2 text-right">Paid (NPR)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-emerald-500/10 font-medium">
+                        {logs.map((p, idx) => (
+                          <tr key={idx}>
+                            <td className="p-2 font-mono text-slate-700 dark:text-slate-200">{p.dateTime}</td>
+                            <td className="p-2 text-slate-500 dark:text-slate-400">{p.note || 'Payment Received'}</td>
+                            <td className="p-2 text-right font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                              Rs. {p.amount}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )
+            })()}
+
+            {/* Financial Summary Box */}
+            {(() => {
+              const totalB = viewingInvoice?.totalAmount && viewingInvoice.totalAmount > 0
+                ? viewingInvoice.totalAmount
+                : Number(viewingBillAppt.feeAmount || 0)
+              const totalP = viewingInvoice
+                ? viewingInvoice.paidAmount
+                : (viewingBillAppt.paymentStatus === 'paid' ? totalB : 0)
+              const bal = Math.max(0, totalB - totalP)
+              const cleanRem = extractCleanClinicalRemarks(viewingInvoice?.remarks)
+
+              return (
+                <div className="space-y-2">
+                  <div className="p-3 bg-teal-50/60 dark:bg-teal-950/30 border border-teal-500/30 rounded-xl text-xs space-y-1.5 font-mono">
+                    <div className="flex justify-between text-slate-700 dark:text-slate-300">
+                      <span>Total Combined Bill:</span>
+                      <strong className="text-slate-900 dark:text-white font-black text-sm">Rs. {totalB}</strong>
+                    </div>
+                    <div className="flex justify-between text-emerald-600 dark:text-emerald-400 font-bold">
+                      <span>Total Paid to Date:</span>
+                      <span>Rs. {totalP}</span>
+                    </div>
+                    <div className="flex justify-between pt-1 border-t border-teal-500/20 text-rose-600 dark:text-rose-400 font-black text-xs">
+                      <span>Balance Due:</span>
+                      <span>Rs. {bal}</span>
+                    </div>
+                  </div>
+
+                  {cleanRem && (
+                    <div className="p-2.5 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-white/40 dark:border-white/10 text-xs">
+                      <span className="text-[10px] uppercase font-bold text-slate-400 block mb-0.5">Clinical Remarks / Advice</span>
+                      <p className="text-slate-700 dark:text-slate-300 whitespace-pre-wrap">{cleanRem}</p>
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
+
+            {/* Official Stamp & Security Seal */}
+            <div className="p-3 rounded-xl bg-slate-100 dark:bg-slate-800/60 text-slate-500 text-[11px] flex items-center justify-between border border-white/40 dark:border-white/10">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-500 shrink-0" />
+                <span>Digitally Authenticated • Dactor Health Cloud Network</span>
+              </div>
+              <span className="font-mono text-[10px] text-slate-400">
+                {new Date(viewingBillAppt.createdAt || Date.now()).toLocaleDateString()}
+              </span>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex items-center space-x-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setViewingBillAppt(null)}
+                className="flex-1 py-3 liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-bold border border-white/50 dark:border-white/10 transition cursor-pointer"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                onClick={() => handlePrintAppointmentBill(viewingBillAppt, viewingInvoice)}
+                className="flex-1 py-3 bg-gradient-to-r from-brand-600 to-teal-500 hover:from-brand-500 hover:to-teal-400 text-white rounded-xl text-xs font-bold transition shadow-glass-brand border border-white/25 active:scale-[0.98] cursor-pointer flex items-center justify-center gap-2"
+              >
+                <Download className="w-4 h-4" />
+                <span>Print Official Slip</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
