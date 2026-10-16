@@ -544,6 +544,47 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
   const [submittingRenewal, setSubmittingRenewal] = useState(false)
   const [clinicNotifications, setClinicNotifications] = useState<DactorNotification[]>([])
   const [showNotificationsModal, setShowNotificationsModal] = useState(false)
+  const [isExpiryBannerDismissed, setIsExpiryBannerDismissed] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('dismiss_clinic_expiry_banner') === 'true'
+    } catch {
+      return false
+    }
+  })
+
+  // Scroll collapsing state across 3 portals: Future OPD, Live Queue, Slot Publishing
+  const [isScrolledDown, setIsScrolledDown] = useState(false)
+
+  useEffect(() => {
+    let lastScrollY = window.scrollY
+    let ticking = false
+
+    const handleScroll = () => {
+      if (!ticking) {
+        window.requestAnimationFrame(() => {
+          const currentScrollY = window.scrollY
+          // If scrolled down more than 90px and scrolling downwards -> collapse top controls smoothly
+          if (currentScrollY > 90 && currentScrollY > lastScrollY + 12) {
+            setIsScrolledDown(true)
+          } 
+          // If scrolling upwards by more than 8px or near the top -> show all buttons smoothly
+          else if (currentScrollY < lastScrollY - 8 || currentScrollY <= 60) {
+            setIsScrolledDown(false)
+          }
+          lastScrollY = currentScrollY
+          ticking = false
+        })
+        ticking = true
+      }
+    }
+
+    window.addEventListener('scroll', handleScroll, { passive: true })
+    return () => window.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  useEffect(() => {
+    setIsScrolledDown(false)
+  }, [deskTab])
 
   // Staff & Doctor Invitations State (InvitationManagerScreen.kt)
   const [allSystemDoctors, setAllSystemDoctors] = useState<Doctor[]>([])
@@ -3443,6 +3484,42 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
         </div>
       </div>
 
+      {/* ACTIVE PORTAL SUBSCRIPTION EXPIRY BANNER (Red alert when expiring within 7 days and not dismissed) */}
+      {isSubscriptionActive && subscriptionDaysLeft <= 7 && !isExpiryBannerDismissed && (
+        <div className="bg-rose-50 dark:bg-rose-950/40 border border-rose-300 dark:border-rose-900/60 rounded-2xl p-3 sm:p-4 flex items-center justify-between shadow-sm animate-in fade-in">
+          <div
+            onClick={() => setShowRenewalModal(true)}
+            className="flex items-center gap-3 cursor-pointer flex-1 min-w-0"
+          >
+            <div className="w-10 h-10 rounded-full bg-rose-100 dark:bg-rose-900/50 flex items-center justify-center shrink-0">
+              <CalendarClock className="w-5 h-5 text-rose-600 dark:text-rose-400" />
+            </div>
+            <div className="min-w-0">
+              <h4 className="text-xs sm:text-sm font-bold text-rose-900 dark:text-rose-200 truncate">
+                Active Portal Subscription ({subscriptionDaysLeft} days left)
+              </h4>
+              <p className="text-[11px] text-rose-700 dark:text-rose-400 truncate">
+                Expires on {selectedClinic?.activationExpiresAt?.split('T')[0] || 'soon'} • Click to renew
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation()
+              setIsExpiryBannerDismissed(true)
+              try {
+                sessionStorage.setItem('dismiss_clinic_expiry_banner', 'true')
+              } catch {}
+            }}
+            className="p-1.5 rounded-full hover:bg-rose-200/60 dark:hover:bg-rose-900/60 text-rose-600 dark:text-rose-300 transition cursor-pointer shrink-0 ml-2"
+            title="Remove notification"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Navigation Desk Tabs (All 15 Modules) */}
       <div className="flex items-center space-x-2 p-1.5 rounded-2xl liquid-glass-base overflow-x-auto scrollbar-none">
         <button
@@ -3636,7 +3713,15 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
       {/* ========================================================= */}
       {deskTab === 'queue' && (
         <div className="space-y-6">
-          {/* Enlisted Doctors & Presence Roster Bar with Master Switch */}
+          {/* Collapsible Doctor Roster & Controls Bar (Smooth transition on scroll) */}
+          <div
+            className={`transition-all duration-300 ease-in-out transform origin-top space-y-4 ${
+              isScrolledDown
+                ? 'max-h-0 opacity-0 overflow-hidden pointer-events-none scale-y-95 mb-0'
+                : 'max-h-[1200px] opacity-100 scale-y-100 mb-6'
+            }`}
+          >
+            {/* Enlisted Doctors & Presence Roster Bar with Master Switch */}
           {clinicDoctors.length > 0 && (
             <div className="liquid-glass-card p-5 rounded-3xl border border-white/60 dark:border-white/15 shadow-glass-sm space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/40 dark:border-white/10 pb-3">
@@ -3819,6 +3904,23 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
               </button>
             </div>
           </div>
+        </div>
+
+        {/* Compact Sticky Queue Summary Bar when scrolled down */}
+        {isScrolledDown && (
+          <div
+            onClick={() => setIsScrolledDown(false)}
+            className="sticky top-2 z-20 liquid-glass-elevated px-4 py-2.5 rounded-2xl border border-white/60 dark:border-white/20 shadow-glass-sm flex items-center justify-between cursor-pointer transition-all duration-300 hover:bg-white/80 dark:hover:bg-slate-800/80"
+          >
+            <div className="flex items-center space-x-3 text-xs font-bold text-slate-800 dark:text-slate-200">
+              <Activity className="w-4 h-4 text-brand-600" />
+              <span>Live OPD Queue: {queueWaitingCount} Waiting • {queueInsideCount} Inside • {queueCompletedCount} Completed</span>
+            </div>
+            <span className="text-xs font-bold text-brand-600 hover:text-brand-800 flex items-center gap-1">
+              Show Roster &amp; Controls ▲
+            </span>
+          </div>
+        )}
 
           {/* Active Cabin Card (Patient currently inside) */}
           {activeConsultationPatient && (
@@ -4649,82 +4751,107 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
       {/* ========================================================= */}
       {deskTab === 'slots' && (
         <div className="space-y-6">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-            <div>
-              <h2 className="text-xl font-black text-slate-900">Doctor Timed Slots Publisher</h2>
-              <p className="text-xs text-slate-500 font-medium mt-0.5">
-                Publish timed consultation slots (e.g. 09:00 - 09:15, with patient capacity limit). Available slots appear live on the patient booking app.
-              </p>
+          {/* Collapsible Header & Date Strip (Smooth transition on scroll) */}
+          <div
+            className={`transition-all duration-300 ease-in-out transform origin-top space-y-4 ${
+              isScrolledDown
+                ? 'max-h-0 opacity-0 overflow-hidden pointer-events-none scale-y-95 mb-0'
+                : 'max-h-[800px] opacity-100 scale-y-100 mb-6'
+            }`}
+          >
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-black text-slate-900">Doctor Timed Slots Publisher</h2>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">
+                  Publish timed consultation slots (e.g. 09:00 - 09:15, with patient capacity limit). Available slots appear live on the patient booking app.
+                </p>
+              </div>
+              <div className="flex items-center space-x-2">
+                <GlassBadge variant="brand" size="md">
+                  {publishedSlots.length} Slots Published on {slotDate}
+                </GlassBadge>
+              </div>
             </div>
-            <div className="flex items-center space-x-2">
-              <GlassBadge variant="brand" size="md">
-                {publishedSlots.length} Slots Published on {slotDate}
-              </GlassBadge>
-            </div>
+
+            {/* 14-Day Horizontal Date Strip (SlotManagerScreen.kt) */}
+            <GlassCard variant="subtle" padding="md" radius="xl" className="space-y-2">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
+                Quick 14-Day Schedule Selector
+              </span>
+              <div className="flex items-center space-x-2 overflow-x-auto pb-1">
+                {upcoming14Dates.map((d) => {
+                  const isSelected = slotDate === d.dateStr
+                  const isHol = selectedClinic?.declaredHolidays?.includes(d.dateStr)
+                  return (
+                    <button
+                      key={d.dateStr}
+                      type="button"
+                      onClick={() => setSlotDate(d.dateStr)}
+                      className={`px-3.5 py-2 rounded-2xl border text-center shrink-0 transition cursor-pointer ${
+                        isSelected
+                          ? 'bg-brand-600 border-brand-600 text-white shadow-glass-brand'
+                          : isHol
+                          ? 'bg-rose-50/80 border-rose-200 text-rose-700 backdrop-blur-md'
+                          : 'bg-white/60 border-white/80 text-slate-700 hover:bg-white/90 backdrop-blur-md'
+                      }`}
+                    >
+                      <span className="text-[10px] font-bold block uppercase opacity-80">{d.dayShort}</span>
+                      <span className="text-sm font-black block">{d.dayNum} {d.monthShort}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </GlassCard>
+
+            {/* Quick Doctor & Date Selector Bar */}
+            <GlassCard variant="base" padding="md" radius="xl" className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs font-bold text-slate-700 block mb-1">
+                  Select Attending Doctor <span className="text-rose-500">*</span>
+                </label>
+                <select
+                  value={slotDoctorId}
+                  onChange={(e) => setSlotDoctorId(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl text-xs font-bold liquid-glass-input focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  {clinicDoctors.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.fullName} ({d.specialty || 'General'})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-700 block mb-1">
+                  Slot Date <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="date"
+                  value={slotDate}
+                  onChange={(e) => setSlotDate(e.target.value)}
+                  min={new Date().toISOString().split('T')[0]}
+                  className="w-full px-3.5 py-2.5 rounded-xl text-xs font-bold liquid-glass-input focus:outline-none focus:ring-2 focus:ring-brand-500"
+                />
+              </div>
+            </GlassCard>
           </div>
 
-          {/* 14-Day Horizontal Date Strip (SlotManagerScreen.kt) */}
-          <GlassCard variant="subtle" padding="md" radius="xl" className="space-y-2">
-            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
-              Quick 14-Day Schedule Selector
-            </span>
-            <div className="flex items-center space-x-2 overflow-x-auto pb-1">
-              {upcoming14Dates.map((d) => {
-                const isSelected = slotDate === d.dateStr
-                const isHol = selectedClinic?.declaredHolidays?.includes(d.dateStr)
-                return (
-                  <button
-                    key={d.dateStr}
-                    type="button"
-                    onClick={() => setSlotDate(d.dateStr)}
-                    className={`px-3.5 py-2 rounded-2xl border text-center shrink-0 transition cursor-pointer ${
-                      isSelected
-                        ? 'bg-brand-600 border-brand-600 text-white shadow-glass-brand'
-                        : isHol
-                        ? 'bg-rose-50/80 border-rose-200 text-rose-700 backdrop-blur-md'
-                        : 'bg-white/60 border-white/80 text-slate-700 hover:bg-white/90 backdrop-blur-md'
-                    }`}
-                  >
-                    <span className="text-[10px] font-bold block uppercase opacity-80">{d.dayShort}</span>
-                    <span className="text-sm font-black block">{d.dayNum} {d.monthShort}</span>
-                  </button>
-                )
-              })}
+          {/* Compact Sticky Bar when scrolled down */}
+          {isScrolledDown && (
+            <div
+              onClick={() => setIsScrolledDown(false)}
+              className="sticky top-2 z-20 liquid-glass-elevated px-4 py-2.5 rounded-2xl border border-white/60 shadow-glass-sm flex items-center justify-between cursor-pointer transition-all duration-300 hover:bg-white/80"
+            >
+              <div className="flex items-center space-x-2 text-xs font-bold text-slate-800">
+                <CalendarClock className="w-4 h-4 text-brand-600" />
+                <span>Timed Slots: {slotDate} ({publishedSlots.length} Published Slots)</span>
+              </div>
+              <span className="text-xs font-bold text-brand-600 hover:text-brand-800 flex items-center gap-1">
+                Show Date Selector &amp; Controls ▲
+              </span>
             </div>
-          </GlassCard>
-
-          {/* Quick Doctor & Date Selector Bar */}
-          <GlassCard variant="base" padding="md" radius="xl" className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="text-xs font-bold text-slate-700 block mb-1">
-                Select Attending Doctor <span className="text-rose-500">*</span>
-              </label>
-              <select
-                value={slotDoctorId}
-                onChange={(e) => setSlotDoctorId(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl text-xs font-bold liquid-glass-input focus:outline-none focus:ring-2 focus:ring-brand-500"
-              >
-                {clinicDoctors.map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.fullName} ({d.specialty || 'General'})
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label className="text-xs font-bold text-slate-700 block mb-1">
-                Slot Date <span className="text-rose-500">*</span>
-              </label>
-              <input
-                type="date"
-                value={slotDate}
-                onChange={(e) => setSlotDate(e.target.value)}
-                min={new Date().toISOString().split('T')[0]}
-                className="w-full px-3.5 py-2.5 rounded-xl text-xs font-bold liquid-glass-input focus:outline-none focus:ring-2 focus:ring-brand-500"
-              />
-            </div>
-          </GlassCard>
+          )}
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {/* Left Column: Publish Single Slot or Quick Presets */}
@@ -4932,120 +5059,148 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
       {/* ========================================================= */}
       {deskTab === 'future_appts' && (
         <div className="space-y-6">
-          {/* 14-Day Horizontal Date Strip with Holiday & Booking Indicators (FutureAppointmentsScreen.kt) */}
-          <GlassCard variant="subtle" padding="md" radius="xl" className="space-y-2">
-            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
-              14-Day Upcoming OPD Calendar Strip
-            </span>
-            <div className="flex items-center space-x-2 overflow-x-auto pb-1">
-              {upcoming14Dates.map((d) => {
-                const isSelected = futureSelectedDate === d.dateStr
-                const isHol = selectedClinic?.declaredHolidays?.includes(d.dateStr)
-                const apptCount = appointments.filter((a) => a.appointmentDate === d.dateStr).length
-                return (
-                  <button
-                    key={d.dateStr}
-                    type="button"
-                    onClick={() => setFutureSelectedDate(d.dateStr)}
-                    className={`px-3.5 py-2 rounded-2xl border text-center shrink-0 transition cursor-pointer relative ${
-                      isSelected
-                        ? 'bg-brand-600 border-brand-600 text-white shadow-glass-brand'
-                        : isHol
-                        ? 'bg-rose-50/80 border-rose-300 text-rose-800 backdrop-blur-md'
-                        : 'bg-white/60 border-white/80 text-slate-700 hover:bg-white/90 backdrop-blur-md'
-                    }`}
-                  >
-                    <span className="text-[10px] font-bold block uppercase opacity-80">{d.dayShort}</span>
-                    <span className="text-sm font-black block">{d.dayNum} {d.monthShort}</span>
-                    <div className="flex items-center justify-center gap-1 mt-0.5">
-                      {isHol && (
-                        <span className="px-1.5 py-0.2 rounded text-[8px] font-black uppercase bg-rose-600 text-white">
-                          Closed
-                        </span>
-                      )}
-                      {apptCount > 0 && (
-                        <span
-                          className={`px-1.5 py-0.2 rounded text-[9px] font-black ${
-                            isSelected ? 'bg-white text-brand-700' : 'bg-brand-100 text-brand-800'
-                          }`}
-                        >
-                          {apptCount} OPD
-                        </span>
-                      )}
-                    </div>
-                  </button>
-                )
-              })}
-            </div>
-          </GlassCard>
-
-          {/* Top Control Bar: Date Selector & Declare Holiday Toggle */}
-          <GlassCard variant="base" padding="md" radius="xl" className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-            <div className="space-y-1">
-              <h2 className="text-lg font-black text-slate-900">Future Appointments & Holiday Desk</h2>
-              <p className="text-xs text-slate-500">
-                Select any upcoming date to view scheduled appointments or declare the clinic closed on holidays.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
-              {/* Sub-filter Pills (FutureAppointmentsScreen.kt: All / Waiting / Completed) */}
-              <div className="flex p-1 liquid-glass-subtle rounded-xl border border-white/70">
-                {(['all', 'waiting', 'completed'] as const).map((f) => (
-                  <button
-                    key={f}
-                    type="button"
-                    onClick={() => setFutureSubFilter(f)}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold capitalize cursor-pointer ${
-                      futureSubFilter === f
-                        ? 'bg-white/90 text-brand-700 shadow-glass-sm'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {f === 'all' ? 'All' : f === 'waiting' ? 'Waiting / Active' : 'Completed'}
-                  </button>
-                ))}
+          {/* Collapsible Calendar & Controls (Smooth transition on scroll) */}
+          <div
+            className={`transition-all duration-300 ease-in-out transform origin-top space-y-4 ${
+              isScrolledDown
+                ? 'max-h-0 opacity-0 overflow-hidden pointer-events-none scale-y-95 mb-0'
+                : 'max-h-[800px] opacity-100 scale-y-100 mb-6'
+            }`}
+          >
+            {/* 14-Day Horizontal Date Strip with Holiday & Booking Indicators (FutureAppointmentsScreen.kt) */}
+            <GlassCard variant="subtle" padding="md" radius="xl" className="space-y-2">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
+                14-Day Upcoming OPD Calendar Strip
+              </span>
+              <div className="flex items-center space-x-2 overflow-x-auto pb-1">
+                {upcoming14Dates.map((d) => {
+                  const isSelected = futureSelectedDate === d.dateStr
+                  const isHol = selectedClinic?.declaredHolidays?.includes(d.dateStr)
+                  const apptCount = appointments.filter((a) => a.appointmentDate === d.dateStr).length
+                  return (
+                    <button
+                      key={d.dateStr}
+                      type="button"
+                      onClick={() => setFutureSelectedDate(d.dateStr)}
+                      className={`px-3.5 py-2 rounded-2xl border text-center shrink-0 transition cursor-pointer relative ${
+                        isSelected
+                          ? 'bg-brand-600 border-brand-600 text-white shadow-glass-brand'
+                          : isHol
+                          ? 'bg-rose-50/80 border-rose-300 text-rose-800 backdrop-blur-md'
+                          : 'bg-white/60 border-white/80 text-slate-700 hover:bg-white/90 backdrop-blur-md'
+                      }`}
+                    >
+                      <span className="text-[10px] font-bold block uppercase opacity-80">{d.dayShort}</span>
+                      <span className="text-sm font-black block">{d.dayNum} {d.monthShort}</span>
+                      <div className="flex items-center justify-center gap-1 mt-0.5">
+                        {isHol && (
+                          <span className="px-1.5 py-0.2 rounded text-[8px] font-black uppercase bg-rose-600 text-white">
+                            Closed
+                          </span>
+                        )}
+                        {apptCount > 0 && (
+                          <span
+                            className={`px-1.5 py-0.2 rounded text-[9px] font-black ${
+                              isSelected ? 'bg-white text-brand-700' : 'bg-brand-100 text-brand-800'
+                            }`}
+                          >
+                            {apptCount} OPD
+                          </span>
+                        )}
+                      </div>
+                    </button>
+                  )
+                })}
               </div>
+            </GlassCard>
 
-              {/* Date Input */}
-              <input
-                type="date"
-                value={futureSelectedDate}
-                onChange={(e) => setFutureSelectedDate(e.target.value)}
-                className="px-3.5 py-2 rounded-xl liquid-glass-input text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
-              />
-
-              {/* Declare Holiday Toggle */}
-              <button
-                type="button"
-                onClick={() => handleToggleHolidayForDate(futureSelectedDate)}
-                disabled={togglingHoliday}
-                className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
-                  isSelectedDateHoliday
-                    ? 'bg-rose-600 border-rose-600 text-white shadow-glass-sm'
-                    : 'bg-white/65 border-white/80 text-slate-700 hover:bg-rose-50 hover:text-rose-700 backdrop-blur-md'
-                }`}
-              >
-                <AlertTriangle className="w-4 h-4" />
-                <span>
-                  {isSelectedDateHoliday
-                    ? 'Holiday Declared (Clinic Closed)'
-                    : 'Declare Holiday on Date'}
-                </span>
-              </button>
-            </div>
-          </GlassCard>
-
-          {/* Holiday Notice Banner if declared */}
-          {isSelectedDateHoliday && (
-            <div className="p-4 bg-rose-50/85 backdrop-blur-md border border-rose-200/80 rounded-2xl flex items-center space-x-3 text-rose-800 text-xs font-bold shadow-glass-sm">
-              <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
-              <div>
-                <span>HOLIDAY DECLARED FOR {futureSelectedDate}: Clinic is marked CLOSED.</span>
-                <p className="font-normal text-rose-700 mt-0.5">
-                  Whenever any patient checks for appointments on this date, the system will inform them that the clinic is closed.
+            {/* Top Control Bar: Date Selector & Declare Holiday Toggle */}
+            <GlassCard variant="base" padding="md" radius="xl" className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <h2 className="text-lg font-black text-slate-900">Future Appointments & Holiday Desk</h2>
+                <p className="text-xs text-slate-500">
+                  Select any upcoming date to view scheduled appointments or declare the clinic closed on holidays.
                 </p>
               </div>
+
+              <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
+                {/* Sub-filter Pills (FutureAppointmentsScreen.kt: All / Waiting / Completed) */}
+                <div className="flex p-1 liquid-glass-subtle rounded-xl border border-white/70">
+                  {(['all', 'waiting', 'completed'] as const).map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      onClick={() => setFutureSubFilter(f)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold capitalize cursor-pointer ${
+                        futureSubFilter === f
+                          ? 'bg-white/90 text-brand-700 shadow-glass-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {f === 'all' ? 'All' : f === 'waiting' ? 'Waiting / Active' : 'Completed'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Date Input */}
+                <input
+                  type="date"
+                  value={futureSelectedDate}
+                  onChange={(e) => setFutureSelectedDate(e.target.value)}
+                  className="px-3.5 py-2 rounded-xl liquid-glass-input text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                />
+
+                {/* Declare Holiday Toggle */}
+                <button
+                  type="button"
+                  onClick={() => handleToggleHolidayForDate(futureSelectedDate)}
+                  disabled={togglingHoliday}
+                  className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold border transition-all cursor-pointer ${
+                    isSelectedDateHoliday
+                      ? 'bg-rose-600 border-rose-600 text-white shadow-glass-sm'
+                      : 'bg-white/65 border-white/80 text-slate-700 hover:bg-rose-50 hover:text-rose-700 backdrop-blur-md'
+                  }`}
+                >
+                  <AlertTriangle className="w-4 h-4" />
+                  <span>
+                    {isSelectedDateHoliday
+                      ? 'Holiday Declared (Clinic Closed)'
+                      : 'Declare Holiday on Date'}
+                  </span>
+                </button>
+              </div>
+            </GlassCard>
+
+            {/* Holiday Notice Banner if declared */}
+            {isSelectedDateHoliday && (
+              <div className="p-4 bg-rose-50/85 backdrop-blur-md border border-rose-200/80 rounded-2xl flex items-center space-x-3 text-rose-800 text-xs font-bold shadow-glass-sm">
+                <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
+                <div>
+                  <span>HOLIDAY DECLARED FOR {futureSelectedDate}: Clinic is marked CLOSED.</span>
+                  <p className="font-normal text-rose-700 mt-0.5">
+                    Whenever any patient checks for appointments on this date, the system will inform them that the clinic is closed.
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Compact Sticky Bar when scrolled down */}
+          {isScrolledDown && (
+            <div
+              onClick={() => setIsScrolledDown(false)}
+              className="sticky top-2 z-20 liquid-glass-elevated px-4 py-2.5 rounded-2xl border border-white/60 shadow-glass-sm flex items-center justify-between cursor-pointer transition-all duration-300 hover:bg-white/80"
+            >
+              <div className="flex items-center space-x-2 text-xs font-bold text-slate-800">
+                <Calendar className="w-4 h-4 text-brand-600" />
+                <span>OPD Queue: {futureSelectedDate} ({futureDateAppointments.length} Appointments)</span>
+                <span className="text-[10px] uppercase px-2 py-0.5 rounded-md bg-brand-50 text-brand-700 font-bold border border-brand-200">
+                  Filter: {futureSubFilter === 'all' ? 'All' : futureSubFilter === 'waiting' ? 'Waiting / Active' : 'Completed'}
+                </span>
+              </div>
+              <span className="text-xs font-bold text-brand-600 hover:text-brand-800 flex items-center gap-1">
+                Show Calendar &amp; Controls ▲
+              </span>
             </div>
           )}
 

@@ -334,7 +334,7 @@ export const App: React.FC = () => {
       if (params?.doctorId !== undefined) {
         setSelectedDoctorId(params.doctorId || null)
       }
-      if (params?.action === 'book' || params?.autoOpenBooking) {
+      if (params?.action === 'book' || params?.autoOpenBooking || params?.isReschedule) {
         setAutoOpenBooking(true)
       } else {
         setAutoOpenBooking(false)

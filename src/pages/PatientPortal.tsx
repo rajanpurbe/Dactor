@@ -188,15 +188,6 @@ interface PatientPortalProps {
   onNavigate?: (tab: string, params?: any) => void
 }
 
-interface FamilyMember {
-  id: string
-  name: string
-  relation: string
-  age: number
-  gender: string
-  phone?: string
-}
-
 export const PatientPortal: React.FC<PatientPortalProps> = ({
   onNavigateHome,
   onOpenLiveQueue,
@@ -243,7 +234,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
   // Active Tab
   const [activeTab, setActiveTab] = useState<
-    'appointments' | 'book' | 'transactions' | 'reports' | 'notifications' | 'family' | 'help'
+    'appointments' | 'book' | 'transactions' | 'reports' | 'notifications'
   >('appointments')
 
   // Support / Help Requests State
@@ -415,8 +406,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   }, [isReturningPatient, followupCodeInput, clinicDoctors])
 
   // Patient Details for Booking
-  const [bookFor, setBookFor] = useState<'self' | 'family'>('self')
-  const [selectedFamilyId, setSelectedFamilyId] = useState<string>('')
   const [bookPatientName, setBookPatientName] = useState('')
   const [bookPatientPhone, setBookPatientPhone] = useState('')
   const [bookPatientAge, setBookPatientAge] = useState('')
@@ -457,24 +446,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   // ==========================================
   const [notifications, setNotifications] = useState<DactorNotification[]>([])
   const [unreadCount, setUnreadCount] = useState(0)
-
-  // ==========================================
-  // FAMILY MEMBERS STATE
-  // ==========================================
-  const [familyMembers, setFamilyMembers] = useState<FamilyMember[]>(() => {
-    try {
-      const saved = localStorage.getItem('dactor_family_members')
-      return saved ? JSON.parse(saved) : []
-    } catch {
-      return []
-    }
-  })
-  const [showAddFamilyModal, setShowAddFamilyModal] = useState(false)
-  const [newFamilyName, setNewFamilyName] = useState('')
-  const [newFamilyRelation, setNewFamilyRelation] = useState('Spouse')
-  const [newFamilyAge, setNewFamilyAge] = useState('')
-  const [newFamilyGender, setNewFamilyGender] = useState('Male')
-  const [newFamilyPhone, setNewFamilyPhone] = useState('')
 
   // ==========================================
   // PENDING BOOKING REDIRECT & TOAST STATE
@@ -746,11 +717,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     loadMySupportTickets()
   }, [patientUser])
 
-  useEffect(() => {
-    if (activeTab === 'help') {
-      loadMySupportTickets()
-    }
-  }, [activeTab])
 
   // ==========================================
   // DATA LOADERS
@@ -1873,35 +1839,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     window.dispatchEvent(new Event('storage'))
   }
 
-  // Family Members Management
-  const handleAddFamilyMember = (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!newFamilyName.trim()) return
-
-    const newMem: FamilyMember = {
-      id: crypto.randomUUID(),
-      name: newFamilyName.trim(),
-      relation: newFamilyRelation,
-      age: parseInt(newFamilyAge) || 25,
-      gender: newFamilyGender,
-      phone: newFamilyPhone.trim(),
-    }
-
-    const updated = [...familyMembers, newMem]
-    setFamilyMembers(updated)
-    localStorage.setItem('dactor_family_members', JSON.stringify(updated))
-    setNewFamilyName('')
-    setNewFamilyAge('')
-    setNewFamilyPhone('')
-    setShowAddFamilyModal(false)
-  }
-
-  const handleDeleteFamilyMember = (id: string) => {
-    const updated = familyMembers.filter((f) => f.id !== id)
-    setFamilyMembers(updated)
-    localStorage.setItem('dactor_family_members', JSON.stringify(updated))
-  }
-
   // Filter Active vs Past appointments
   const todayStr = new Date().toISOString().split('T')[0]
   const filteredAppointments = myAppointments.filter((a) => {
@@ -2060,13 +1997,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
             { id: 'transactions', label: 'Transaction History', icon: CreditCard, badge: transactions.length },
             { id: 'reports', label: 'Diagnostic Lab Reports', icon: FileText, badge: patientLabReports.length },
             { id: 'notifications', label: 'Queue Alerts & Updates', icon: Bell, badge: unreadCount },
-            { id: 'family', label: 'Family Profiles', icon: Users, badge: familyMembers.length },
-            {
-              id: 'help',
-              label: 'Help Requests',
-              icon: Headphones,
-              badge: patientTickets.filter((t) => t.status === 'open' || t.status === 'in_progress').length,
-            },
           ].map((tab) => {
             const Icon = tab.icon
             const isActive = activeTab === tab.id
@@ -2342,13 +2272,18 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                           <div className="flex items-center space-x-1.5">
                             <button
                               onClick={() => {
-                                if (onNavigate && appt.clinicId) {
-                                  onNavigate('clinic-detail', {
-                                    clinicId: appt.clinicId,
-                                    doctorId: appt.doctorId,
-                                    trackingCode: appt.trackingCode10Digit,
-                                    isReschedule: true,
-                                  })
+                                if (appt.clinicId) {
+                                  if (onNavigate) {
+                                    onNavigate('clinic-detail', {
+                                      clinicId: appt.clinicId,
+                                      doctorId: appt.doctorId,
+                                      trackingCode: appt.trackingCode10Digit,
+                                      isReschedule: true,
+                                      autoOpenBooking: true,
+                                    })
+                                  } else {
+                                    window.location.href = `/?clinic=${appt.clinicId}&doctor=${appt.doctorId || ''}&rescheduleCode=${appt.trackingCode10Digit}&reschedule=true#clinic-detail`
+                                  }
                                 } else {
                                   setRescheduleAppt(appt)
                                   setNewRescheduleDate(appt.appointmentDate)
@@ -3237,71 +3172,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                   </div>
                 )}
 
-                {/* Book for Self or Family (Hidden for Verified Follow-Up Visits) */}
-                {!isReturningPatient && familyMembers.length > 0 && (
-                  <div className="space-y-2">
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                      Who is this appointment for?
-                    </label>
-                    <div className="flex items-center space-x-3">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setBookFor('self')
-                          if (patientUser) {
-                            setBookPatientName(patientUser.fullName || '')
-                            setBookPatientPhone(patientUser.phone || '')
-                            setBookPatientAge(patientUser.age ? patientUser.age.toString() : '28')
-                            setBookPatientGender(patientUser.gender || 'Male')
-                          }
-                        }}
-                        className={`flex-1 py-2 rounded-xl text-xs font-bold border transition ${
-                          bookFor === 'self'
-                            ? 'bg-brand-50 text-brand-800 border-brand-500'
-                            : 'bg-white text-slate-600 border-slate-200'
-                        }`}
-                      >
-                        Self ({patientUser?.fullName || 'Me'})
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setBookFor('family')}
-                        className={`flex-1 py-2 rounded-xl text-xs font-bold border transition ${
-                          bookFor === 'family'
-                            ? 'bg-brand-50 text-brand-800 border-brand-500'
-                            : 'bg-white text-slate-600 border-slate-200'
-                        }`}
-                      >
-                        Family Member
-                      </button>
-                    </div>
-
-                    {bookFor === 'family' && (
-                      <select
-                        value={selectedFamilyId}
-                        onChange={(e) => {
-                          setSelectedFamilyId(e.target.value)
-                          const mem = familyMembers.find((f) => f.id === e.target.value)
-                          if (mem) {
-                            setBookPatientName(mem.name)
-                            setBookPatientAge(mem.age.toString())
-                            setBookPatientGender(mem.gender)
-                            if (mem.phone) setBookPatientPhone(mem.phone)
-                          }
-                        }}
-                        className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 outline-none"
-                      >
-                        <option value="">-- Choose family member --</option>
-                        {familyMembers.map((m) => (
-                          <option key={m.id} value={m.id}>
-                            {m.name} ({m.relation})
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                  </div>
-                )}
-
                 {/* Patient Full Name */}
                 <div className="space-y-1">
                   <div className="flex items-center justify-between">
@@ -4052,348 +3922,33 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           </div>
         )}
 
-        {/* ==========================================
-            TAB 6: FAMILY PROFILES
-        ========================================== */}
-        {activeTab === 'family' && (
-          <div className="liquid-glass-card rounded-3xl p-6 sm:p-8 shadow-sm border border-white/40 dark:border-white/10 space-y-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-lg font-black text-slate-900 dark:text-white">Family Members</h3>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  Save family members to book doctor slots and lab tests with 1 click.
-                </p>
-              </div>
-              <button
-                onClick={() => setShowAddFamilyModal(true)}
-                className="flex items-center space-x-1.5 px-4 py-2 bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 text-white font-bold text-xs rounded-xl shadow-xs transition cursor-pointer active:scale-[0.98]"
-              >
-                <Users className="w-4 h-4" />
-                <span>+ Add Member</span>
-              </button>
+        {/* Support & Legal Compliance Footer Card (Aligned with Mobile App) */}
+        <div className="liquid-glass-card rounded-3xl p-6 sm:p-7 border border-white/40 dark:border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-center space-x-3.5">
+            <div className="w-10 h-10 rounded-2xl bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center border border-blue-500/20 shrink-0">
+              <Headphones className="w-5 h-5" />
             </div>
-
-            {familyMembers.length === 0 ? (
-              <div className="p-12 text-center text-slate-400 space-y-3">
-                <Users className="w-10 h-10 mx-auto stroke-1" />
-                <p className="text-sm font-semibold">No family members registered</p>
-                <p className="text-xs text-slate-400 max-w-sm mx-auto">
-                  Add spouse, children, or elderly parents to easily manage their medical appointments.
-                </p>
+            <div>
+              <div className="font-bold text-sm text-slate-900 dark:text-white">
+                Contact Us & Official Dactor Helpdesk
               </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                {familyMembers.map((mem) => (
-                  <div key={mem.id} className="p-5 rounded-2xl border border-white/40 dark:border-white/10 liquid-glass-subtle space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-teal-500/10 text-teal-800 dark:text-teal-300 border border-teal-500/20">
-                        {mem.relation}
-                      </span>
-                      <button
-                        onClick={() => handleDeleteFamilyMember(mem.id)}
-                        className="text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 transition cursor-pointer"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                    <div className="font-bold text-base text-slate-900 dark:text-white">{mem.name}</div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400">
-                      {mem.age} yrs • {mem.gender}
-                      {mem.phone && ` • ${mem.phone}`}
-                    </div>
-                  </div>
-                ))}
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                24/7 patient support, hospital queue guidance, NMC compliance & terms
               </div>
-            )}
-          </div>
-        )}
-
-        {/* ==========================================
-            TAB 7: HELP REQUESTS & SUPPORT TICKETS
-        ========================================== */}
-        {activeTab === 'help' && (
-          <div className="liquid-glass-card rounded-3xl p-6 sm:p-8 shadow-sm border border-white/40 dark:border-white/10 space-y-6">
-            {/* Header */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-white/20 dark:border-white/5">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <div className="w-9 h-9 rounded-xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center border border-indigo-500/20">
-                    <LifeBuoy className="w-5 h-5" />
-                  </div>
-                  <h3 className="text-lg sm:text-xl font-black text-slate-900 dark:text-white">
-                    Help Requests & Support Status
-                  </h3>
-                </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  Track resolution updates for your submitted inquiries, live queue issues, or clinic support.
-                </p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={loadMySupportTickets}
-                  disabled={loadingPatientTickets}
-                  className="p-2 text-slate-400 hover:text-teal-600 dark:hover:text-teal-400 liquid-glass-subtle rounded-xl transition cursor-pointer"
-                  title="Refresh Help Requests"
-                >
-                  <RefreshCw className={`w-4 h-4 ${loadingPatientTickets ? 'animate-spin' : ''}`} />
-                </button>
-                <a
-                  href="#support"
-                  onClick={() => {
-                    window.location.hash = '#support'
-                    window.dispatchEvent(new HashChangeEvent('hashchange'))
-                  }}
-                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-teal-500/20 transition cursor-pointer"
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Submit New Request</span>
-                </a>
-              </div>
-            </div>
-
-            {/* Instant Ticket Search Bar */}
-            <div className="p-4 sm:p-5 rounded-2xl liquid-glass-subtle border border-indigo-200/60 dark:border-indigo-500/20 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-                  <Search className="w-4 h-4 text-indigo-500" />
-                  <span>Check Any Ticket by ID, Phone, or Gmail</span>
-                </span>
-                <span className="text-[11px] text-slate-500 font-mono">e.g. #DAC-TKT-1082</span>
-              </div>
-              <form onSubmit={handleSearchPatientTicket} className="flex gap-2">
-                <input
-                  type="text"
-                  value={ticketSearchInput}
-                  onChange={(e) => setTicketSearchInput(e.target.value)}
-                  placeholder="Enter Ticket ID (#DAC-TKT-...) or contact phone / email"
-                  className="flex-1 px-4 py-2.5 rounded-xl liquid-glass-input text-xs sm:text-sm font-semibold border border-white/60 dark:border-white/10 text-slate-900 dark:text-white"
-                />
-                <button
-                  type="submit"
-                  disabled={isSearchingTicket || !ticketSearchInput.trim()}
-                  className="px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-sky-600 hover:brightness-105 disabled:opacity-50 text-white font-bold text-xs rounded-xl transition cursor-pointer shadow-xs whitespace-nowrap"
-                >
-                  {isSearchingTicket ? 'Searching...' : 'Check Status'}
-                </button>
-              </form>
-
-              {ticketSearchError && (
-                <div className="p-3 bg-rose-50/80 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 rounded-xl text-xs flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>{ticketSearchError}</span>
-                </div>
-              )}
-
-              {ticketLookupResult && (
-                <div className="p-4 bg-white/80 dark:bg-slate-900/80 rounded-xl border border-indigo-300/60 dark:border-indigo-500/30 space-y-3 animate-in fade-in">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-black text-sm text-indigo-600 dark:text-indigo-400">
-                        {ticketLookupResult.ticketCode}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => handleCopyCode(ticketLookupResult.ticketCode)}
-                        className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-                        title="Copy Ticket ID"
-                      >
-                        <Copy className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                    <span
-                      className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${
-                        ticketLookupResult.status === 'resolved'
-                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
-                          : ticketLookupResult.status === 'in_progress'
-                          ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
-                          : ticketLookupResult.status === 'closed'
-                          ? 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
-                          : 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300'
-                      }`}
-                    >
-                      {ticketLookupResult.status === 'resolved'
-                        ? 'Resolved'
-                        : ticketLookupResult.status === 'in_progress'
-                        ? 'In Progress'
-                        : ticketLookupResult.status === 'closed'
-                        ? 'Closed'
-                        : 'Open / In Queue'}
-                    </span>
-                  </div>
-
-                  <div className="text-xs text-slate-600 dark:text-slate-300">
-                    <span className="font-bold text-slate-700 dark:text-slate-200">Category: </span>
-                    {(ticketLookupResult as any).reasonCategory || ticketLookupResult.category || 'General Inquiry'}
-                  </div>
-
-                  <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/60 text-xs text-slate-700 dark:text-slate-300 italic">
-                    "{ticketLookupResult.message}"
-                  </div>
-
-                  {ticketLookupResult.adminNotes && (
-                    <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 rounded-xl border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-300">
-                      <div className="font-bold mb-1 flex items-center gap-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>Admin Resolution Notes:</span>
-                      </div>
-                      <p>{ticketLookupResult.adminNotes}</p>
-                    </div>
-                  )}
-
-                  <div className="flex items-center justify-end gap-2 pt-1">
-                    <a
-                      href={`#support?track=${encodeURIComponent(ticketLookupResult.ticketCode)}`}
-                      onClick={() => {
-                        window.location.hash = `#support?track=${encodeURIComponent(ticketLookupResult.ticketCode)}`
-                        window.dispatchEvent(new HashChangeEvent('hashchange'))
-                      }}
-                      className="text-xs font-bold text-indigo-600 dark:text-indigo-400 hover:underline flex items-center gap-1"
-                    >
-                      <span>Open Full Support Desk & WhatsApp →</span>
-                    </a>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* List of Tickets linked to Patient Profile / Device */}
-            <div className="space-y-4">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                Your Registered Help Requests ({patientTickets.length})
-              </h4>
-
-              {loadingPatientTickets ? (
-                <div className="py-12 text-center text-slate-400 text-xs flex items-center justify-center gap-2">
-                  <RefreshCw className="w-4 h-4 animate-spin text-teal-500" />
-                  <span>Loading your help requests...</span>
-                </div>
-              ) : patientTickets.length === 0 ? (
-                <div className="text-center py-10 space-y-3 liquid-glass-subtle rounded-2xl border border-white/30 dark:border-white/10 p-6">
-                  <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 flex items-center justify-center mx-auto">
-                    <Headphones className="w-6 h-6" />
-                  </div>
-                  <h4 className="font-bold text-sm text-slate-900 dark:text-white">
-                    No Help Requests Found
-                  </h4>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
-                    You haven't submitted any help requests from this account yet, or your past inquiries are under a different phone number.
-                  </p>
-                  <div className="pt-2">
-                    <a
-                      href="#support"
-                      onClick={() => {
-                        window.location.hash = '#support'
-                        window.dispatchEvent(new HashChangeEvent('hashchange'))
-                      }}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-teal-500 text-white font-bold text-xs shadow-xs hover:bg-teal-600 transition"
-                    >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>Contact Support Now</span>
-                    </a>
-                  </div>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {patientTickets.map((t) => (
-                    <div
-                      key={t.id || t.ticketCode}
-                      className="p-5 rounded-2xl liquid-glass-subtle border border-white/40 dark:border-white/10 space-y-3 hover:border-indigo-400/50 transition shadow-xs"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono font-bold text-xs text-indigo-600 dark:text-indigo-400">
-                            {t.ticketCode}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => handleCopyCode(t.ticketCode)}
-                            className="text-slate-400 hover:text-slate-600 transition"
-                            title="Copy Code"
-                          >
-                            <Copy className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                        <span
-                          className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${
-                            t.status === 'resolved'
-                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300'
-                              : t.status === 'in_progress'
-                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
-                              : t.status === 'closed'
-                              ? 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
-                              : 'bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300'
-                          }`}
-                        >
-                          {t.status === 'resolved'
-                            ? 'Resolved'
-                            : t.status === 'in_progress'
-                            ? 'In Progress'
-                            : t.status === 'closed'
-                            ? 'Closed'
-                            : 'Open'}
-                        </span>
-                      </div>
-
-                      <div className="text-xs">
-                        <span className="text-slate-400 font-medium">Category: </span>
-                        <span className="font-bold text-slate-800 dark:text-slate-200">
-                          {(t as any).reasonCategory || t.category || 'General Inquiry'}
-                        </span>
-                        <div className="text-[11px] text-slate-400">
-                          {t.createdAt ? new Date(t.createdAt).toLocaleDateString() : 'Recent'}
-                        </div>
-                      </div>
-
-                      <p className="text-xs text-slate-600 dark:text-slate-300 line-clamp-2 italic bg-white/40 dark:bg-slate-900/40 p-2.5 rounded-xl border border-white/20 dark:border-white/5">
-                        "{t.message}"
-                      </p>
-
-                      {t.adminNotes && (
-                        <div className="p-3 bg-emerald-50/80 dark:bg-emerald-950/40 rounded-xl border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-300">
-                          <div className="font-bold flex items-center gap-1 mb-0.5">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                            <span>Resolution Notes:</span>
-                          </div>
-                          <p className="font-medium text-emerald-900 dark:text-emerald-200">
-                            {t.adminNotes}
-                          </p>
-                        </div>
-                      )}
-
-                      <div className="pt-2 border-t border-white/30 dark:border-white/5 flex items-center justify-between text-xs">
-                        <a
-                          href={`#support?track=${encodeURIComponent(t.ticketCode)}`}
-                          onClick={() => {
-                            window.location.hash = `#support?track=${encodeURIComponent(t.ticketCode)}`
-                            window.dispatchEvent(new HashChangeEvent('hashchange'))
-                          }}
-                          className="font-bold text-teal-600 dark:text-teal-400 hover:underline flex items-center gap-1"
-                        >
-                          <span>Track Live Details</span>
-                          <ArrowRight className="w-3.5 h-3.5" />
-                        </a>
-
-                        <a
-                          href={`https://wa.me/9779800000000?text=${encodeURIComponent(
-                            `Hello Dactor Support Desk, following up on Help Request Ticket ${t.ticketCode}.`
-                          )}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="font-bold text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1"
-                        >
-                          <MessageSquare className="w-3.5 h-3.5" />
-                          <span>WhatsApp</span>
-                        </a>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           </div>
-        )}
+          <div className="flex items-center space-x-2.5">
+            <a
+              href="https://dactorofficial.github.io/support"
+              target="_blank"
+              rel="noreferrer"
+              className="px-4 py-2 rounded-xl text-xs font-bold text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition flex items-center space-x-1.5 cursor-pointer"
+            >
+              <span>Visit Support Desk</span>
+              <ExternalLink className="w-3.5 h-3.5" />
+            </a>
+          </div>
+        </div>
       </div>
 
       {/* ==========================================
@@ -4626,20 +4181,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
               {/* Helpdesk & Support Links */}
               <div className="pt-1 space-y-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowEditProfileModal(false)
-                    setActiveTab('help')
-                  }}
-                  className="w-full py-2.5 px-4 rounded-xl liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70 border border-teal-200 dark:border-teal-500/20 text-teal-700 dark:text-teal-300 font-bold text-xs flex items-center justify-between transition cursor-pointer"
-                >
-                  <div className="flex items-center gap-2">
-                    <LifeBuoy className="w-4 h-4 text-teal-500" />
-                    <span>Check My Help Request Status</span>
-                  </div>
-                  <ChevronRight className="w-3.5 h-3.5 opacity-70" />
-                </button>
 
                 <a
                   href={supportUrl.startsWith('http') || supportUrl.startsWith('mailto:') ? supportUrl : `https://${supportUrl}`}
@@ -4665,88 +4206,6 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                   Schedule 30-Day Account Deletion
                 </button>
               </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ==========================================
-          MODAL: ADD FAMILY MEMBER
-      ========================================== */}
-      {showAddFamilyModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/55 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="liquid-glass-modal rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-glass-modal border border-white/60 dark:border-white/15 space-y-5 relative animate-in fade-in zoom-in-95">
-            <button
-              onClick={() => setShowAddFamilyModal(false)}
-              className="absolute top-5 right-5 p-1.5 rounded-full liquid-glass-subtle text-slate-500 hover:text-slate-800 dark:hover:text-white transition cursor-pointer"
-            >
-              <X className="w-4 h-4" />
-            </button>
-
-            <div>
-              <h3 className="text-xl font-black text-slate-900 dark:text-white">Add Family Member</h3>
-              <p className="text-xs text-slate-500 dark:text-slate-400">Save family profile for fast appointment booking.</p>
-            </div>
-
-            <form onSubmit={handleAddFamilyMember} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">Full Name *</label>
-                <input
-                  type="text"
-                  required
-                  value={newFamilyName}
-                  onChange={(e) => setNewFamilyName(e.target.value)}
-                  placeholder="e.g. Suman Sharma"
-                  className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-semibold text-slate-900 dark:text-white outline-none"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">Relationship</label>
-                  <select
-                    value={newFamilyRelation}
-                    onChange={(e) => setNewFamilyRelation(e.target.value)}
-                    className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-semibold text-slate-900 dark:text-white outline-none"
-                  >
-                    <option value="Spouse">Spouse</option>
-                    <option value="Child">Child</option>
-                    <option value="Father">Father</option>
-                    <option value="Mother">Mother</option>
-                    <option value="Sibling">Sibling</option>
-                    <option value="Other">Other</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">Age *</label>
-                  <input
-                    type="number"
-                    required
-                    value={newFamilyAge}
-                    onChange={(e) => setNewFamilyAge(e.target.value)}
-                    placeholder="e.g. 7"
-                    className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-semibold text-slate-900 dark:text-white outline-none"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">Contact Phone (Optional)</label>
-                <input
-                  type="tel"
-                  value={newFamilyPhone}
-                  onChange={(e) => setNewFamilyPhone(e.target.value)}
-                  placeholder="98xxxxxxxx"
-                  className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-semibold text-slate-900 dark:text-white outline-none"
-                />
-              </div>
-
-              <button
-                type="submit"
-                className="w-full py-3 bg-gradient-to-r from-brand-600 to-teal-500 hover:from-brand-500 hover:to-teal-400 text-white font-bold text-xs rounded-xl shadow-glass-brand border border-white/25 transition active:scale-[0.98] cursor-pointer"
-              >
-                Save Family Member
-              </button>
             </form>
           </div>
         </div>

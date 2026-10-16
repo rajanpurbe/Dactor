@@ -1998,6 +1998,7 @@ function mapClinic(c: any): Clinic {
     archivedAt: c.archived_at || meta.archived_at,
     deletionScheduledAt: c.deletion_scheduled_at || meta.deletion_scheduled_at,
     logoUrl: c.logo_url || meta.logo_url || (pics.length > 0 ? pics[0] : null),
+    photoUrl: c.photo_url || meta.photo_url || c.logo_url || meta.logo_url || (pics.length > 0 ? pics[0] : null),
     isOnBreak: c.is_on_break ?? meta.is_on_break ?? false,
     breakUpdatedAt: c.break_updated_at || meta.break_updated_at,
     weeklyScheduleJson: c.weekly_schedule_json || meta.weekly_schedule_json,
