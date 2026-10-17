@@ -930,7 +930,7 @@ export async function deleteSlot(slotId: string): Promise<boolean> {
 export async function reorderQueuePosition(
   clinicId: string,
   appointmentId: string,
-  direction: 'up' | 'down'
+  direction: 'up' | 'down' | 'top'
 ): Promise<{ success: boolean; message?: string }> {
   try {
     // 1. Fetch all waiting queue entries for this clinic ordered by position
@@ -948,6 +948,19 @@ export async function reorderQueuePosition(
     const currentIndex = entries.findIndex((e) => e.appointment_id === appointmentId)
     if (currentIndex === -1) {
       return { success: false, message: 'Patient not currently in waiting queue.' }
+    }
+
+    if (direction === 'top') {
+      if (currentIndex === 0) {
+        return { success: false, message: 'Already at the top of the waiting queue.' }
+      }
+      const topPos = (entries[0].queue_position || 1) - 1
+      await supabase
+        .from('queue_entries')
+        .update({ queue_position: topPos, updated_at: new Date().toISOString() })
+        .eq('id', entries[currentIndex].id)
+
+      return { success: true }
     }
 
     const targetIndex = direction === 'up' ? currentIndex - 1 : currentIndex + 1
@@ -1907,7 +1920,7 @@ export async function getMedicalSpecialties(): Promise<MedicalSpecialty[]> {
       .order('name', { ascending: true })
 
     if (error) throw error
-    return data || []
+    return (data || []).filter(s => s.category !== 'system_config' && !s.name?.startsWith('system_config'))
   } catch {
     return [
       { id: '1', name: 'General Physician', description: 'Primary Care, Fever, Infection, Blood Pressure' },
@@ -3215,6 +3228,52 @@ export async function cancelClinicInvitation(invitationId: string, clinicId: str
     localStorage.setItem(`dactor_clinic_invitations_${clinicId}`, JSON.stringify(updated))
   } catch {}
   return true
+}
+
+export async function getDoctorInvitations(doctorEmail: string, doctorId?: string): Promise<ClinicInvitation[]> {
+  try {
+    let query = supabase.from('clinic_invitations').select('*').eq('status', 'pending')
+    if (doctorEmail) {
+      query = query.ilike('invited_email', doctorEmail.trim().toLowerCase())
+    }
+    const { data, error } = await query
+    if (!error && data) {
+      return data.map((d: any) => ({
+        id: d.id,
+        clinicId: d.clinic_id,
+        clinicName: d.clinic_name || 'Associated Clinic',
+        invitedEmail: d.invited_email,
+        invitedName: d.invited_name || d.invited_email || 'Doctor',
+        role: d.role || 'doctor',
+        status: d.status || 'pending',
+        createdAt: d.created_at,
+        token: d.token,
+      }))
+    }
+  } catch {}
+  return []
+}
+
+export async function respondToDoctorInvitation(
+  invitationId: string,
+  accept: boolean,
+  doctorId?: string,
+  clinicId?: string
+): Promise<boolean> {
+  try {
+    const newStatus = accept ? 'accepted' : 'declined'
+    await supabase
+      .from('clinic_invitations')
+      .update({ status: newStatus, doctor_id: doctorId || null, updated_at: new Date().toISOString() })
+      .eq('id', invitationId)
+
+    if (accept && doctorId && clinicId) {
+      await supabase.from('doctors').update({ active_clinic_id: clinicId, clinic_id: clinicId }).eq('id', doctorId)
+    }
+    return true
+  } catch {
+    return false
+  }
 }
 
 // ==========================================

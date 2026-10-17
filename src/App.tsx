@@ -39,6 +39,8 @@ const getTabFromUrl = (): string => {
       if (cleanParam === 'login' || cleanParam === 'signin' || cleanParam === 'auth') return 'login'
       if (cleanParam === 'support' || cleanParam === 'contact' || cleanParam === 'helpdesk') return 'support'
       if (cleanParam === 'patient' || cleanParam === 'patient-portal' || cleanParam === 'my-health') return 'patient-portal'
+      if (cleanParam === 'records' || cleanParam === 'medical-records') return 'records'
+      if (cleanParam === 'account' || cleanParam === 'profile') return 'account'
       if (cleanParam === 'doctor' || cleanParam === 'doctor-portal' || cleanParam === 'practitioner') return 'doctor-portal'
       if (cleanParam === 'portal' || cleanParam === 'admin-portal' || cleanParam === 'clinic-portal' || cleanParam === 'clinic') return 'portal'
       if (cleanParam === 'clinics') return 'clinics'
@@ -51,7 +53,7 @@ const getTabFromUrl = (): string => {
     }
   } catch {}
 
-  // 2. Check URL Hash (e.g. #clinics, #live-queue, #clinic-detail)
+  // 2. Check URL Hash (e.g. #clinics, #live-queue, #records, #account)
   const rawHash = window.location.hash.toLowerCase()
   if (rawHash) {
     const hash = rawHash.replace(/^#\/?/, '').replace(/\/$/, '').split('?')[0]
@@ -59,6 +61,8 @@ const getTabFromUrl = (): string => {
     if (hash === 'login' || hash === 'signin' || hash === 'auth') return 'login'
     if (hash === 'support' || hash === 'contact' || hash === 'helpdesk') return 'support'
     if (hash === 'patient' || hash === 'patient-portal' || hash === 'my-health') return 'patient-portal'
+    if (hash === 'records') return 'records'
+    if (hash === 'account' || hash === 'profile') return 'account'
     if (hash === 'doctor' || hash === 'doctor-portal' || hash === 'practitioner') return 'doctor-portal'
     if (
       hash === 'portal' ||
@@ -82,7 +86,7 @@ const getTabFromUrl = (): string => {
     return '404'
   }
 
-  // 3. Check pathname (e.g. /support, /clinics, /unknown-page)
+  // 3. Check pathname (e.g. /support, /clinics, /records, /account)
   let path = window.location.pathname.toLowerCase().replace(/\/$/, '')
   // Support GitHub Pages project subpath /dactor or /dactor/
   if (path === '/dactor' || path === '/dactor/index.html' || path === '/dactor/index') {
@@ -95,6 +99,8 @@ const getTabFromUrl = (): string => {
 
   if (path.includes('login') || path.includes('signin') || path.includes('auth')) return 'login'
   if (path.includes('support') || path.includes('contact') || path.includes('helpdesk')) return 'support'
+  if (path.includes('records')) return 'records'
+  if (path.includes('account') || path.includes('profile')) return 'account'
   if (path.includes('patient') || path.includes('my-health')) return 'patient-portal'
   if (path.includes('doctor') || path.includes('practitioner')) return 'doctor-portal'
   if (
@@ -210,7 +216,7 @@ export const App: React.FC = () => {
           authRole: isDoc ? ('doctor' as const) : null,
         }
       }
-      if (tab === 'patient-portal') {
+      if (tab === 'patient-portal' || tab === 'records' || tab === 'account') {
         const isPat =
           localStorage.getItem('dactor_patient_logged_in') === 'true' ||
           Boolean(localStorage.getItem('dactor_patient_session'))
@@ -529,8 +535,9 @@ export const App: React.FC = () => {
           />
         )}
 
-        {activeTab === 'patient-portal' && (
+        {(activeTab === 'patient-portal' || activeTab === 'records' || activeTab === 'account') && (
           <PatientPortal
+            initialTab={activeTab === 'records' ? 'records' : activeTab === 'account' ? 'account' : 'appointments'}
             onNavigateHome={() => handleNavigate('home')}
             onOpenLiveQueue={handleOpenLiveQueue}
             onOpenReportModal={handleOpenReportModal}

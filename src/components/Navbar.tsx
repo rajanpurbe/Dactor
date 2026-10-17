@@ -15,6 +15,7 @@ import {
   Ticket,
   ShieldCheck,
   Headphones,
+  Home,
 } from 'lucide-react'
 import dactorLogo from '../assets/logo.png'
 
@@ -54,22 +55,24 @@ export const Navbar: React.FC<NavbarProps> = ({
           ? 'clinic_manager'
           : activeTab === 'doctor-portal'
           ? 'doctor'
-          : activeTab === 'patient-portal'
+          : activeTab === 'patient-portal' || activeTab === 'records' || activeTab === 'account'
           ? 'patient'
           : authRole || null)
       : null
 
+  // 1:1 Parity with Android App Navigation (PatientMainScreen.kt)
   const allNavLinks = [
-    { id: 'home', label: 'Home', icon: Activity },
-    { id: 'clinics', label: 'Find Clinics & OPD', icon: Stethoscope },
-    { id: 'patient-portal', label: 'Patient Portal', icon: User },
-    { id: 'live-queue', label: 'Live Queue & Reports', icon: Activity },
+    { id: 'home', label: 'Home', icon: Home },
+    { id: 'live-queue', label: 'Track / Queue', icon: Activity },
+    { id: 'records', label: 'Records', icon: FileText },
+    { id: 'account', label: 'Account', icon: User },
+    { id: 'clinics', label: 'Find Clinics', icon: Stethoscope },
   ]
 
   // Strictly remove unassociated portal links from navigation
   const navLinks = allNavLinks.filter((item) => {
     if (activePortalRole === 'clinic_manager' || activePortalRole === 'doctor') {
-      return item.id !== 'patient-portal'
+      return item.id !== 'records' && item.id !== 'account'
     }
     return true
   })

@@ -134,6 +134,7 @@ import {
   purgeExpiredClinicData,
 } from '../services/db'
 import { compressImage } from '../utils/imageCompressor'
+import { playClinicChime } from '../utils/audioChime'
 import {
   parsePaymentRecords,
   extractCleanClinicalRemarks,
@@ -1885,8 +1886,8 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     }
   }
 
-  // Queue Sliding (Reordering / ranking)
-  const handleQueueReorder = async (apptId: string, direction: 'up' | 'down') => {
+  // Queue Sliding (Reordering / ranking / emergency priority)
+  const handleQueueReorder = async (apptId: string, direction: 'up' | 'down' | 'top') => {
     if (!selectedClinic) return
     const res = await reorderQueuePosition(selectedClinic.id, apptId, direction)
     if (res.success) {
@@ -4180,13 +4181,13 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                             </span>
                           </td>
                           <td className="py-3.5 px-4 text-right space-x-1.5 whitespace-nowrap">
-                            {/* Queue Sliding Up / Down for Waiting Patients */}
+                            {/* Queue Sliding Up / Down and Emergency Priority #1 for Waiting Patients */}
                             {isWaiting && (
-                              <span className="inline-flex rounded-lg border border-white/50 dark:border-white/10 p-0.5 liquid-glass-subtle mr-1 align-middle">
+                              <span className="inline-flex items-center rounded-lg border border-white/50 dark:border-white/10 p-0.5 liquid-glass-subtle mr-1 align-middle space-x-0.5">
                                 <button
                                   type="button"
                                   onClick={() => handleQueueReorder(appt.id, 'up')}
-                                  className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-brand-600 rounded cursor-pointer"
+                                  className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-blue-600 rounded cursor-pointer"
                                   title="Slide Up (Move higher in waiting ranking)"
                                 >
                                   <ArrowUp className="w-3 h-3" />
@@ -4194,21 +4195,35 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                                 <button
                                   type="button"
                                   onClick={() => handleQueueReorder(appt.id, 'down')}
-                                  className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-brand-600 rounded cursor-pointer"
+                                  className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-blue-600 rounded cursor-pointer"
                                   title="Slide Down (Move lower in waiting ranking)"
                                 >
                                   <ArrowDown className="w-3 h-3" />
                                 </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleQueueReorder(appt.id, 'top')}
+                                  className="p-1 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 rounded cursor-pointer"
+                                  title="Emergency Priority: Bump patient directly to #1 front of line"
+                                >
+                                  <AlertTriangle className="w-3 h-3" />
+                                </button>
                               </span>
                             )}
 
-                            {/* Call Patient Inside */}
+                            {/* Call Patient Inside (Triggers Audio Chime) */}
                             {isWaiting && (
                               <button
-                                onClick={() => handleStatusChange(appt.id, 'in_consultation')}
-                                className="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-bold text-[11px] shadow-sm cursor-pointer active:scale-[0.98]"
+                                onClick={async () => {
+                                  try {
+                                    playClinicChime()
+                                  } catch {}
+                                  await handleStatusChange(appt.id, 'in_consultation')
+                                }}
+                                className="px-2.5 py-1.5 bg-gradient-to-r from-blue-600 to-sky-600 hover:from-blue-700 hover:to-sky-700 text-white rounded-lg font-bold text-[11px] shadow-sm cursor-pointer active:scale-[0.98] inline-flex items-center space-x-1"
                               >
-                                Call Inside
+                                <Bell className="w-3 h-3" />
+                                <span>Call Inside</span>
                               </button>
                             )}
 
@@ -4216,9 +4231,22 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                             {inCabin && (
                               <button
                                 onClick={() => handleStatusChange(appt.id, 'completed')}
-                                className="px-2.5 py-1.5 bg-gradient-to-r from-brand-600 to-teal-500 hover:from-brand-500 hover:to-teal-400 text-white rounded-lg font-bold text-[11px] shadow-glass-brand border border-white/25 cursor-pointer active:scale-[0.98]"
+                                className="px-2.5 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-lg font-bold text-[11px] shadow-sm cursor-pointer active:scale-[0.98] inline-flex items-center space-x-1"
                               >
-                                Mark Done
+                                <CheckCircle2 className="w-3 h-3" />
+                                <span>Mark Done</span>
+                              </button>
+                            )}
+
+                            {/* Re-Queue for No-Show Patients */}
+                            {appt.checkinStatus === 'no_show' && (
+                              <button
+                                onClick={() => handleStatusChange(appt.id, 'waiting')}
+                                className="px-2.5 py-1.5 bg-blue-500/15 hover:bg-blue-500/25 text-blue-700 dark:text-blue-300 border border-blue-400/40 rounded-lg font-bold text-[11px] cursor-pointer inline-flex items-center space-x-1"
+                                title="Re-queue patient back to active waiting queue"
+                              >
+                                <RefreshCw className="w-3 h-3" />
+                                <span>Re-Queue</span>
                               </button>
                             )}
 
