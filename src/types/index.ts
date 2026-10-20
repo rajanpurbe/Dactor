@@ -88,6 +88,7 @@ export interface Doctor {
   isInClinic?: boolean
   clinicId?: string
   activeClinicId?: string
+  primaryClinicId?: string
   kycStatus?: string // approved, pending, rejected
   profilePictureUrl?: string
   licenseDocUrl?: string
@@ -96,6 +97,13 @@ export interface Doctor {
   bio?: string
   practitionerRole?: string // doctor or lab_technician
   isLabTechnician?: boolean
+  practicingClinics?: Clinic[]
+}
+
+export interface DoctorHomeItem {
+  doctor: Doctor
+  practicingClinics: Clinic[]
+  hasDocInClinic: boolean
 }
 
 export interface Slot {
@@ -110,6 +118,20 @@ export interface Slot {
   isAvailable?: boolean
   isBreak?: boolean
   isPublished?: boolean
+}
+
+export interface MultiSlotPositionResult {
+  cumulativePosition: number
+  patientsAheadInDay: number
+  positionInSlot: number
+  slotStartTimeText: string
+  slotEndTimeText: string
+  approxAppointmentTimeText: string
+  timeWindowText: string
+  dateLabel: string
+  isToday: boolean
+  isTomorrow: boolean
+  isFutureDate: boolean
 }
 
 export interface ClinicService {
@@ -149,10 +171,23 @@ export interface Appointment {
   updatedAt?: string
   selectedTests?: string[]
   selectedLabTests?: string[] | string
+  // Pay at Desk properties
+  paymentMode?: string
+  status?: string // WAITING_FOR_APPROVAL, APPROVED, UNAPPROVED, EXPIRED
+  attemptNumber?: number
+  serviceChargeAmount?: number
+  totalAmount?: number
+  expiresAt?: string | null
+  approvedAt?: string | null
+  rejectedAt?: string | null
   // Joined fields for display
   clinic?: Clinic
   doctor?: Doctor
 }
+
+// Configurable constant for Pay at Desk service charge (Spec Rule 1)
+export const PAY_AT_DESK_SERVICE_CHARGE_PERCENT = 5
+
 
 export interface LabReport {
   id: string
@@ -295,4 +330,14 @@ export interface SupportTicket {
   createdAt: string
   resolvedAt?: string
   adminNotes?: string
+}
+
+export interface CityLocation {
+  id: string
+  name: string
+  coordinates?: string
+  aliases?: string
+  isActive: boolean
+  createdAt?: string
+  updatedAt?: string
 }

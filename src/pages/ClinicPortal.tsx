@@ -21,6 +21,7 @@ import {
   ShieldCheck,
   Send,
   Eye,
+  EyeOff,
   RefreshCw,
   Phone,
   UserCheck,
@@ -50,13 +51,15 @@ import {
   Headphones,
   ExternalLink,
   HelpCircle,
-  Zap,
   Copy,
   MessageSquare,
   Mail,
   LifeBuoy,
+  ChevronDown,
 } from 'lucide-react'
+import { printAppointmentBill, printPrescription } from '../utils/medicalDocPrinter'
 import { GlassCard, GlassButton, GlassBadge } from '../components/glass'
+import { DateScroller } from '../components/DateScroller'
 import {
   Clinic,
   ClinicInvitation,
@@ -70,6 +73,7 @@ import {
   DayScheduleInfo,
   MedicalSpecialty,
   MedicalQualification,
+  CityLocation,
 } from '../types'
 import {
   getClinics,
@@ -110,7 +114,6 @@ import {
   saveWeeklySchedule,
   updateDoctor,
   sendManualNotification,
-  sendEarlyArrivalInviteNotification,
   checkEmailPortalAssociation,
   getClinicPatientDirectory,
   getSupportUrl,
@@ -132,6 +135,15 @@ import {
   cancelClinicInvitation,
   deleteClinicPermanently,
   purgeExpiredClinicData,
+  getLocationDetails,
+  addCityLocation,
+  deleteCityLocation,
+  updateCityLocation,
+  saveClinicEsewaCredentials,
+  getPendingPayAtDeskRequests,
+  getPendingPayAtDeskCount,
+  approvePayAtDeskAppointment,
+  rejectPayAtDeskAppointment,
 } from '../services/db'
 import { compressImage } from '../utils/imageCompressor'
 import { playClinicChime } from '../utils/audioChime'
@@ -304,7 +316,6 @@ function calculateLiveQueueTimingEstimate(
   const slotStartDate = parseSlotStartTime(targetAppt.appointmentTime)
   const isSlotInFuture = slotStartDate ? now.getTime() < slotStartDate.getTime() : false
   const isDoctorFree = Boolean(doctor && doctor.isInClinic !== false && !insidePatient && !clinic.isOnBreak)
-  const canEarly = Boolean(isDoctorFree && isSlotInFuture && targetAppt.optInEarlyCall && patientsAhead === 0)
 
   let arrivalAdvice = ''
   let slotStartFmt = ''
@@ -337,12 +348,12 @@ function calculateLiveQueueTimingEstimate(
   let remainingMins: number
 
   if (patientsAhead === 0) {
-    if (slotStartDate && isSlotInFuture && !canEarly) {
+    if (slotStartDate && isSlotInFuture) {
       finalExpectedTime = slotStartDate
       remainingMins = Math.max(0, Math.round((slotStartDate.getTime() - now.getTime()) / 60000))
       waitStr = remainingMins > 60 ? `Starts at ${slotStartFmt}` : `~${remainingMins} mins`
     } else {
-      // Position 1 and current time is within slot, doctor free early, or slot is over:
+      // Position 1 and current time is within slot or slot is over:
       finalExpectedTime = now
       waitStr = 'Arrive Fast'
       remainingMins = 0
@@ -366,7 +377,7 @@ function calculateLiveQueueTimingEstimate(
   const windowText = isArriveFast ? 'Immediate' : formatTimeWindow(finalExpectedTime)
   const approxText = isArriveFast ? 'Your turn, arrive fast' : formatApproxTime(finalExpectedTime)
 
-  const isSoon = patientsAhead === 0 || remainingMins <= 3 || waitStr.includes('Soon') || isArriveFast || canEarly
+  const isSoon = patientsAhead === 0 || remainingMins <= 3 || waitStr.includes('Soon') || isArriveFast
 
   return {
     statusText: slotNotice,
@@ -379,7 +390,7 @@ function calculateLiveQueueTimingEstimate(
     timeWindowText: windowText,
     approxTimeText: approxText,
     slotNoticeText: slotNotice,
-    canOfferEarlyArrival: canEarly,
+    canOfferEarlyArrival: false,
     suggestedArrivalText: arrivalAdvice,
   }
 }
@@ -508,6 +519,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
   // Operational desk tabs matching DashboardScreen.kt
   const [deskTab, setDeskTab] = useState<
     | 'queue'
+    | 'pay_at_desk_requests'
     | 'walkin'
     | 'slots'
     | 'future_appts'
@@ -524,13 +536,26 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     | 'settings'
   >('queue')
 
+  // Pay at Desk requests state
+  const [payAtDeskRequests, setPayAtDeskRequests] = useState<Appointment[]>([])
+  const [payAtDeskCount, setPayAtDeskCount] = useState<number>(0)
+  const [isLoadingPayAtDesk, setIsLoadingPayAtDesk] = useState<boolean>(false)
+  const [payAtDeskActionLoading, setPayAtDeskActionLoading] = useState<boolean>(false)
+  const [payAtDeskDetailModal, setPayAtDeskDetailModal] = useState<Appointment | null>(null)
+  const [confirmPayAtDeskAction, setConfirmPayAtDeskAction] = useState<{ action: 'approve' | 'reject'; appt: Appointment } | null>(null)
+
 
   useEffect(() => {
     // Keep desk tab clean
   }, [])
 
-  // Queue Board Segmented Sub-Tab (QueueBoardScreen.kt: Waiting vs Past/Completed)
+  // Queue Board Segmented Sub-Tab (QueueBoardScreen.kt: Live vs Completed)
   const [queueSubTab, setQueueSubTab] = useState<'waiting' | 'past'>('waiting')
+  const [selectedQueueDate, setSelectedQueueDate] = useState<string>(
+    () => new Date().toISOString().split('T')[0]
+  )
+  const [expandedQueueApptId, setExpandedQueueApptId] = useState<string | null>(null)
+  const [expandedPatientId, setExpandedPatientId] = useState<string | null>(null)
 
   // Clinical Remark Modal State (QueueBoardScreen.kt & FutureAppointmentsScreen.kt)
   const [remarkModalOpen, setRemarkModalOpen] = useState(false)
@@ -855,6 +880,8 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
   const [settingSpecialties, setSettingSpecialties] = useState<string[]>([])
   const [settingDesc, setSettingDesc] = useState('')
   const [settingGatewayProvider, setSettingGatewayProvider] = useState('esewa')
+  const [settingPaymentEnvironment, setSettingPaymentEnvironment] = useState<'test' | 'live'>('test')
+  const [showPaymentSecretKey, setShowPaymentSecretKey] = useState(false)
   const [settingMerchantId, setSettingMerchantId] = useState('')
   const [settingPaymentApiKey, setSettingPaymentApiKey] = useState('')
   const [settingPaymentSecretKey, setSettingPaymentSecretKey] = useState('')
@@ -865,6 +892,82 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
   const [showDeleteArchiveModal, setShowDeleteArchiveModal] = useState(false)
   const [isDeletingPermanently, setIsDeletingPermanently] = useState(false)
   const [copiedLink, setCopiedLink] = useState<string | null>(null)
+
+  // Admin Cities & Locations Dropdown Manager State
+  const [adminCities, setAdminCities] = useState<CityLocation[]>([])
+  const [loadingAdminCities, setLoadingAdminCities] = useState(false)
+  const [showAddCityModal, setShowAddCityModal] = useState(false)
+  const [newCityName, setNewCityName] = useState('')
+  const [newCityCoords, setNewCityCoords] = useState('27.7172, 85.3240')
+  const [newCityAliases, setNewCityAliases] = useState('')
+  const [cityActionMsg, setCityActionMsg] = useState<string | null>(null)
+  const [isSubmittingCity, setIsSubmittingCity] = useState(false)
+
+  const loadAdminCities = async () => {
+    setLoadingAdminCities(true)
+    try {
+      const list = await getLocationDetails()
+      setAdminCities(list)
+    } catch (err) {
+      console.warn('Error loading admin cities:', err)
+    } finally {
+      setLoadingAdminCities(false)
+    }
+  }
+
+  const handleAddNewCity = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!newCityName.trim()) return
+    setIsSubmittingCity(true)
+    try {
+      const added = await addCityLocation({
+        name: newCityName.trim(),
+        coordinates: newCityCoords.trim() || '27.7172, 85.3240',
+        aliases: newCityAliases.trim() || newCityName.toLowerCase(),
+        isActive: true,
+      })
+      if (added) {
+        setAdminCities((prev) => [added, ...prev])
+        setCityActionMsg(`✓ Added "${newCityName.trim()}" to location dropdown!`)
+        setNewCityName('')
+        setNewCityAliases('')
+        setShowAddCityModal(false)
+        setTimeout(() => setCityActionMsg(null), 3500)
+      }
+    } catch (err: any) {
+      alert(err?.message || 'Failed to add city')
+    } finally {
+      setIsSubmittingCity(false)
+    }
+  }
+
+  const handleDeleteCity = async (city: CityLocation) => {
+    if (!confirm(`Are you sure you want to delete city "${city.name}" from the location dropdown?`)) return
+    try {
+      setAdminCities((prev) => prev.filter((c) => c.id !== city.id))
+      await deleteCityLocation(city.id)
+      setCityActionMsg(`✓ Deleted "${city.name}" from location dropdown.`)
+      setTimeout(() => setCityActionMsg(null), 3500)
+    } catch (err: any) {
+      alert(err?.message || 'Failed to delete city')
+      loadAdminCities()
+    }
+  }
+
+  const handleToggleCityActive = async (city: CityLocation) => {
+    const nextState = !city.isActive
+    try {
+      setAdminCities((prev) =>
+        prev.map((c) => (c.id === city.id ? { ...c, isActive: nextState } : c))
+      )
+      await updateCityLocation(city.id, { isActive: nextState })
+      setCityActionMsg(`✓ Updated visibility for "${city.name}".`)
+      setTimeout(() => setCityActionMsg(null), 2500)
+    } catch (err: any) {
+      alert(err?.message || 'Failed to update city')
+      loadAdminCities()
+    }
+  }
 
   const handleCopyBookingLink = (url: string) => {
     try {
@@ -904,6 +1007,18 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     setSettingSpecialties(clinicObj.specialties || [])
     setSettingDesc(clinicObj.description || '')
     setSettingGatewayProvider(clinicObj.paymentGatewayProvider || 'esewa')
+    let clinicEnv: 'test' | 'live' = 'test'
+    try {
+      if (clinicObj.description && clinicObj.description.trim().startsWith('{')) {
+        const meta = JSON.parse(clinicObj.description)
+        if (meta.payment_environment === 'live' || meta.esewa_environment === 'live') clinicEnv = 'live'
+        else if (meta.payment_gateways_json) {
+          const g = typeof meta.payment_gateways_json === 'string' ? JSON.parse(meta.payment_gateways_json) : meta.payment_gateways_json
+          if (g?.esewa?.environment === 'live') clinicEnv = 'live'
+        }
+      }
+    } catch {}
+    setSettingPaymentEnvironment(clinicEnv)
     setSettingMerchantId(clinicObj.merchantId || '')
     setSettingPaymentApiKey(clinicObj.paymentApiKey || '')
     setSettingPaymentSecretKey(clinicObj.paymentSecretKey || '')
@@ -995,6 +1110,97 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     loadClinicDetails()
   }, [selectedClinic, refreshKey])
 
+  // Pay at Desk requests loader & real-time sync
+  const fetchPayAtDesk = async (clinicId?: string) => {
+    const cid = clinicId || selectedClinic?.id
+    if (!cid) return
+    setIsLoadingPayAtDesk(true)
+    try {
+      const list = await getPendingPayAtDeskRequests(cid)
+      setPayAtDeskRequests(list)
+      setPayAtDeskCount(list.length)
+    } catch (e) {
+      console.error('Error fetching pay at desk requests:', e)
+    } finally {
+      setIsLoadingPayAtDesk(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!selectedClinic?.id) return
+    fetchPayAtDesk(selectedClinic.id)
+
+    const sub = supabase
+      .channel(`pay_at_desk_${selectedClinic.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'appointments',
+          filter: `clinic_id=eq.${selectedClinic.id}`,
+        },
+        () => {
+          fetchPayAtDesk(selectedClinic.id)
+        }
+      )
+      .subscribe()
+
+    const interval = setInterval(() => {
+      fetchPayAtDesk(selectedClinic.id)
+    }, 10000)
+
+    return () => {
+      supabase.removeChannel(sub)
+      clearInterval(interval)
+    }
+  }, [selectedClinic?.id])
+
+  const handleApprovePayAtDesk = async (appt: Appointment) => {
+    if (!selectedClinic?.id || payAtDeskActionLoading) return
+    setPayAtDeskActionLoading(true)
+    try {
+      const res = await approvePayAtDeskAppointment(appt.id, selectedClinic.id)
+      if (res.success) {
+        setConfirmPayAtDeskAction(null)
+        setPayAtDeskDetailModal(null)
+        await fetchPayAtDesk()
+        const [appts, liveSlots] = await Promise.all([
+          getAppointmentsByClinic(selectedClinic.id),
+          getSlotsByDoctorAndDate(appt.doctorId || '', appt.appointmentDate),
+        ])
+        setAppointments(appts)
+        setPublishedSlots(liveSlots)
+        playClinicChime()
+      } else {
+        alert(res.error || 'Failed to approve request')
+      }
+    } catch (err: any) {
+      alert(err.message || 'Error approving request')
+    } finally {
+      setPayAtDeskActionLoading(false)
+    }
+  }
+
+  const handleRejectPayAtDesk = async (appt: Appointment) => {
+    if (!selectedClinic?.id || payAtDeskActionLoading) return
+    setPayAtDeskActionLoading(true)
+    try {
+      const res = await rejectPayAtDeskAppointment(appt.id, selectedClinic.id)
+      if (res.success) {
+        setConfirmPayAtDeskAction(null)
+        setPayAtDeskDetailModal(null)
+        await fetchPayAtDesk()
+      } else {
+        alert(res.error || 'Failed to reject request')
+      }
+    } catch (err: any) {
+      alert(err.message || 'Error rejecting request')
+    } finally {
+      setPayAtDeskActionLoading(false)
+    }
+  }
+
   // Load published slots for selected doctor & date
   useEffect(() => {
     if (!slotDoctorId || !slotDate) return
@@ -1031,6 +1237,13 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     }
   }, [billItems])
 
+  // Load cities list when Settings desk tab is active
+  useEffect(() => {
+    if (deskTab === 'settings') {
+      loadAdminCities()
+    }
+  }, [deskTab])
+
   const saveSession = (email: string, role: 'clinic_manager' | 'doctor' | 'lab_tech' = 'clinic_manager') => {
     setIsAuthenticated(true)
     setAuthEmail(email)
@@ -1041,6 +1254,10 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
       localStorage.setItem('dactor_clinic_email', email)
       localStorage.setItem('dactor_clinic_role', role)
       localStorage.removeItem('dactor_pending_verification')
+      try {
+        sessionStorage.removeItem('dactor_explicit_home')
+        sessionStorage.removeItem('dactor_allow_home')
+      } catch {}
       window.dispatchEvent(new Event('storage'))
     } catch {}
   }
@@ -1203,6 +1420,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     const cleanMgr = regManagerPhone.replace(/\D/g, '')
     if (cleanMgr.length !== 10 || !cleanMgr.startsWith('9')) errors.managerPhone = 'Manager phone must be 10 digits starting with 9.'
     if (!regClinicTermsAccepted) errors.terms = 'You must accept the Regulatory Terms & Conditions to register.'
+    if (regClinicPictures.length > 4) errors.pictures = 'Maximum 4 clinic pictures allowed.'
 
     if (Object.keys(errors).length > 0) {
       setRegClinicErrors(errors)
@@ -1213,7 +1431,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     if (!verifiedEmail.trim()) setVerifiedEmail(effectiveClinicEmail)
 
     setIsSubmittingRegistration(true)
-    setRegistrationStatusMsg('Compressing documents and uploading to Supabase...')
+    setRegistrationStatusMsg('Compressing documents and uploading securely...')
 
     try {
       let regDocUrl: string | undefined
@@ -1249,7 +1467,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
         verificationStatus: 'pending',
       }
 
-      setRegistrationStatusMsg('Creating clinic record in Supabase...')
+      setRegistrationStatusMsg('Creating clinic record on secure network...')
       const created = await createClinic(newClinicPayload)
       if (!created) throw new Error('Failed to create clinic in database.')
 
@@ -1721,32 +1939,6 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     }
   }
 
-  // Early Arrival Invite Trigger for Opted-in Patients
-  const handleSendEarlyInvite = async (appt: Appointment) => {
-    if (!selectedClinic) return
-    const confirmed = window.confirm(
-      `Send "⚡ Doctor is Free Now! Come in early?" push alert to ${appt.patientName}?`
-    )
-    if (!confirmed) return
-
-    try {
-      const ok = await sendEarlyArrivalInviteNotification(
-        appt.id,
-        appt.patientName,
-        appt.trackingCode10Digit,
-        appt.appointmentTime,
-        appt.userId
-      )
-      if (ok) {
-        alert(`⚡ Early arrival push notification successfully pushed to ${appt.patientName}'s device!`)
-      } else {
-        alert('Could not send notification. Please try again.')
-      }
-    } catch (err) {
-      console.error('Error inviting early:', err)
-      alert('Failed to send early invitation.')
-    }
-  }
 
   // Doctor onboarding form validation
   const validateDoctorOnboarding = () => {
@@ -1806,8 +1998,8 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     const errors: { [key: string]: string } = {}
     if (!walkinName.trim()) errors.name = 'Patient name is required.'
     if (!walkinAge || Number(walkinAge) <= 0) errors.age = 'Valid age is required.'
-    if (!walkinMobile.trim() || walkinMobile.replace(/\D/g, '').length < 8) {
-      errors.mobile = 'Valid 8-10 digit mobile number is required.'
+    if (walkinMobile.trim() && walkinMobile.replace(/\D/g, '').length < 8) {
+      errors.mobile = 'Mobile number must be 8-10 digits if provided.'
     }
     if (isLabClinic && walkinSelectedTests.length === 0) {
       errors.tests = 'Please select at least one diagnostic lab test.'
@@ -1831,17 +2023,19 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
         ? `Walk-In Free Follow-Up Visit (Previous Token #${walkinRetainedAppt.trackingCode10Digit})`
         : 'Walk-In Reception Registration'
 
+      const rawTime = walkinSlotTime.trim() || new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })
+
       const created = await createAppointment({
         clinicId: selectedClinic.id,
         doctorId: isLabClinic ? undefined : (walkinDoctorId || clinicDoctors[0]?.id || undefined),
         trackingCode10Digit: code10,
         patientName: walkinName.trim(),
-        patientAge: Number(walkinAge),
-        patientGender: walkinGender,
-        patientMobile: walkinMobile.trim(),
+        patientAge: Number(walkinAge) || 25,
+        patientGender: walkinGender || 'Other',
+        patientMobile: walkinMobile.trim() || '9800000000',
         patientEmail: walkinEmail.trim() || undefined,
         appointmentDate: new Date().toISOString().split('T')[0],
-        appointmentTime: walkinSlotTime.trim() || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        appointmentTime: rawTime,
         slotId: walkinSlotId || undefined,
         checkinStatus: 'waiting',
         paymentStatus: 'paid',
@@ -2102,7 +2296,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
 
     try {
       const existing = await getInvoiceForAppointment(appt.id)
-      if (existing && ((existing.items && existing.items.length > 0) || existing.totalAmount > 0)) {
+      if (existing) {
         if (existing.items && existing.items.length > 0) {
           setBillItems(
             existing.items.map((it, idx) => ({
@@ -2126,9 +2320,10 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
 
         const parsedLogs = parsePaymentRecords(existing.remarks, existing.paidAmount, existing.paidAt)
         setBillPaymentRecords(parsedLogs)
-        setBillTotalAmount(String(existing.totalAmount))
-        setBillPaidAmount(String(existing.paidAmount))
-        setBillRemarks(extractCleanClinicalRemarks(existing.remarks))
+        const calcTotal = Number(existing.totalAmount || appt.feeAmount || 500)
+        setBillTotalAmount(String(calcTotal))
+        setBillPaidAmount(String(existing.paidAmount || 0))
+        setBillRemarks(extractCleanClinicalRemarks(existing.remarks) || appt.notes || '')
       } else {
         const initialFee = Number(appt.feeAmount) || 500
         setBillItems([
@@ -2187,7 +2382,29 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
       }
 
       const itemsTotal = billItems.reduce((acc, it) => acc + it.price * (it.quantity || 1), 0)
-      const finalTotalAmount = Number(billTotalAmount) || itemsTotal || 0
+      const inputTotal = Number(billTotalAmount) || 0
+      const finalTotalAmount = itemsTotal > 0 ? (inputTotal > itemsTotal ? inputTotal : itemsTotal) : (inputTotal > 0 ? inputTotal : (Number(billTargetAppt.feeAmount) || 500))
+
+      // If user typed a larger total than items sum, add a reconciling item so itemized list reflects the total
+      let itemsToPersist = [...billItems]
+      if (itemsToPersist.length === 0) {
+        itemsToPersist = [
+          {
+            id: 'consultation',
+            name: `${billTargetAppt.doctor?.fullName || selectedDoctor?.fullName || 'Doctor'} Consultation Fee`,
+            price: finalTotalAmount,
+            quantity: 1,
+          }
+        ]
+      } else if (inputTotal > itemsTotal) {
+        const diff = inputTotal - itemsTotal
+        itemsToPersist.push({
+          id: crypto.randomUUID(),
+          name: 'Additional Clinical Procedures & Services',
+          price: diff,
+          quantity: 1,
+        })
+      }
 
       const newPaymentAmt = Number(billNewPaymentInput) || 0
       let updatedPayments = [...billPaymentRecords]
@@ -2205,15 +2422,16 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
         ? updatedPayments.reduce((acc, p) => acc + p.amount, 0)
         : (Number(billPaidAmount) || 0)
 
-      await saveOrUpdateInvoicePayment({
+      const savedInvoice = await saveOrUpdateInvoicePayment({
         appointmentId: billTargetAppt.id,
-        clinicId: selectedClinic.id,
+        clinicId: billTargetAppt.clinicId || selectedClinic.id,
         totalAmount: finalTotalAmount,
         paidAmount: finalPaidAmount,
         remarks: billRemarks.trim() || undefined,
         receiptUrl,
-        items: billItems.map((it) => ({
+        items: itemsToPersist.map((it) => ({
           itemName: it.name,
+          name: it.name,
           quantity: it.quantity,
           price: it.price,
           total: it.price * it.quantity,
@@ -2221,11 +2439,38 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
         paymentRecords: updatedPayments,
       })
 
+      if (!savedInvoice) {
+        alert('Failed to save bill. Please check your connection and try again.')
+        return
+      }
+
+      // Update local invoice list so UI updates immediately
+      setInvoices((prev) => {
+        const idx = prev.findIndex((i) => i.appointmentId === billTargetAppt.id)
+        if (idx >= 0) {
+          const updated = [...prev]
+          updated[idx] = savedInvoice
+          return updated
+        }
+        return [savedInvoice, ...prev]
+      })
+
+      // Update local appointments list with new fee and payment status
+      const derivedApptStatus = finalPaidAmount >= finalTotalAmount && finalTotalAmount > 0 ? 'paid' : (finalPaidAmount > 0 ? 'partial' : 'unpaid')
+      setAppointments((prev) =>
+        prev.map((a) =>
+          a.id === billTargetAppt.id
+            ? { ...a, feeAmount: finalTotalAmount, paymentStatus: derivedApptStatus as any }
+            : a
+        )
+      )
+
       setBillModalOpen(false)
       setRefreshKey((k) => k + 1)
       alert(`Combined bill saved (Total: Rs. ${finalTotalAmount}, Paid: Rs. ${finalPaidAmount}, Due: Rs. ${Math.max(0, finalTotalAmount - finalPaidAmount)})`)
     } catch (err) {
       console.error('Error saving invoice bill:', err)
+      alert('Error saving bill. Please check your network and try again.')
     } finally {
       setSavingBill(false)
     }
@@ -2378,6 +2623,25 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     if (!selectedClinic) return
     setSavingSettings(true)
     try {
+      if (settingGatewayProvider === 'esewa') {
+        const productCode = settingMerchantId.trim() || settingPaymentApiKey.trim() || 'EPAYTEST'
+        if (settingPaymentSecretKey.trim() || settingMerchantId.trim()) {
+          try {
+            await saveClinicEsewaCredentials({
+              clinicId: selectedClinic.id,
+              productCode,
+              secretKey: settingPaymentSecretKey.trim() || undefined,
+              environment: settingPaymentEnvironment,
+            })
+          } catch (secErr: any) {
+            console.error('Error saving eSewa credentials:', secErr)
+            alert(`Could not save eSewa credentials: ${secErr.message || secErr}`)
+            setSavingSettings(false)
+            return
+          }
+        }
+      }
+
       const updates: Partial<Clinic> = {
         name: settingName.trim(),
         type: settingType as any,
@@ -2394,7 +2658,8 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
         paymentGatewayProvider: settingGatewayProvider,
         merchantId: settingMerchantId.trim(),
         paymentApiKey: settingPaymentApiKey.trim(),
-        paymentSecretKey: settingPaymentSecretKey.trim(),
+        // eSewa secrets are stored strictly server-side in clinic_payment_credentials, never in public description
+        paymentSecretKey: settingGatewayProvider === 'esewa' ? undefined : settingPaymentSecretKey.trim(),
         isDirectPaymentEnabled: settingDirectPaymentEnabled,
       }
       const ok = await updateClinic(selectedClinic.id, updates)
@@ -2450,11 +2715,11 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     setDoctorPhotoMsg('Compressing photo to <= 300 KB...')
     try {
       const compressed = await compressImage(doctorPhotoFile, 300 * 1024)
-      setDoctorPhotoMsg('Uploading to Supabase doctor_photos storage...')
+      setDoctorPhotoMsg('Uploading doctor photo to secure storage...')
       const publicUrl = await uploadDoctorPhoto(doctorPhotoTarget.id, compressed, doctorPhotoFile.name)
-      if (!publicUrl) throw new Error('Failed to upload doctor photo to Supabase storage.')
+      if (!publicUrl) throw new Error('Failed to upload doctor photo to secure storage.')
 
-      setDoctorPhotoMsg('Updating doctor profile in Supabase...')
+      setDoctorPhotoMsg('Updating doctor profile...')
       const ok = await updateDoctor(doctorPhotoTarget.id, { profilePictureUrl: publicUrl })
       if (!ok) throw new Error('Failed to update doctor profile picture in database.')
 
@@ -2495,12 +2760,12 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     setClinicPhotoStatusMsg('Compressing facility image...')
     try {
       const compressed = await compressImage(file, 300 * 1024)
-      setClinicPhotoStatusMsg('Uploading to Supabase clinic_photos storage...')
+      setClinicPhotoStatusMsg('Uploading photo to secure storage...')
       const publicUrl = await uploadClinicPhoto(selectedClinic.id, compressed, file.name)
-      if (!publicUrl) throw new Error('Failed to upload photo to Supabase storage.')
+      if (!publicUrl) throw new Error('Failed to upload photo to secure storage.')
 
       const updatedPics = [...currentPics, publicUrl]
-      setClinicPhotoStatusMsg('Saving to clinic profile in Supabase...')
+      setClinicPhotoStatusMsg('Saving to clinic profile...')
       const ok = await updateClinic(selectedClinic.id, { pictures: updatedPics })
       if (!ok) throw new Error('Failed to update clinic pictures in database.')
 
@@ -2628,12 +2893,22 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
     [medicalSpecialties]
   )
 
-  // Queue Counts
+  // Queue Counts (filtered by selected queue date from DateScroller)
   const todayDateStr = new Date().toISOString().split('T')[0]
-  const todayAppointments = useMemo(
-    () => appointments.filter((a) => a.appointmentDate === todayDateStr),
-    [appointments, todayDateStr]
-  )
+  const todayAppointments = useMemo(() => {
+    const list = appointments.filter((a) => {
+      if (a.appointmentDate !== selectedQueueDate) return false
+      // Pay at Desk appointments waiting for clinic approval must not be in live queue
+      if (a.paymentMode === 'PAY_AT_DESK' && a.status === 'WAITING_FOR_APPROVAL') return false
+      return true
+    })
+    return [...list].sort((a, b) => {
+      const aInside = a.checkinStatus === 'in_consultation' || a.checkinStatus === 'inside' ? 0 : 1
+      const bInside = b.checkinStatus === 'in_consultation' || b.checkinStatus === 'inside' ? 0 : 1
+      if (aInside !== bInside) return aInside - bInside
+      return (a.appointmentTime || '').localeCompare(b.appointmentTime || '')
+    })
+  }, [appointments, selectedQueueDate])
 
   const noShowAppointments = useMemo(
     () => appointments.filter((a) => a.checkinStatus === 'no_show'),
@@ -2656,7 +2931,12 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
 
   // Appointments for the selected future date
   const futureDateAppointments = useMemo(
-    () => appointments.filter((a) => a.appointmentDate === futureSelectedDate),
+    () =>
+      appointments.filter(
+        (a) =>
+          a.appointmentDate === futureSelectedDate &&
+          !(a.paymentMode === 'PAY_AT_DESK' && a.status === 'WAITING_FOR_APPROVAL')
+      ),
     [appointments, futureSelectedDate]
   )
 
@@ -2746,7 +3026,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
               <RefreshCw className={`w-4 h-4 ${checkingVerification ? 'animate-spin' : ''}`} />
               <span>
                 {checkingVerification
-                  ? 'Querying Live Supabase Verification Status...'
+                  ? 'Querying Live Verification Status...'
                   : 'Check Verification Status Now'}
               </span>
             </button>
@@ -3041,7 +3321,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                     <span>Government Registration / PAN Certificate</span>
                   </div>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Auto-compressed to &le;300 KB before uploading to Supabase storage.
+                    Auto-compressed to &le;300 KB before uploading to secure storage.
                   </p>
                   <input
                     type="file"
@@ -3057,26 +3337,81 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                 </div>
 
                 <div className="p-4 rounded-2xl border border-dashed border-white/60 dark:border-white/20 liquid-glass-subtle space-y-2">
-                  <div className="flex items-center space-x-2 text-xs font-bold text-slate-800 dark:text-slate-200">
-                    <Camera className="w-4 h-4 text-brand-600 dark:text-brand-400" />
-                    <span>Clinic Exterior / Reception Photos</span>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-2 text-xs font-bold text-slate-800 dark:text-slate-200">
+                      <Camera className="w-4 h-4 text-brand-600 dark:text-brand-400" />
+                      <span>Clinic Exterior / Reception Photos (1-4)</span>
+                    </div>
+                    <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-brand-500/10 text-brand-700 dark:text-brand-300">
+                      {regClinicPictures.length}/4
+                    </span>
                   </div>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Displayed to patients in the Dactor app to help identify your building.
+                    {regClinicPictures.length === 0
+                      ? 'Add up to 4 photos. Displayed to patients in Dactor to help identify your building.'
+                      : regClinicPictures.length >= 4
+                      ? '4/4 photos added • Maximum reached ✓'
+                      : `${regClinicPictures.length}/4 photos added • Can select up to ${4 - regClinicPictures.length} more`}
                   </p>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    multiple
-                    onChange={(e) =>
-                      setRegClinicPictures(e.target.files ? Array.from(e.target.files) : [])
-                    }
-                    className="text-xs text-slate-600 dark:text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-xl file:border-0 file:text-xs file:font-bold file:bg-brand-500/15 file:text-brand-700 dark:file:text-brand-300 hover:file:bg-brand-500/25"
-                  />
+                  {regClinicPictures.length < 4 && (
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple={4 - regClinicPictures.length > 1}
+                      onChange={(e) => {
+                        if (!e.target.files) return
+                        const incoming = Array.from(e.target.files)
+                        const remaining = 4 - regClinicPictures.length
+                        if (remaining <= 0) return
+
+                        // Deduplicate files against already selected photos
+                        const uniqueIncoming = incoming.filter(
+                          (file) => !regClinicPictures.some((p) => p.name === file.name && p.size === file.size)
+                        )
+                        const duplicateCount = incoming.length - uniqueIncoming.length
+                        if (duplicateCount > 0 && uniqueIncoming.length === 0) {
+                          alert('The selected photo(s) have already been added.')
+                          e.target.value = ''
+                          return
+                        }
+
+                        if (uniqueIncoming.length > remaining) {
+                          alert(`You can only add up to ${remaining} more picture(s). A maximum of 4 photos is allowed. Only the first ${remaining} will be added.`)
+                        }
+                        const toAdd = uniqueIncoming.slice(0, remaining)
+                        setRegClinicPictures((prev) => [...prev, ...toAdd].slice(0, 4))
+                        e.target.value = ''
+                      }}
+                      className="text-xs text-slate-600 dark:text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-xl file:border-0 file:text-xs file:font-bold file:bg-brand-500/15 file:text-brand-700 dark:file:text-brand-300 hover:file:bg-brand-500/25"
+                    />
+                  )}
                   {regClinicPictures.length > 0 && (
-                    <p className="text-[11px] text-emerald-700 dark:text-emerald-400 font-bold">
-                      {regClinicPictures.length} photo(s) ready for compression & upload
-                    </p>
+                    <div className="space-y-1.5 pt-1">
+                      <div className="flex flex-wrap gap-2">
+                        {regClinicPictures.map((pic, idx) => (
+                          <div
+                            key={`${pic.name}-${pic.size}-${idx}`}
+                            className="flex items-center space-x-1.5 px-2.5 py-1 bg-white/60 dark:bg-slate-800/60 rounded-lg border border-slate-200 dark:border-slate-700 text-[11px]"
+                          >
+                            <span className="font-bold text-brand-600 dark:text-brand-400">#{idx + 1}/4</span>
+                            <span className="max-w-[120px] truncate font-medium text-slate-700 dark:text-slate-300" title={pic.name}>
+                              {pic.name}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setRegClinicPictures((prev) => prev.filter((_, i) => i !== idx))}
+                              className="text-slate-400 hover:text-red-500 font-bold ml-1 text-xs"
+                              title="Remove photo"
+                            >
+                              &times;
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <p className="text-[11px] text-emerald-700 dark:text-emerald-400 font-bold">
+                        {regClinicPictures.length} of 4 photos ready for compression & upload
+                      </p>
+                    </div>
                   )}
                 </div>
               </div>
@@ -3536,6 +3871,23 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
         </button>
 
         <button
+          onClick={() => setDeskTab('pay_at_desk_requests')}
+          className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-all shrink-0 cursor-pointer ${
+            deskTab === 'pay_at_desk_requests'
+              ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-white shadow-md border border-white/25'
+              : 'text-slate-600 dark:text-slate-300 hover:bg-white/50 dark:hover:bg-slate-800/50'
+          }`}
+        >
+          <CreditCard className="w-4 h-4" />
+          <span>View Requests</span>
+          {payAtDeskCount > 0 && (
+            <span className="ml-1 px-1.5 py-0.5 rounded-full text-[10px] font-black bg-amber-400 text-slate-900 animate-pulse">
+              {payAtDeskCount}
+            </span>
+          )}
+        </button>
+
+        <button
           onClick={() => setDeskTab('walkin')}
           className={`flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-bold transition-all shrink-0 cursor-pointer ${
             deskTab === 'walkin'
@@ -3980,49 +4332,64 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
             </div>
           )}
 
-          {/* Section Header + Segmented Sub-Tabs */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <div className="flex p-1 liquid-glass-subtle rounded-2xl border border-white/40 dark:border-white/10">
-                <button
-                  type="button"
-                  onClick={() => setQueueSubTab('waiting')}
-                  className={`px-4 py-2 rounded-xl text-xs font-black transition cursor-pointer ${
-                    queueSubTab === 'waiting'
-                      ? 'bg-gradient-to-r from-brand-600 to-teal-500 text-white shadow-glass-brand'
-                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900'
-                  }`}
-                >
-                  Waiting Queue ({queueWaitingCount + queueInsideCount})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setQueueSubTab('past')}
-                  className={`px-4 py-2 rounded-xl text-xs font-black transition cursor-pointer ${
-                    queueSubTab === 'past'
-                      ? 'bg-gradient-to-r from-brand-600 to-teal-500 text-white shadow-glass-brand'
-                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900'
-                  }`}
-                >
-                  Past / Completed Queue ({todayAppointments.filter((a) => a.checkinStatus === 'completed' || a.checkinStatus === 'no_show' || a.checkinStatus === 'cancelled').length})
-                </button>
-              </div>
+          {/* Date Scroller (Patient App Style, Compact) */}
+          <DateScroller
+            selectedDate={selectedQueueDate}
+            onSelectDate={(d) => {
+              setSelectedQueueDate(d)
+              setExpandedQueueApptId(null)
+            }}
+            className="mb-3"
+          />
+
+          {/* Section Header + Segmented Sub-Tabs (Live vs Completed) */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+            <div className="flex items-center gap-1.5 p-1 liquid-glass-subtle rounded-xl border border-white/40 dark:border-white/10 overflow-x-auto no-scrollbar max-w-full">
+              <button
+                type="button"
+                onClick={() => {
+                  setQueueSubTab('waiting')
+                  setExpandedQueueApptId(null)
+                }}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition whitespace-nowrap cursor-pointer ${
+                  queueSubTab === 'waiting'
+                    ? 'bg-gradient-to-r from-brand-600 to-teal-500 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900'
+                }`}
+              >
+                Live ({queueWaitingCount + queueInsideCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setQueueSubTab('past')
+                  setExpandedQueueApptId(null)
+                }}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition whitespace-nowrap cursor-pointer ${
+                  queueSubTab === 'past'
+                    ? 'bg-gradient-to-r from-brand-600 to-teal-500 text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-slate-900'
+                }`}
+              >
+                Completed ({todayAppointments.filter((a) => a.checkinStatus === 'completed' || a.checkinStatus === 'done' || a.checkinStatus === 'no_show').length})
+              </button>
             </div>
+
             <div className="flex items-center space-x-2">
               <button
                 onClick={handleTriggerAutoNotify}
-                className="flex items-center space-x-1.5 text-xs font-bold text-amber-900 dark:text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-300/60 px-3 py-1.5 rounded-xl cursor-pointer transition-colors"
+                className="flex items-center space-x-1.5 text-xs font-bold text-amber-900 dark:text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-300/60 px-2.5 py-1.5 rounded-xl cursor-pointer transition-colors"
                 title={`Notify patients who are ≤ ${settingThreshold} spots away from consultation cabin`}
               >
                 <Bell className="w-3.5 h-3.5" />
-                <span>Auto-Notify (Threshold: &le; {settingThreshold})</span>
+                <span>Auto-Notify (&le; {settingThreshold})</span>
               </button>
               <button
                 onClick={() => setRefreshKey((k) => k + 1)}
-                className="flex items-center space-x-1.5 text-xs font-bold text-brand-700 dark:text-brand-300 liquid-glass-subtle border border-brand-400/30 px-3 py-1.5 rounded-xl cursor-pointer transition"
+                className="flex items-center space-x-1.5 text-xs font-bold text-brand-700 dark:text-brand-300 liquid-glass-subtle border border-brand-400/30 px-2.5 py-1.5 rounded-xl cursor-pointer transition"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-                <span>Refresh Board</span>
+                <span>Refresh</span>
               </button>
             </div>
           </div>
@@ -4030,25 +4397,25 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
           {todayAppointments.length === 0 ? (
             <div className="p-12 text-center liquid-glass-card rounded-3xl border border-white/60 dark:border-white/10 shadow-glass-sm">
               <Activity className="w-10 h-10 text-slate-400 mx-auto mb-2" />
-              <h3 className="font-bold text-slate-800 dark:text-slate-200">No appointments scheduled for today</h3>
+              <h3 className="font-bold text-slate-800 dark:text-slate-200">
+                No appointments scheduled for {selectedQueueDate}
+              </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                Patients registered via online booking or reception walk-in will automatically appear here.
+                Patients scheduled or registered for this date will automatically appear here.
               </p>
             </div>
           ) : (
             <div className="liquid-glass-elevated rounded-3xl border border-white/60 dark:border-white/15 overflow-hidden shadow-glass-base">
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-280px)] min-h-[360px] scrollbar-thin">
                 <table className="w-full text-left text-xs">
-                  <thead className="liquid-glass-subtle border-b border-white/40 dark:border-white/10 text-slate-600 dark:text-slate-300 uppercase tracking-wider font-bold">
+                  <thead className="sticky top-0 z-10 liquid-glass-subtle border-b border-white/40 dark:border-white/10 text-slate-600 dark:text-slate-300 uppercase tracking-wider font-bold backdrop-blur-md bg-white/95 dark:bg-slate-900/95 shadow-xs">
                     <tr>
-                      <th className="py-3.5 px-4">Token Code</th>
-                      <th className="py-3.5 px-4">Patient Name & Phone</th>
-                      <th className="py-3.5 px-4">Age / Gender</th>
-                      <th className="py-3.5 px-4">Doctor</th>
-                      <th className="py-3.5 px-4">Status</th>
-                      <th className="py-3.5 px-4">Estimated Timing</th>
-                      <th className="py-3.5 px-4">Payment</th>
-                      <th className="py-3.5 px-4 text-right">Actions</th>
+                      <th className="py-3 px-4 w-12 text-center">Turn</th>
+                      <th className="py-3 px-4">Patient</th>
+                      <th className="py-3 px-4">Doctor</th>
+                      <th className="py-3 px-4">Status</th>
+                      <th className="py-3 px-4">Payment</th>
+                      <th className="py-3 px-4 text-right">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/30 dark:divide-white/5 font-medium">
@@ -4059,270 +4426,638 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                             appt.checkinStatus === 'in_consultation' ||
                             appt.checkinStatus === 'inside'
                           : appt.checkinStatus === 'completed' ||
+                            appt.checkinStatus === 'done' ||
                             appt.checkinStatus === 'no_show' ||
                             appt.checkinStatus === 'cancelled'
                       )
-                      .map((appt) => {
-                      const isWaiting = appt.checkinStatus === 'waiting'
-                      const inCabin =
-                        appt.checkinStatus === 'in_consultation' || appt.checkinStatus === 'inside'
-                      const isDone = appt.checkinStatus === 'completed'
+                      .map((appt, idx) => {
+                        const isWaiting = appt.checkinStatus === 'waiting'
+                        const inCabin =
+                          appt.checkinStatus === 'in_consultation' || appt.checkinStatus === 'inside'
+                        const isDone = appt.checkinStatus === 'completed' || appt.checkinStatus === 'done'
+                        const isExpanded = expandedQueueApptId === appt.id
 
-                      const timing = calculateLiveQueueTimingEstimate(
-                        appt,
-                        todayAppointments,
-                        selectedClinic,
-                        selectedDoctor
-                      )
-
-                      return (
-                        <tr key={appt.id} className="hover:bg-white/40 dark:hover:bg-slate-800/40 transition-colors">
-                          <td className="py-3.5 px-4 font-mono font-bold text-slate-900 dark:text-white">
-                            <div className="flex items-center space-x-1.5">
-                              <span>#{appt.trackingCode10Digit}</span>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  navigator.clipboard?.writeText(appt.trackingCode10Digit)
-                                  alert(`Copied 10-digit ID: ${appt.trackingCode10Digit}`)
-                                }}
-                                className="px-1.5 py-0.5 rounded liquid-glass-subtle hover:bg-brand-500/15 text-[10px] font-sans font-bold text-slate-600 dark:text-slate-300 hover:text-brand-700 cursor-pointer"
-                                title="Copy 10-Digit Tracking ID"
-                              >
-                                Copy
-                              </button>
-                            </div>
-                          </td>
-                          <td className="py-3.5 px-4 font-bold text-slate-900 dark:text-white">
-                            <div>{appt.patientName}</div>
-                            {appt.optInEarlyCall && (
-                              <div className="mt-0.5">
-                                <span className="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-400/40 text-[10px] font-bold">
-                                  <Zap className="w-2.5 h-2.5 text-emerald-600 dark:text-emerald-400" />
-                                  <span>Early Call Opted-In</span>
-                                </span>
-                              </div>
-                            )}
-                            {appt.patientMobile && (
-                              <a
-                                href={`tel:${appt.patientMobile}`}
-                                className="inline-flex items-center space-x-1 text-[11px] font-mono text-brand-700 dark:text-brand-400 hover:underline mt-0.5"
-                                title="Call Patient Mobile"
-                              >
-                                <Phone className="w-3 h-3" />
-                                <span>{appt.patientMobile}</span>
-                              </a>
-                            )}
-                            {appt.notes && (
-                              <div className="mt-1 px-2 py-0.5 rounded-lg bg-amber-500/15 border border-amber-300/50 text-[10px] text-amber-900 dark:text-amber-200 font-medium">
-                                Remark: {appt.notes}
-                              </div>
-                            )}
-                          </td>
-                          <td className="py-3.5 px-4 text-slate-600 dark:text-slate-300">
-                            {appt.patientAge || '–'} Yrs • {appt.patientGender || '–'}
-                          </td>
-                          <td className="py-3.5 px-4 text-slate-600 dark:text-slate-300">
-                            {appt.doctor?.fullName || selectedDoctor?.fullName || 'General OPD'}
-                          </td>
-                          <td className="py-3.5 px-4">
-                            {inCabin ? (
-                              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-900 dark:text-amber-200 border border-amber-400/40 animate-pulse">
-                                Inside Cabin
-                              </span>
-                            ) : isDone ? (
-                              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-900 dark:text-emerald-200 border border-emerald-400/40">
-                                Completed
-                              </span>
-                            ) : appt.checkinStatus === 'no_show' ? (
-                              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-900 dark:text-rose-200 border border-rose-400/40">
-                                No-Show
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-sky-500/20 text-sky-900 dark:text-sky-200 border border-sky-400/40">
-                                Waiting
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-3.5 px-4">
-                            <div className="space-y-0.5">
-                              <span
-                                className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-bold ${
-                                  timing.isDoctorAway
-                                    ? 'bg-rose-500/20 text-rose-800 dark:text-rose-300 border border-rose-400/40'
-                                    : timing.isOnBreak
-                                    ? 'bg-amber-500/20 text-amber-800 dark:text-amber-300 border border-amber-400/40'
-                                    : timing.isSoonBeReady
-                                    ? 'bg-emerald-500/20 text-emerald-800 dark:text-emerald-300 border border-emerald-400/40 animate-pulse'
-                                    : 'liquid-glass-subtle text-slate-700 dark:text-slate-300 border border-white/40'
-                                }`}
-                              >
-                                {timing.estimatedWait}
-                              </span>
-                              {timing.exactTimeStr !== '–' &&
-                                timing.exactTimeStr !== timing.estimatedWait && (
-                                  <p className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
-                                    {timing.exactTimeStr}
-                                  </p>
-                                )}
-                            </div>
-                          </td>
-                          <td className="py-3.5 px-4">
-                            <span
-                              className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                appt.paymentStatus === 'paid'
-                                  ? 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-400/40'
-                                  : appt.paymentStatus === 'partial'
-                                  ? 'bg-amber-500/15 text-amber-800 dark:text-amber-300 border border-amber-400/40'
-                                  : 'liquid-glass-subtle text-slate-700 dark:text-slate-300 border border-white/40'
+                        return (
+                          <React.Fragment key={appt.id}>
+                            <tr
+                              onClick={() => setExpandedQueueApptId(isExpanded ? null : appt.id)}
+                              className={`transition-colors cursor-pointer ${
+                                isExpanded
+                                  ? 'bg-blue-50/60 dark:bg-slate-800/60'
+                                  : 'hover:bg-white/40 dark:hover:bg-slate-800/40'
                               }`}
                             >
-                              Rs. {appt.feeAmount || 500} • {appt.paymentStatus.toUpperCase()}
-                            </span>
-                          </td>
-                          <td className="py-3.5 px-4 text-right space-x-1.5 whitespace-nowrap">
-                            {/* Queue Sliding Up / Down and Emergency Priority #1 for Waiting Patients */}
-                            {isWaiting && (
-                              <span className="inline-flex items-center rounded-lg border border-white/50 dark:border-white/10 p-0.5 liquid-glass-subtle mr-1 align-middle space-x-0.5">
-                                <button
-                                  type="button"
-                                  onClick={() => handleQueueReorder(appt.id, 'up')}
-                                  className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-blue-600 rounded cursor-pointer"
-                                  title="Slide Up (Move higher in waiting ranking)"
+                              {/* Turn # */}
+                              <td className="py-3.5 px-4 text-center font-black text-brand-700 dark:text-brand-300">
+                                #{idx + 1}
+                              </td>
+
+                              {/* Patient Name & Demographics (Token is hidden until tapped) */}
+                              <td className="py-3.5 px-4">
+                                <div className="font-bold text-slate-900 dark:text-white text-sm">
+                                  {appt.patientName}
+                                </div>
+                                <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                                  {appt.patientAge ? `${appt.patientAge} Yrs` : ''}
+                                  {appt.patientAge && appt.patientGender ? ' • ' : ''}
+                                  {appt.patientGender || ''}
+                                </div>
+                                {appt.notes && (
+                                  <div className="mt-1 px-2 py-0.5 rounded-lg bg-amber-500/15 border border-amber-300/50 text-[10px] text-amber-900 dark:text-amber-200 font-medium line-clamp-1">
+                                    Remark: {appt.notes}
+                                  </div>
+                                )}
+                              </td>
+
+                              {/* Doctor */}
+                              <td className="py-3.5 px-4 text-slate-600 dark:text-slate-300">
+                                {appt.doctor?.fullName || selectedDoctor?.fullName || 'General OPD'}
+                              </td>
+
+                              {/* Status Badge */}
+                              <td className="py-3.5 px-4">
+                                {inCabin ? (
+                                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-900 dark:text-amber-200 border border-amber-400/40 animate-pulse">
+                                    Inside Cabin
+                                  </span>
+                                ) : isDone ? (
+                                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-900 dark:text-emerald-200 border border-emerald-400/40">
+                                    Completed
+                                  </span>
+                                ) : appt.checkinStatus === 'no_show' ? (
+                                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-900 dark:text-rose-200 border border-rose-400/40">
+                                    No-Show
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[10px] font-bold bg-sky-500/20 text-sky-900 dark:text-sky-200 border border-sky-400/40">
+                                    Waiting
+                                  </span>
+                                )}
+                              </td>
+
+                              {/* Payment */}
+                              <td className="py-3.5 px-4">
+                                <span
+                                  className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                    appt.paymentStatus === 'paid'
+                                      ? 'bg-emerald-500/15 text-emerald-800 dark:text-emerald-300 border border-emerald-400/40'
+                                      : appt.paymentStatus === 'partial'
+                                      ? 'bg-amber-500/15 text-amber-800 dark:text-amber-300 border border-amber-400/40'
+                                      : 'liquid-glass-subtle text-slate-700 dark:text-slate-300 border border-white/40'
+                                  }`}
                                 >
-                                  <ArrowUp className="w-3 h-3" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleQueueReorder(appt.id, 'down')}
-                                  className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-blue-600 rounded cursor-pointer"
-                                  title="Slide Down (Move lower in waiting ranking)"
-                                >
-                                  <ArrowDown className="w-3 h-3" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleQueueReorder(appt.id, 'top')}
-                                  className="p-1 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 rounded cursor-pointer"
-                                  title="Emergency Priority: Bump patient directly to #1 front of line"
-                                >
-                                  <AlertTriangle className="w-3 h-3" />
-                                </button>
-                              </span>
+                                  Rs. {appt.feeAmount || 500} • {appt.paymentStatus.toUpperCase()}
+                                </span>
+                              </td>
+
+                              {/* Action Cell: ONLY Call Inside or Mark Done without tapping */}
+                              <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                                {isWaiting && (
+                                  <button
+                                    type="button"
+                                    onClick={async (e) => {
+                                      e.stopPropagation()
+                                      try {
+                                        playClinicChime()
+                                      } catch {}
+                                      await handleStatusChange(appt.id, 'in_consultation')
+                                    }}
+                                    className="px-3 py-1.5 bg-gradient-to-r from-blue-600 to-sky-600 hover:from-blue-700 hover:to-sky-700 text-white rounded-lg font-bold text-xs shadow-sm cursor-pointer active:scale-[0.98] inline-flex items-center space-x-1"
+                                  >
+                                    <Bell className="w-3.5 h-3.5" />
+                                    <span>Call Inside</span>
+                                  </button>
+                                )}
+
+                                {inCabin && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      handleStatusChange(appt.id, 'completed')
+                                    }}
+                                    className="px-3 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-lg font-bold text-xs shadow-sm cursor-pointer active:scale-[0.98] inline-flex items-center space-x-1"
+                                  >
+                                    <CheckCircle2 className="w-3.5 h-3.5" />
+                                    <span>Mark Done</span>
+                                  </button>
+                                )}
+
+                                {appt.checkinStatus === 'no_show' && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      handleStatusChange(appt.id, 'waiting')
+                                    }}
+                                    className="px-2.5 py-1.5 bg-blue-500/15 hover:bg-blue-500/25 text-blue-700 dark:text-blue-300 border border-blue-400/40 rounded-lg font-bold text-xs cursor-pointer inline-flex items-center space-x-1"
+                                  >
+                                    <RefreshCw className="w-3 h-3" />
+                                    <span>Re-Queue</span>
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+
+                            {/* Tapped / Expanded Options Drawer */}
+                            {isExpanded && (
+                              <tr className="bg-slate-50/90 dark:bg-slate-900/90">
+                                <td colSpan={6} className="px-4 py-3.5">
+                                  <div className="p-3.5 rounded-2xl liquid-glass-subtle border border-brand-500/20 space-y-3">
+                                    {/* Patient Info with Token & Direct Phone Call Button */}
+                                    <div className="flex flex-wrap items-center justify-between gap-2.5 pb-2 border-b border-white/50 dark:border-white/10">
+                                      <div className="flex items-center space-x-3">
+                                        <span className="text-xs font-mono font-bold text-slate-800 dark:text-slate-200 liquid-glass-card px-2.5 py-1 rounded-lg border border-white/40">
+                                          Token: #{appt.trackingCode10Digit}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            navigator.clipboard?.writeText(appt.trackingCode10Digit)
+                                            alert(`Copied Token #${appt.trackingCode10Digit}`)
+                                          }}
+                                          className="text-[11px] font-bold text-brand-600 dark:text-brand-400 hover:underline cursor-pointer"
+                                        >
+                                          Copy
+                                        </button>
+                                      </div>
+
+                                      {/* Direct Call Patient Option */}
+                                      {appt.patientMobile && (
+                                        <a
+                                          href={`tel:${appt.patientMobile}`}
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-800 dark:text-emerald-300 border border-emerald-400/40 text-xs font-bold transition cursor-pointer"
+                                        >
+                                          <Phone className="w-3.5 h-3.5 text-emerald-600" />
+                                          <span>Call Patient ({appt.patientMobile})</span>
+                                        </a>
+                                      )}
+                                    </div>
+
+                                    {/* Action Options Row */}
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      {/* Slide Up / Down / Emergency Priority (if waiting) */}
+                                      {isWaiting && (
+                                        <div className="inline-flex items-center rounded-xl border border-white/50 dark:border-white/10 p-1 liquid-glass-subtle space-x-1">
+                                          <span className="text-[10px] font-bold text-slate-400 uppercase px-1">Order:</span>
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation()
+                                              handleQueueReorder(appt.id, 'up')
+                                            }}
+                                            className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-blue-600 rounded cursor-pointer"
+                                            title="Slide Up"
+                                          >
+                                            <ArrowUp className="w-3.5 h-3.5" />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation()
+                                              handleQueueReorder(appt.id, 'down')
+                                            }}
+                                            className="p-1 hover:bg-white/60 text-slate-600 dark:text-slate-300 hover:text-blue-600 rounded cursor-pointer"
+                                            title="Slide Down"
+                                          >
+                                            <ArrowDown className="w-3.5 h-3.5" />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation()
+                                              handleQueueReorder(appt.id, 'top')
+                                            }}
+                                            className="p-1 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 rounded cursor-pointer font-bold text-[10px]"
+                                            title="Emergency Priority: Bump patient to front"
+                                          >
+                                            <AlertTriangle className="w-3.5 h-3.5 inline mr-0.5" />
+                                            <span>#1 Priority</span>
+                                          </button>
+                                        </div>
+                                      )}
+
+                                      {/* Clinical Remark */}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleOpenRemarkModal(appt)
+                                        }}
+                                        className="px-2.5 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-900 dark:text-amber-200 border border-amber-300/50 rounded-xl font-bold text-xs cursor-pointer inline-flex items-center space-x-1"
+                                      >
+                                        <MessageSquare className="w-3.5 h-3.5" />
+                                        <span>Remark</span>
+                                      </button>
+
+                                      {/* Push Bill / Update Payment */}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleOpenBillModal(appt)
+                                        }}
+                                        className="px-2.5 py-1.5 bg-sky-500/15 hover:bg-sky-500/25 text-sky-800 dark:text-sky-200 border border-sky-300/50 rounded-xl font-bold text-xs cursor-pointer inline-flex items-center space-x-1"
+                                      >
+                                        <Receipt className="w-3.5 h-3.5" />
+                                        <span>Bill</span>
+                                      </button>
+
+                                      {/* Push Alert */}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleOpenPushAlertModal(appt)
+                                        }}
+                                        className="px-2.5 py-1.5 bg-purple-500/15 hover:bg-purple-500/25 text-purple-700 dark:text-purple-300 border border-purple-300/50 rounded-xl font-bold text-xs cursor-pointer inline-flex items-center space-x-1"
+                                      >
+                                        <Bell className="w-3.5 h-3.5" />
+                                        <span>Push Alert</span>
+                                      </button>
+
+                                      {/* Shift Date */}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleOpenShiftModal(appt)
+                                        }}
+                                        className="px-2.5 py-1.5 bg-teal-500/15 hover:bg-teal-500/25 text-teal-800 dark:text-teal-300 border border-teal-300/50 rounded-xl font-bold text-xs cursor-pointer inline-flex items-center space-x-1"
+                                      >
+                                        <Calendar className="w-3.5 h-3.5" />
+                                        <span>Shift Date</span>
+                                      </button>
+
+                                      {/* Print Slip */}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          handleOpenPrintSlip(appt)
+                                        }}
+                                        className="px-2.5 py-1.5 liquid-glass-subtle hover:bg-white/70 text-slate-700 dark:text-slate-200 border border-white/50 dark:border-white/10 rounded-xl font-bold text-xs cursor-pointer inline-flex items-center space-x-1"
+                                      >
+                                        <Printer className="w-3.5 h-3.5" />
+                                        <span>Slip</span>
+                                      </button>
+
+                                      {/* Mark No Show */}
+                                      {!isDone && appt.checkinStatus !== 'no_show' && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            handleStatusChange(appt.id, 'no_show')
+                                          }}
+                                          className="px-2.5 py-1.5 liquid-glass-subtle hover:bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-white/50 dark:border-white/10 rounded-xl font-bold text-xs cursor-pointer inline-flex items-center space-x-1"
+                                        >
+                                          <X className="w-3.5 h-3.5" />
+                                          <span>No Show</span>
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                </td>
+                              </tr>
                             )}
-
-                            {/* Call Patient Inside (Triggers Audio Chime) */}
-                            {isWaiting && (
-                              <button
-                                onClick={async () => {
-                                  try {
-                                    playClinicChime()
-                                  } catch {}
-                                  await handleStatusChange(appt.id, 'in_consultation')
-                                }}
-                                className="px-2.5 py-1.5 bg-gradient-to-r from-blue-600 to-sky-600 hover:from-blue-700 hover:to-sky-700 text-white rounded-lg font-bold text-[11px] shadow-sm cursor-pointer active:scale-[0.98] inline-flex items-center space-x-1"
-                              >
-                                <Bell className="w-3 h-3" />
-                                <span>Call Inside</span>
-                              </button>
-                            )}
-
-                            {/* Mark Done Button */}
-                            {inCabin && (
-                              <button
-                                onClick={() => handleStatusChange(appt.id, 'completed')}
-                                className="px-2.5 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white rounded-lg font-bold text-[11px] shadow-sm cursor-pointer active:scale-[0.98] inline-flex items-center space-x-1"
-                              >
-                                <CheckCircle2 className="w-3 h-3" />
-                                <span>Mark Done</span>
-                              </button>
-                            )}
-
-                            {/* Re-Queue for No-Show Patients */}
-                            {appt.checkinStatus === 'no_show' && (
-                              <button
-                                onClick={() => handleStatusChange(appt.id, 'waiting')}
-                                className="px-2.5 py-1.5 bg-blue-500/15 hover:bg-blue-500/25 text-blue-700 dark:text-blue-300 border border-blue-400/40 rounded-lg font-bold text-[11px] cursor-pointer inline-flex items-center space-x-1"
-                                title="Re-queue patient back to active waiting queue"
-                              >
-                                <RefreshCw className="w-3 h-3" />
-                                <span>Re-Queue</span>
-                              </button>
-                            )}
-
-                            {/* Add / Edit Clinical Remark */}
-                            <button
-                              type="button"
-                              onClick={() => handleOpenRemarkModal(appt)}
-                              className="px-2 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-900 dark:text-amber-200 border border-amber-300/50 rounded-lg font-bold text-[11px] cursor-pointer"
-                              title="Add or edit clinical remark / notes"
-                            >
-                              Remark
-                            </button>
-
-                            {/* Shift Appointment Date */}
-                            <button
-                              onClick={() => handleOpenShiftModal(appt)}
-                              className="px-2 py-1.5 bg-teal-500/15 hover:bg-teal-500/25 text-teal-800 dark:text-teal-300 border border-teal-300/50 rounded-lg font-bold text-[11px] cursor-pointer"
-                              title="Shift appointment to another date"
-                            >
-                              Shift Date
-                            </button>
-
-                            {/* Print Token Slip */}
-                            <button
-                              onClick={() => handleOpenPrintSlip(appt)}
-                              className="px-2 py-1.5 liquid-glass-subtle hover:bg-white/70 text-slate-700 dark:text-slate-200 border border-white/50 dark:border-white/10 rounded-lg font-bold text-[11px] cursor-pointer"
-                              title="Print thermal token slip"
-                            >
-                              <Printer className="w-3.5 h-3.5 inline" />
-                            </button>
-
-                            {/* ⚡ Invite Early for Opted-In Patients */}
-                            {appt.optInEarlyCall && isWaiting && (
-                              <button
-                                type="button"
-                                onClick={() => handleSendEarlyInvite(appt)}
-                                className="px-2 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-800 dark:text-emerald-300 border border-emerald-400/50 rounded-lg font-bold text-[11px] cursor-pointer inline-flex items-center space-x-1"
-                                title="Send 'Doctor is free now. Come in early?' push notification to patient"
-                              >
-                                <Zap className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
-                                <span>Invite Early</span>
-                              </button>
-                            )}
-
-                            {/* Push Alert */}
-                            <button
-                              onClick={() => handleOpenPushAlertModal(appt)}
-                              className="px-2 py-1.5 bg-purple-500/15 hover:bg-purple-500/25 text-purple-700 dark:text-purple-300 border border-purple-300/50 rounded-lg font-bold text-[11px] cursor-pointer"
-                              title="Send real push notification template to patient"
-                            >
-                              Push Alert
-                            </button>
-
-                            {/* Push Bill / Update Payment */}
-                            <button
-                              onClick={() => handleOpenBillModal(appt)}
-                              className="px-2 py-1.5 bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-300 border border-sky-300/50 rounded-lg font-bold text-[11px] cursor-pointer"
-                            >
-                              Bill
-                            </button>
-
-                            {/* No Show */}
-                            {!isDone && appt.checkinStatus !== 'no_show' && (
-                              <button
-                                onClick={() => handleStatusChange(appt.id, 'no_show')}
-                                className="px-2 py-1.5 liquid-glass-subtle hover:bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-white/50 dark:border-white/10 rounded-lg font-bold text-[11px] cursor-pointer"
-                              >
-                                No Show
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      )
-                    })}
+                          </React.Fragment>
+                        )
+                      })}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ========================================================= */}
+      {/* DESK TAB: PAY AT DESK REQUESTS */}
+      {/* ========================================================= */}
+      {deskTab === 'pay_at_desk_requests' && (
+        <div className="space-y-6">
+          {/* Header Card */}
+          <GlassCard variant="elevated" padding="lg" radius="xl" specular className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <div className="flex items-center space-x-3">
+                <div className="p-2.5 rounded-xl bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                  <CreditCard className="w-6 h-6" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-black text-slate-900 dark:text-white flex items-center gap-2">
+                    Pay at Desk Requests
+                    {payAtDeskCount > 0 && (
+                      <span className="px-2.5 py-0.5 rounded-full text-xs font-black bg-amber-500 text-white">
+                        {payAtDeskCount} Pending
+                      </span>
+                    )}
+                  </h2>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 font-medium mt-0.5">
+                    Review and approve patient appointments booked with Pay at Desk
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={() => fetchPayAtDesk()}
+                disabled={isLoadingPayAtDesk}
+                className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-slate-700 dark:text-slate-200 bg-white/70 dark:bg-slate-800/70 border border-slate-200/80 dark:border-slate-700/80 hover:bg-slate-100 cursor-pointer transition-all disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isLoadingPayAtDesk ? 'animate-spin' : ''}`} />
+                <span>Refresh</span>
+              </button>
+            </div>
+          </GlassCard>
+
+          {/* Overload Rule Notice Banner */}
+          <div className="flex items-start space-x-3 p-3.5 rounded-xl bg-amber-50/80 dark:bg-amber-950/20 border border-amber-200/60 dark:border-amber-900/40 text-amber-900 dark:text-amber-200 text-xs">
+            <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+            <div className="space-y-0.5">
+              <p className="font-bold">Pay at Desk Overload Policy</p>
+              <p className="text-amber-800 dark:text-amber-300">
+                Approving an appointment always adds the patient to the requested slot even if full (e.g. 12/12 becomes 13). Approved requests immediately enter the live OPD queue.
+              </p>
+            </div>
+          </div>
+
+          {/* Requests Content */}
+          {isLoadingPayAtDesk && payAtDeskRequests.length === 0 ? (
+            <div className="py-20 flex flex-col items-center justify-center space-y-3">
+              <RefreshCw className="w-8 h-8 text-brand-600 animate-spin" />
+              <p className="text-sm font-bold text-slate-500">Loading pending requests...</p>
+            </div>
+          ) : payAtDeskRequests.length === 0 ? (
+            <GlassCard variant="subtle" padding="lg" radius="xl" className="py-16 text-center space-y-3">
+              <div className="w-14 h-14 mx-auto rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center text-amber-600">
+                <Receipt className="w-7 h-7" />
+              </div>
+              <h3 className="text-base font-black text-slate-800 dark:text-white">No Pending Requests</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mx-auto">
+                There are no Pay at Desk appointment requests waiting for approval at this time.
+              </p>
+            </GlassCard>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {payAtDeskRequests.map((req) => (
+                <GlassCard
+                  key={req.id}
+                  variant="elevated"
+                  padding="md"
+                  radius="xl"
+                  specular
+                  className="space-y-3 border border-slate-200/80 dark:border-white/10 hover:shadow-lg transition-all"
+                >
+                  {/* Top Bar: 10-Digit ID + Attempt Badge */}
+                  <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800">
+                    <span className="font-mono text-xs font-black tracking-wider text-slate-800 dark:text-slate-100 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-md">
+                      #{req.trackingCode10Digit}
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full text-[11px] font-black bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 border border-amber-300/40">
+                      Attempt {req.attemptNumber || 1} of 3
+                    </span>
+                  </div>
+
+                  {/* Patient Info */}
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <h4 className="text-base font-black text-slate-900 dark:text-white">
+                        {req.patientName}
+                      </h4>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        {req.patientAge ? `${req.patientAge} yrs` : '—'} • {req.patientGender || 'Other'}
+                      </p>
+                    </div>
+                    {req.patientMobile && (
+                      <a
+                        href={`tel:${req.patientMobile}`}
+                        className="p-2 rounded-full bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 hover:bg-emerald-100 transition-colors"
+                        title="Call patient"
+                      >
+                        <Phone className="w-4 h-4" />
+                      </a>
+                    )}
+                  </div>
+
+                  {/* Doctor & Slot */}
+                  <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 space-y-1 text-xs text-slate-600 dark:text-slate-300">
+                    <div className="flex items-center space-x-1.5 font-semibold text-slate-800 dark:text-slate-200">
+                      <Stethoscope className="w-3.5 h-3.5 text-brand-600" />
+                      <span>{req.doctor?.fullName || 'Assigned Doctor'}</span>
+                    </div>
+                    <div className="flex items-center space-x-1.5">
+                      <Calendar className="w-3.5 h-3.5 text-slate-400" />
+                      <span>{req.appointmentDate} • {req.appointmentTime}</span>
+                    </div>
+                  </div>
+
+                  {/* Fee Breakdown */}
+                  <div className="p-2.5 rounded-lg bg-amber-50/50 dark:bg-amber-950/20 border border-amber-100 dark:border-amber-900/30 text-xs space-y-1">
+                    <div className="flex justify-between text-slate-500 dark:text-slate-400">
+                      <span>Consultation Fee:</span>
+                      <span className="font-semibold">NPR {req.feeAmount}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-500 dark:text-slate-400">
+                      <span>5% Service Charge:</span>
+                      <span className="font-semibold">NPR {req.serviceChargeAmount || 0}</span>
+                    </div>
+                    <div className="flex justify-between text-sm font-black text-slate-900 dark:text-white pt-1 border-t border-amber-200/40">
+                      <span>Total Due at Desk:</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">NPR {req.totalAmount || req.feeAmount}</span>
+                    </div>
+                  </div>
+
+                  {/* Action Buttons */}
+                  <div className="flex items-center space-x-2 pt-1">
+                    <button
+                      onClick={() => setConfirmPayAtDeskAction({ action: 'reject', appt: req })}
+                      disabled={payAtDeskActionLoading}
+                      className="flex-1 py-2 px-3 rounded-xl text-xs font-bold text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/30 hover:bg-rose-100 border border-rose-200/60 dark:border-rose-900/40 transition-all cursor-pointer disabled:opacity-50"
+                    >
+                      Cancel / Reject
+                    </button>
+                    <button
+                      onClick={() => setConfirmPayAtDeskAction({ action: 'approve', appt: req })}
+                      disabled={payAtDeskActionLoading}
+                      className="flex-1 py-2 px-3 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 shadow-md transition-all cursor-pointer disabled:opacity-50"
+                    >
+                      Approve
+                    </button>
+                  </div>
+
+                  <button
+                    onClick={() => setPayAtDeskDetailModal(req)}
+                    className="w-full text-center text-[11px] font-semibold text-slate-500 hover:text-brand-600 cursor-pointer pt-1"
+                  >
+                    View Full Details
+                  </button>
+                </GlassCard>
+              ))}
+            </div>
+          )}
+
+          {/* Action Confirmation Modal */}
+          {confirmPayAtDeskAction && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn">
+              <div className="w-full max-w-md bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-2xl border border-slate-200 dark:border-slate-800 space-y-4">
+                <div className="flex items-center space-x-3">
+                  <div className={`p-3 rounded-full ${
+                    confirmPayAtDeskAction.action === 'approve'
+                      ? 'bg-emerald-100 dark:bg-emerald-950/50 text-emerald-600'
+                      : 'bg-rose-100 dark:bg-rose-950/50 text-rose-600'
+                  }`}>
+                    {confirmPayAtDeskAction.action === 'approve' ? (
+                      <CheckCircle2 className="w-6 h-6" />
+                    ) : (
+                      <AlertTriangle className="w-6 h-6" />
+                    )}
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-black text-slate-900 dark:text-white">
+                      {confirmPayAtDeskAction.action === 'approve' ? 'Approve Appointment?' : 'Unapprove Request?'}
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      Patient: {confirmPayAtDeskAction.appt.patientName} (ID: #{confirmPayAtDeskAction.appt.trackingCode10Digit})
+                    </p>
+                  </div>
+                </div>
+
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 text-xs space-y-1.5 text-slate-600 dark:text-slate-300">
+                  <p><strong>Date & Slot:</strong> {confirmPayAtDeskAction.appt.appointmentDate} at {confirmPayAtDeskAction.appt.appointmentTime}</p>
+                  <p><strong>Total at Desk:</strong> NPR {confirmPayAtDeskAction.appt.totalAmount}</p>
+                  <p><strong>Attempt:</strong> {confirmPayAtDeskAction.appt.attemptNumber || 1} of 3</p>
+                </div>
+
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {confirmPayAtDeskAction.action === 'approve'
+                    ? 'Approving adds the patient directly to the live OPD queue. If the slot is full, the slot is safely overloaded.'
+                    : 'The request will be marked UNAPPROVED. The patient will be notified and can retry if attempts remain.'}
+                </p>
+
+                <div className="flex items-center space-x-3 pt-2">
+                  <button
+                    onClick={() => setConfirmPayAtDeskAction(null)}
+                    disabled={payAtDeskActionLoading}
+                    className="flex-1 py-2.5 rounded-xl text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 cursor-pointer disabled:opacity-50"
+                  >
+                    Go Back
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (confirmPayAtDeskAction.action === 'approve') {
+                        handleApprovePayAtDesk(confirmPayAtDeskAction.appt)
+                      } else {
+                        handleRejectPayAtDesk(confirmPayAtDeskAction.appt)
+                      }
+                    }}
+                    disabled={payAtDeskActionLoading}
+                    className={`flex-1 py-2.5 rounded-xl text-xs font-bold text-white shadow-md cursor-pointer disabled:opacity-50 flex items-center justify-center space-x-1.5 ${
+                      confirmPayAtDeskAction.action === 'approve'
+                        ? 'bg-emerald-600 hover:bg-emerald-700'
+                        : 'bg-rose-600 hover:bg-rose-700'
+                    }`}
+                  >
+                    {payAtDeskActionLoading && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                    <span>{confirmPayAtDeskAction.action === 'approve' ? 'Confirm Approval' : 'Confirm Unapprove'}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Full Detail Modal */}
+          {payAtDeskDetailModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn">
+              <div className="w-full max-w-lg bg-white dark:bg-slate-900 rounded-2xl p-6 shadow-2xl border border-slate-200 dark:border-slate-800 space-y-4 max-h-[90vh] overflow-y-auto">
+                <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
+                  <div>
+                    <h3 className="text-lg font-black text-slate-900 dark:text-white">Request Details</h3>
+                    <p className="font-mono text-xs font-bold text-brand-600">#{payAtDeskDetailModal.trackingCode10Digit}</p>
+                  </div>
+                  <button
+                    onClick={() => setPayAtDeskDetailModal(null)}
+                    className="p-1 rounded-lg text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="space-y-3 text-xs">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/50">
+                      <p className="text-slate-400">Patient</p>
+                      <p className="font-bold text-slate-900 dark:text-white mt-0.5">{payAtDeskDetailModal.patientName}</p>
+                      <p className="text-slate-500">{payAtDeskDetailModal.patientAge ? `${payAtDeskDetailModal.patientAge} yrs` : '—'} • {payAtDeskDetailModal.patientGender || 'Other'}</p>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/50">
+                      <p className="text-slate-400">Contact</p>
+                      <p className="font-bold text-slate-900 dark:text-white mt-0.5">{payAtDeskDetailModal.patientMobile || '—'}</p>
+                      <p className="text-slate-500">{payAtDeskDetailModal.patientEmail || 'No email'}</p>
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 space-y-2">
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Doctor:</span>
+                      <span className="font-bold text-slate-900 dark:text-white">{payAtDeskDetailModal.doctor?.fullName || 'Assigned Doctor'}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Slot Date & Time:</span>
+                      <span className="font-bold text-slate-900 dark:text-white">{payAtDeskDetailModal.appointmentDate} • {payAtDeskDetailModal.appointmentTime}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-400">Attempt Count:</span>
+                      <span className="font-bold text-amber-600">Attempt {payAtDeskDetailModal.attemptNumber || 1} of 3</span>
+                    </div>
+                    {payAtDeskDetailModal.notes && (
+                      <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
+                        <span className="text-slate-400">Clinical Notes / Tests:</span>
+                        <p className="font-medium text-slate-700 dark:text-slate-300 mt-0.5">{payAtDeskDetailModal.notes}</p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-3 rounded-xl bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200/60 dark:border-amber-900/40 space-y-1.5">
+                    <div className="flex justify-between text-slate-600 dark:text-slate-300">
+                      <span>Consultation Fee:</span>
+                      <span className="font-bold">NPR {payAtDeskDetailModal.feeAmount}</span>
+                    </div>
+                    <div className="flex justify-between text-slate-600 dark:text-slate-300">
+                      <span>5% Service Charge:</span>
+                      <span className="font-bold">NPR {payAtDeskDetailModal.serviceChargeAmount || 0}</span>
+                    </div>
+                    <div className="flex justify-between text-sm font-black text-slate-900 dark:text-white pt-2 border-t border-amber-200/60 dark:border-amber-900/60">
+                      <span>Total Payable at Desk:</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">NPR {payAtDeskDetailModal.totalAmount || payAtDeskDetailModal.feeAmount}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center space-x-3 pt-2">
+                  <button
+                    onClick={() => {
+                      const m = payAtDeskDetailModal
+                      setPayAtDeskDetailModal(null)
+                      setConfirmPayAtDeskAction({ action: 'reject', appt: m })
+                    }}
+                    className="flex-1 py-2.5 rounded-xl text-xs font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 cursor-pointer"
+                  >
+                    Cancel / Reject
+                  </button>
+                  <button
+                    onClick={() => {
+                      const m = payAtDeskDetailModal
+                      setPayAtDeskDetailModal(null)
+                      setConfirmPayAtDeskAction({ action: 'approve', appt: m })
+                    }}
+                    className="flex-1 py-2.5 rounded-xl text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 shadow-md cursor-pointer"
+                  >
+                    Approve Request
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -4888,7 +5623,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
               <GlassCard variant="base" padding="md" radius="xl" className="space-y-4">
                 <div className="flex items-center space-x-2 text-brand-700 font-black text-sm pb-2 border-b border-white/60">
                   <CalendarClock className="w-4 h-4" />
-                  <span>Create Individual Timed Slot</span>
+                  <span>Add Timed Slot</span>
                 </div>
 
                 <form onSubmit={handlePublishSlot} className="space-y-3">
@@ -4938,7 +5673,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                     fullWidth
                     disabled={publishingSlot}
                   >
-                    {publishingSlot ? 'Publishing...' : 'Publish Timed Slot'}
+                    {publishingSlot ? 'Adding...' : 'Add slot'}
                   </GlassButton>
                 </form>
               </GlassCard>
@@ -5279,14 +6014,6 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                         </td>
                         <td className="py-3.5 px-4 font-bold text-slate-900">
                           <div>{appt.patientName}</div>
-                          {appt.optInEarlyCall && (
-                            <div className="mt-0.5">
-                              <span className="inline-flex items-center space-x-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-800 border border-emerald-400/40 text-[10px] font-bold">
-                                <Zap className="w-2.5 h-2.5 text-emerald-600" />
-                                <span>Early Call Opted-In</span>
-                              </span>
-                            </div>
-                          )}
                           {appt.notes && (
                             <div className="mt-0.5 text-[10px] text-amber-800 bg-amber-50/80 px-2 py-0.5 rounded border border-amber-200 inline-block">
                               Remark: {appt.notes}
@@ -5326,17 +6053,6 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                           >
                             Shift Date
                           </button>
-                          {appt.optInEarlyCall && appt.checkinStatus !== 'completed' && appt.checkinStatus !== 'no_show' && (
-                            <button
-                              type="button"
-                              onClick={() => handleSendEarlyInvite(appt)}
-                              className="px-2.5 py-1 bg-emerald-50/85 hover:bg-emerald-100 text-emerald-800 rounded-lg text-[11px] font-bold cursor-pointer inline-flex items-center space-x-1"
-                              title="Send 'Doctor is free now. Come in early?' push alert to patient"
-                            >
-                              <Zap className="w-3 h-3 text-emerald-600" />
-                              <span>Invite Early</span>
-                            </button>
-                          )}
                           <button
                             type="button"
                             onClick={() => handleOpenPushAlertModal(appt)}
@@ -6492,45 +7208,289 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                       <th className="py-3 px-4">Total Visits</th>
                       <th className="py-3 px-4">Last Visit</th>
                       <th className="py-3 px-4">Tracking Code(s)</th>
+                      <th className="py-3 px-4 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200/50 font-medium">
-                    {patientDirectory.map((pat) => (
-                      <tr key={pat.id} className="hover:bg-white/45 transition-colors">
-                        <td className="py-3.5 px-4 font-bold text-slate-900">
-                          {pat.fullName}
-                        </td>
-                        <td className="py-3.5 px-4 font-mono text-slate-700">
-                          {pat.phone}
-                        </td>
-                        <td className="py-3.5 px-4 text-slate-600">
-                          {pat.gender} {pat.age ? `• ${pat.age} yrs` : ''}
-                        </td>
-                        <td className="py-3.5 px-4 font-bold text-brand-700">
-                          {pat.visitCount} {pat.visitCount === 1 ? 'visit' : 'visits'}
-                        </td>
-                        <td className="py-3.5 px-4 text-slate-600">
-                          {pat.lastVisitDate || '–'}
-                        </td>
-                        <td className="py-3.5 px-4">
-                          <div className="flex flex-wrap gap-1">
-                            {pat.trackingCodes.slice(0, 2).map((code: string) => (
-                              <span
-                                key={code}
-                                className="px-2 py-0.5 rounded-md bg-white/75 border border-white/80 text-slate-800 font-mono text-[10px] font-bold"
-                              >
-                                #{code}
-                              </span>
-                            ))}
-                            {pat.trackingCodes.length > 2 && (
-                              <span className="text-[10px] text-slate-500 font-bold">
-                                +{pat.trackingCodes.length - 2} more
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                    {patientDirectory.map((pat) => {
+                      const isExpanded = expandedPatientId === pat.id
+                      const matchingAppt = appointments.find(
+                        (a) =>
+                          (pat.trackingCodes && pat.trackingCodes.includes(a.trackingCode10Digit)) ||
+                          (pat.phone && pat.phone !== 'N/A' && a.patientMobile === pat.phone) ||
+                          a.patientName.toLowerCase() === pat.fullName.toLowerCase()
+                      ) || ({
+                        id: pat.id,
+                        trackingCode10Digit: pat.trackingCodes[0] || '1000000000',
+                        clinicId: selectedClinic?.id || '',
+                        patientName: pat.fullName,
+                        patientMobile: pat.phone !== 'N/A' ? pat.phone : '',
+                        patientGender: pat.gender,
+                        patientAge: pat.age,
+                        appointmentDate: pat.lastVisitDate || new Date().toISOString().slice(0, 10),
+                        appointmentTime: '10:00 AM',
+                        checkinStatus: 'waiting',
+                        paymentStatus: 'unpaid',
+                        feeAmount: 0,
+                        clinic: selectedClinic || undefined,
+                      } as unknown as Appointment)
+
+                      const cleanPhone = pat.phone ? pat.phone.replace(/\D/g, '') : ''
+
+                      return (
+                        <React.Fragment key={pat.id}>
+                          <tr className={`hover:bg-white/50 transition-colors ${isExpanded ? 'bg-white/40' : ''}`}>
+                            <td className="py-3.5 px-4 font-bold text-slate-900">
+                              <div className="flex items-center space-x-2">
+                                <span>{pat.fullName}</span>
+                                {pat.consultations && pat.consultations.length > 1 && (
+                                  <span className="px-1.5 py-0.5 rounded-full bg-teal-100 text-teal-800 text-[10px] font-bold border border-teal-200">
+                                    Follow-Up Patient
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="py-3.5 px-4 font-mono text-slate-700">
+                              {pat.phone}
+                            </td>
+                            <td className="py-3.5 px-4 text-slate-600">
+                              {pat.gender} {pat.age ? `• ${pat.age} yrs` : ''}
+                            </td>
+                            <td className="py-3.5 px-4 font-bold text-brand-700">
+                              {pat.visitCount} {pat.visitCount === 1 ? 'visit' : 'visits'}
+                            </td>
+                            <td className="py-3.5 px-4 text-slate-600">
+                              {pat.lastVisitDate || '–'}
+                            </td>
+                            <td className="py-3.5 px-4">
+                              <div className="flex flex-wrap gap-1">
+                                {pat.trackingCodes.slice(0, 2).map((code: string) => (
+                                  <span
+                                    key={code}
+                                    className="px-2 py-0.5 rounded-md bg-white/75 border border-white/80 text-slate-800 font-mono text-[10px] font-bold"
+                                  >
+                                    #{code}
+                                  </span>
+                                ))}
+                                {pat.trackingCodes.length > 2 && (
+                                  <span className="text-[10px] text-slate-500 font-bold">
+                                    +{pat.trackingCodes.length - 2} more
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="py-3.5 px-4 text-right">
+                              <div className="flex items-center justify-end space-x-1.5 flex-wrap">
+                                {pat.phone && pat.phone !== 'N/A' && (
+                                  <a
+                                    href={`tel:${pat.phone}`}
+                                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 font-bold text-[11px] border border-emerald-300 transition-colors"
+                                    title={`Call ${pat.fullName} (${pat.phone})`}
+                                  >
+                                    <Phone className="w-3 h-3 text-emerald-600" />
+                                    <span>Call</span>
+                                  </a>
+                                )}
+                                {cleanPhone && (
+                                  <a
+                                    href={`https://wa.me/977${cleanPhone}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-teal-50 hover:bg-teal-100 text-teal-800 font-bold text-[11px] border border-teal-300 transition-colors"
+                                    title="WhatsApp Patient"
+                                  >
+                                    <MessageSquare className="w-3 h-3 text-teal-600" />
+                                    <span>WhatsApp</span>
+                                  </a>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenBillModal(matchingAppt)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-600 text-white font-bold text-[11px] shadow-xs transition-colors cursor-pointer"
+                                  title="Push / Update Billing Invoice"
+                                >
+                                  <Receipt className="w-3 h-3" />
+                                  <span>Push Bill</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenShiftModal(matchingAppt)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-[11px] shadow-xs transition-colors cursor-pointer"
+                                  title="Reschedule / Shift Appointment Date"
+                                >
+                                  <Calendar className="w-3 h-3" />
+                                  <span>Shift Date</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenPrintSlip(matchingAppt)}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-700 hover:bg-slate-800 text-white font-bold text-[11px] shadow-xs transition-colors cursor-pointer"
+                                  title="Print 80mm Walk-In / Token Slip"
+                                >
+                                  <Printer className="w-3 h-3" />
+                                  <span>Slip</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedPatientId(isExpanded ? null : pat.id)}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/80 hover:bg-white text-slate-700 font-bold text-[11px] border border-slate-300 transition-colors cursor-pointer"
+                                  title="View Consultations Timeline"
+                                >
+                                  <span>{isExpanded ? 'Hide' : 'Visits'}</span>
+                                  <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+
+                          {/* EXPANDABLE DUAL-CONSULTATION TIMELINE DRAWER */}
+                          {isExpanded && (
+                            <tr className="bg-slate-50/90 dark:bg-slate-900/60 border-y border-emerald-200 dark:border-emerald-800">
+                              <td colSpan={7} className="p-4 md:p-5">
+                                <div className="space-y-3">
+                                  <div className="flex items-center justify-between pb-2 border-b border-slate-200/80">
+                                    <div className="flex items-center space-x-2">
+                                      <Stethoscope className="w-4 h-4 text-emerald-600" />
+                                      <h4 className="font-bold text-xs text-slate-800 uppercase tracking-wider">
+                                        Consultation Journey & Clinical Records ({pat.consultations?.length || pat.visitCount} Visits)
+                                      </h4>
+                                    </div>
+                                    <span className="text-[11px] text-slate-500">
+                                      Patient: <strong>{pat.fullName}</strong> • Contact: {pat.phone}
+                                    </span>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                                    {(pat.consultations && pat.consultations.length > 0
+                                      ? pat.consultations
+                                      : pat.trackingCodes.map((tc, idx) => ({
+                                          id: `${pat.id}-${idx}`,
+                                          appointmentDate: pat.lastVisitDate || 'Recorded',
+                                          appointmentTime: 'OPD',
+                                          trackingCode: tc,
+                                          checkinStatus: 'completed',
+                                          paymentStatus: 'paid',
+                                          feeAmount: idx === 0 ? 500 : 0,
+                                          isFollowup: idx > 0,
+                                        }))
+                                    ).map((consult, cIdx) => {
+                                      const consultAppt = appointments.find((a) => a.trackingCode10Digit === consult.trackingCode) || ({
+                                        ...matchingAppt,
+                                        id: consult.id,
+                                        trackingCode10Digit: consult.trackingCode,
+                                        appointmentDate: consult.appointmentDate,
+                                        appointmentTime: consult.appointmentTime,
+                                        feeAmount: consult.feeAmount,
+                                        checkinStatus: consult.checkinStatus,
+                                        paymentStatus: consult.paymentStatus,
+                                        notes: consult.notes,
+                                      } as unknown as Appointment)
+
+                                      return (
+                                        <div
+                                          key={consult.id || consult.trackingCode || cIdx}
+                                          className={`p-3.5 rounded-2xl border transition-all ${
+                                            consult.isFollowup
+                                              ? 'bg-teal-50/70 border-teal-200'
+                                              : 'bg-blue-50/70 border-blue-200'
+                                          }`}
+                                        >
+                                          <div className="flex items-center justify-between pb-2 mb-2 border-b border-white/60">
+                                            <span
+                                              className={`px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wide ${
+                                                consult.isFollowup
+                                                  ? 'bg-teal-200/80 text-teal-900 border border-teal-300'
+                                                  : 'bg-blue-200/80 text-blue-900 border border-blue-300'
+                                              }`}
+                                            >
+                                              {cIdx === 0
+                                                ? '1. Initial Consultation'
+                                                : `2. Follow-Up Consultation ${consult.feeAmount === 0 ? '(Free Visit)' : ''}`}
+                                            </span>
+                                            <span className="font-mono text-[11px] font-bold text-slate-700 bg-white/80 px-2 py-0.5 rounded">
+                                              #{consult.trackingCode}
+                                            </span>
+                                          </div>
+
+                                          <div className="text-[11px] space-y-1 text-slate-700">
+                                            <div>
+                                              <strong className="text-slate-900">Doctor:</strong>{' '}
+                                              {consult.doctorName || 'OPD Specialist'}
+                                              {consult.doctorSpecialty ? ` (${consult.doctorSpecialty})` : ''}
+                                            </div>
+                                            <div>
+                                              <strong className="text-slate-900">Date & Slot:</strong> {consult.appointmentDate} • {consult.appointmentTime}
+                                            </div>
+                                            <div>
+                                              <strong className="text-slate-900">Status:</strong>{' '}
+                                              <span className="font-semibold capitalize">{consult.checkinStatus.replace('_', ' ')}</span>
+                                              {' • '}
+                                              <strong className="text-slate-900">Fee:</strong> Rs. {consult.feeAmount}{' '}
+                                              <span className="text-emerald-700 font-bold">({consult.paymentStatus})</span>
+                                            </div>
+                                            {consult.notes && (
+                                              <div className="mt-1 p-2 rounded-lg bg-white/80 border border-white text-slate-800">
+                                                <strong>Clinical Notes:</strong> {consult.notes}
+                                              </div>
+                                            )}
+                                          </div>
+
+                                          <div className="mt-3 pt-2 border-t border-white/60 flex items-center justify-between flex-wrap gap-1.5">
+                                            <div className="flex items-center gap-1.5">
+                                              <button
+                                                type="button"
+                                                onClick={() => printAppointmentBill(consultAppt)}
+                                                className="px-2 py-1 rounded-md bg-white hover:bg-slate-100 text-slate-800 font-bold text-[10px] border border-slate-300 shadow-xs cursor-pointer"
+                                                title="Print Official Bill Invoice"
+                                              >
+                                                <Receipt className="w-2.5 h-2.5 inline mr-1 text-emerald-600" />
+                                                Print Bill
+                                              </button>
+                                              <button
+                                                type="button"
+                                                onClick={() => printPrescription(consultAppt)}
+                                                className="px-2 py-1 rounded-md bg-white hover:bg-slate-100 text-slate-800 font-bold text-[10px] border border-slate-300 shadow-xs cursor-pointer"
+                                                title="Print Official Prescription (Rx)"
+                                              >
+                                                <Stethoscope className="w-2.5 h-2.5 inline mr-1 text-blue-600" />
+                                                Print Rx
+                                              </button>
+                                            </div>
+                                            <div className="flex items-center gap-1.5">
+                                              <button
+                                                type="button"
+                                                onClick={() => handleOpenBillModal(consultAppt)}
+                                                className="px-2 py-1 rounded-md bg-amber-500 hover:bg-amber-600 text-white font-bold text-[10px] cursor-pointer"
+                                              >
+                                                Push Bill
+                                              </button>
+                                              <button
+                                                type="button"
+                                                onClick={() => handleOpenShiftModal(consultAppt)}
+                                                className="px-2 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white font-bold text-[10px] cursor-pointer"
+                                              >
+                                                Shift Date
+                                              </button>
+                                              <button
+                                                type="button"
+                                                onClick={() => handleOpenPrintSlip(consultAppt)}
+                                                className="px-2 py-1 rounded-md bg-slate-700 hover:bg-slate-800 text-white font-bold text-[10px] cursor-pointer"
+                                              >
+                                                Slip
+                                              </button>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      )
+                                    })}
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      )
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -7333,7 +8293,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                       onChange={(e) => setSettingGatewayProvider(e.target.value)}
                       className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-bold"
                     >
-                      <option value="esewa">eSewa Merchant (Nepal)</option>
+                      <option value="esewa">eSewa Merchant (Nepal - ePay v2)</option>
                       <option value="khalti">Khalti Digital Wallet (Nepal)</option>
                       <option value="connectips">ConnectIPS / Fonepay</option>
                       <option value="stripe">Stripe International</option>
@@ -7341,44 +8301,150 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                   </div>
                   <div>
                     <label className="text-[11px] font-bold text-slate-700 block mb-1">
-                      Merchant ID / Service Code
+                      Gateway Environment
                     </label>
-                    <input
-                      type="text"
-                      value={settingMerchantId}
-                      onChange={(e) => setSettingMerchantId(e.target.value)}
-                      placeholder="e.g. EPAYTEST or Merchant ID"
-                      className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono"
-                    />
+                    <select
+                      value={settingPaymentEnvironment}
+                      onChange={(e) => setSettingPaymentEnvironment(e.target.value as any)}
+                      className={`w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-bold ${
+                        settingPaymentEnvironment === 'live' ? 'text-emerald-700 font-black' : 'text-amber-700'
+                      }`}
+                    >
+                      <option value="test">TEST / Sandbox Environment (rc-epay)</option>
+                      <option value="live">LIVE Production Environment (epay)</option>
+                    </select>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[11px] font-bold text-slate-700 block mb-1">
-                      Public / Live API Key
-                    </label>
-                    <input
-                      type="text"
-                      value={settingPaymentApiKey}
-                      onChange={(e) => setSettingPaymentApiKey(e.target.value)}
-                      placeholder="live_public_key_..."
-                      className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono"
-                    />
+                {settingGatewayProvider === 'esewa' ? (
+                  <div className="space-y-3 pt-1">
+                    {/* Environment Notice Banner */}
+                    <div className={`p-3 rounded-xl border text-[11px] flex items-start justify-between gap-3 ${
+                      settingPaymentEnvironment === 'live'
+                        ? 'bg-emerald-50/70 border-emerald-300 text-emerald-900'
+                        : 'bg-amber-50/70 border-amber-300 text-amber-900'
+                    }`}>
+                      <div>
+                        <span className="font-bold block">
+                          {settingPaymentEnvironment === 'live'
+                            ? '● LIVE PRODUCTION MODE ACTIVE'
+                            : '● TEST / SANDBOX MODE ACTIVE'}
+                        </span>
+                        <span>
+                          {settingPaymentEnvironment === 'live'
+                            ? 'Patient payments are processed through live eSewa (epay.esewa.com.np) and settled directly into your clinic merchant bank account.'
+                            : 'Test payments use eSewa Sandbox (rc-epay.esewa.com.np). No real money is charged. Use default credentials to simulate transactions.'}
+                        </span>
+                      </div>
+                      {settingPaymentEnvironment === 'test' && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSettingMerchantId('EPAYTEST')
+                            setSettingPaymentSecretKey('8gBm/:&EnhH.1/q')
+                          }}
+                          className="shrink-0 px-2.5 py-1 bg-amber-200/80 hover:bg-amber-300 text-amber-900 font-bold rounded-lg text-[10px] transition cursor-pointer"
+                        >
+                          Fill Sandbox Defaults
+                        </button>
+                      )}
+                    </div>
+
+                    {/* eSewa Credentials Grid */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                          eSewa Product Code (Merchant Code) <span className="text-rose-500">*</span>
+                        </label>
+                        <input
+                          type="text"
+                          value={settingMerchantId}
+                          onChange={(e) => setSettingMerchantId(e.target.value)}
+                          placeholder="e.g. EPAYTEST or your eSewa Product Code"
+                          className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono font-bold"
+                        />
+                        <span className="text-[10px] text-slate-500 mt-1 block">
+                          This code routes customer payments directly to your eSewa merchant wallet.
+                        </span>
+                      </div>
+                      <div>
+                        <div className="flex items-center justify-between mb-1">
+                          <label className="text-[11px] font-bold text-slate-700 block">
+                            eSewa Secret Key (HMAC-SHA256) <span className="text-rose-500">*</span>
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => setShowPaymentSecretKey(!showPaymentSecretKey)}
+                            className="text-[10px] text-slate-500 hover:text-slate-800 flex items-center gap-1 font-semibold cursor-pointer"
+                          >
+                            {showPaymentSecretKey ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                            <span>{showPaymentSecretKey ? 'Hide' : 'Show'}</span>
+                          </button>
+                        </div>
+                        <input
+                          type={showPaymentSecretKey ? 'text' : 'password'}
+                          value={settingPaymentSecretKey}
+                          onChange={(e) => setSettingPaymentSecretKey(e.target.value)}
+                          placeholder={settingPaymentEnvironment === 'test' ? '8gBm/:&EnhH.1/q' : '••••••••••••••••'}
+                          className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono"
+                        />
+                        <span className="text-[10px] text-slate-500 mt-1 block">
+                          Kept strictly server-side with RLS to cryptographically verify eSewa payments.
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* eSewa Redirection & Settlement Explainer */}
+                    <div className="p-3 bg-slate-50/80 rounded-xl border border-slate-200/80 text-[11px] text-slate-600 space-y-1">
+                      <div className="font-bold text-slate-800 flex items-center gap-1.5">
+                        <ShieldCheck className="w-3.5 h-3.5 text-brand-600" />
+                        <span>How Payment Redirection to Your Account Works:</span>
+                      </div>
+                      <p className="text-[10.5px] leading-relaxed text-slate-600">
+                        1. Patient books an OPD/Lab appointment and chooses eSewa → 2. Browser redirects to secure eSewa portal using your <strong>Product Code</strong> → 3. Patient approves payment → 4. eSewa redirects back to Dactor server, which independently verifies transaction amount and status using your <strong>Secret Key</strong> → 5. Live queue position and billing invoice are issued automatically.
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <label className="text-[11px] font-bold text-slate-700 block mb-1">
-                      Merchant Secret Key
-                    </label>
-                    <input
-                      type="password"
-                      value={settingPaymentSecretKey}
-                      onChange={(e) => setSettingPaymentSecretKey(e.target.value)}
-                      placeholder="••••••••••••••••"
-                      className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono"
-                    />
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Merchant ID / Client Code
+                      </label>
+                      <input
+                        type="text"
+                        value={settingMerchantId}
+                        onChange={(e) => setSettingMerchantId(e.target.value)}
+                        placeholder="Merchant ID"
+                        className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Public / Live API Key
+                      </label>
+                      <input
+                        type="text"
+                        value={settingPaymentApiKey}
+                        onChange={(e) => setSettingPaymentApiKey(e.target.value)}
+                        placeholder="live_public_key_..."
+                        className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-700 block mb-1">
+                        Secret Key
+                      </label>
+                      <input
+                        type="password"
+                        value={settingPaymentSecretKey}
+                        onChange={(e) => setSettingPaymentSecretKey(e.target.value)}
+                        placeholder="••••••••••••••••"
+                        className="w-full px-3 py-2 rounded-xl liquid-glass-input text-xs font-mono"
+                      />
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
 
               <GlassButton
@@ -7491,7 +8557,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                 <label className="flex items-center justify-center space-x-2 w-full py-4 px-6 border-2 border-dashed border-brand-300 hover:border-brand-500 rounded-2xl bg-brand-50/50 hover:bg-brand-50/80 backdrop-blur-md transition-all cursor-pointer">
                   <UploadCloud className="w-5 h-5 text-brand-600" />
                   <span className="text-xs font-bold text-brand-800">
-                    {uploadingClinicPhoto ? 'Compressing & Uploading to Supabase...' : `+ Upload Facility Photo (${(selectedClinic?.pictures?.length || 0) + 1} of 4)`}
+                    {uploadingClinicPhoto ? 'Compressing & Uploading...' : `+ Upload Facility Photo (${(selectedClinic?.pictures?.length || 0) + 1} of 4)`}
                   </span>
                   <input
                     type="file"
@@ -7502,7 +8568,7 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                   />
                 </label>
                 <p className="text-[10px] text-slate-400 text-center mt-1.5">
-                  Images are automatically compressed to ≤ 300 KB and uploaded to public Supabase storage.
+                  Images are automatically compressed to ≤ 300 KB and uploaded securely.
                 </p>
               </div>
             )}
@@ -7584,6 +8650,235 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
               </div>
             </div>
           </GlassCard>
+
+          {/* 6. ADMIN CITIES & LOCATIONS DROPDOWN MANAGER */}
+          <GlassCard variant="base" padding="lg" radius="xl" className="border-emerald-200/80 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-emerald-100 dark:border-white/10">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-700/50 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+                  <MapPin className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-slate-900 dark:text-white flex items-center gap-2">
+                    <span>Cities & Locations Dropdown Manager</span>
+                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 border border-emerald-300 dark:border-emerald-700">
+                      Live Sync
+                    </span>
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Add, delete, or toggle cities and regions shown in the main location dropdown across the website and patient mobile app.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={loadAdminCities}
+                  disabled={loadingAdminCities}
+                  className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loadingAdminCities ? 'animate-spin' : ''}`} />
+                  <span>Refresh</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowAddCityModal(true)}
+                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-600/20 transition flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>+ Add City to Dropdown</span>
+                </button>
+              </div>
+            </div>
+
+            {cityActionMsg && (
+              <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200 text-xs font-bold flex items-center gap-2 animate-in fade-in">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>{cityActionMsg}</span>
+              </div>
+            )}
+
+            {/* Quick Live Preview Pill */}
+            <div className="p-3 rounded-xl liquid-glass-subtle flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-bold text-slate-500 dark:text-slate-400 text-[11px] uppercase tracking-wider">
+                Active in Dropdown:
+              </span>
+              <span className="px-2.5 py-1 rounded-lg bg-indigo-50 dark:bg-indigo-950/50 text-indigo-700 dark:text-indigo-300 font-bold border border-indigo-200 dark:border-indigo-800 text-xs">
+                📍 All Nepal (Universal)
+              </span>
+              {adminCities.filter(c => c.isActive).map(c => (
+                <span
+                  key={c.id}
+                  className="px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 font-bold border border-emerald-200 dark:border-emerald-800 text-xs flex items-center gap-1"
+                >
+                  <span>📍 {c.name}</span>
+                </span>
+              ))}
+            </div>
+
+            {/* Cities Table */}
+            <div className="rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 uppercase text-[10px] font-black tracking-wider">
+                    <tr>
+                      <th className="py-2.5 px-3.5">City Name</th>
+                      <th className="py-2.5 px-3.5">District / Area Aliases</th>
+                      <th className="py-2.5 px-3.5">Center Coordinates</th>
+                      <th className="py-2.5 px-3.5">Dropdown Visibility</th>
+                      <th className="py-2.5 px-3.5 text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800 font-medium">
+                    {loadingAdminCities && adminCities.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-8 text-center text-slate-400">
+                          <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-emerald-600" />
+                          <span>Loading city options from database...</span>
+                        </td>
+                      </tr>
+                    ) : adminCities.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-8 text-center text-slate-400">
+                          No cities found in database. Click &quot;+ Add City to Dropdown&quot; to add one.
+                        </td>
+                      </tr>
+                    ) : (
+                      adminCities.map((city) => (
+                        <tr key={city.id} className="hover:bg-slate-50/60 dark:hover:bg-slate-800/40 transition">
+                          <td className="py-3 px-3.5 font-bold text-slate-900 dark:text-white">
+                            <div className="flex items-center gap-2">
+                              <MapPin className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                              <span>{city.name}</span>
+                            </div>
+                          </td>
+                          <td className="py-3 px-3.5 text-slate-600 dark:text-slate-400">
+                            <span className="line-clamp-1 max-w-xs text-[11px]">
+                              {city.aliases || city.name.toLowerCase()}
+                            </span>
+                          </td>
+                          <td className="py-3 px-3.5 font-mono text-[11px] text-slate-500">
+                            {city.coordinates || '27.7172, 85.3240'}
+                          </td>
+                          <td className="py-3 px-3.5">
+                            <button
+                              type="button"
+                              onClick={() => handleToggleCityActive(city)}
+                              className={`text-[10px] font-bold px-2.5 py-1 rounded-full cursor-pointer transition ${
+                                city.isActive
+                                  ? 'bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-700'
+                                  : 'bg-slate-100 dark:bg-slate-800 text-slate-500 border border-slate-200 dark:border-slate-700'
+                              }`}
+                            >
+                              {city.isActive ? 'Shown in Dropdown' : 'Hidden'}
+                            </button>
+                          </td>
+                          <td className="py-3 px-3.5 text-right">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteCity(city)}
+                              className="p-1.5 rounded-lg text-rose-500 hover:text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition cursor-pointer"
+                              title={`Delete ${city.name} from dropdown`}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </GlassCard>
+
+          {/* Add City Modal */}
+          {showAddCityModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+              <div className="liquid-glass-modal rounded-3xl max-w-md w-full p-6 space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-white/60">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-xl bg-emerald-500/20 flex items-center justify-center text-emerald-600">
+                      <MapPin className="w-4 h-4" />
+                    </div>
+                    <h3 className="text-base font-black text-slate-900 dark:text-white">
+                      Add New City to Location Dropdown
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowAddCityModal(false)}
+                    className="p-1.5 text-slate-400 hover:text-slate-700 rounded-full"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <form onSubmit={handleAddNewCity} className="space-y-3.5">
+                  <div>
+                    <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                      City / Location Name *
+                    </label>
+                    <input
+                      type="text"
+                      value={newCityName}
+                      onChange={(e) => setNewCityName(e.target.value)}
+                      placeholder="e.g. Butwal, Janakpur, Itahari, Birtamode..."
+                      required
+                      className="w-full px-3.5 py-2.5 rounded-xl text-xs font-semibold liquid-glass-input focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                      District & Area Keywords (Comma-separated)
+                    </label>
+                    <input
+                      type="text"
+                      value={newCityAliases}
+                      onChange={(e) => setNewCityAliases(e.target.value)}
+                      placeholder="e.g. butwal, rupandehi, bhairahawa, lumbini"
+                      className="w-full px-3.5 py-2.5 rounded-xl text-xs font-semibold liquid-glass-input focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      Clinics whose address matches any of these keywords will be found when this city is chosen.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                      Center Coordinates (Latitude, Longitude)
+                    </label>
+                    <input
+                      type="text"
+                      value={newCityCoords}
+                      onChange={(e) => setNewCityCoords(e.target.value)}
+                      placeholder="27.7172, 85.3240"
+                      className="w-full px-3.5 py-2.5 rounded-xl text-xs font-mono font-semibold liquid-glass-input focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                  </div>
+
+                  <div className="flex justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setShowAddCityModal(false)}
+                      className="px-4 py-2 rounded-xl text-xs font-bold text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={isSubmittingCity}
+                      className="px-5 py-2 rounded-xl text-xs font-bold bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-md shadow-emerald-600/20 transition cursor-pointer disabled:opacity-60"
+                    >
+                      {isSubmittingCity ? 'Adding...' : 'Add City to Dropdown'}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

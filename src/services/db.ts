@@ -16,6 +16,9 @@ import {
   PatientTransactionRecord,
   SupportTicket,
   PaymentGatewaysConfig,
+  MultiSlotPositionResult,
+  DoctorHomeItem,
+  CityLocation,
 } from '../types'
 import {
   parsePaymentRecords,
@@ -257,9 +260,10 @@ export async function createDoctor(doctor: Partial<Doctor>): Promise<Doctor | nu
 // ==========================================
 // APPOINTMENTS & LIVE QUEUE API
 // ==========================================
-function formatTimeForPostgres(timeStr?: string): string {
+export function formatTimeForPostgres(timeStr?: string): string {
   if (!timeStr) return '10:00:00'
-  const clean = timeStr.trim().toUpperCase()
+  const firstPart = timeStr.split(/\s*[-–—]|to\s*/i)[0].trim()
+  const clean = firstPart.toUpperCase()
   const isPM = clean.includes('PM')
   const isAM = clean.includes('AM')
   const timeOnly = clean.replace(/[^0-9:]/g, '')
@@ -283,11 +287,14 @@ function normalizePaymentStatus(status?: string): 'pending' | 'paid' | 'refunded
 export async function getAppointmentByTrackingCode(code: string): Promise<Appointment | null> {
   try {
     const cleanCode = code.trim()
+    if (!cleanCode) return null
     const { data, error } = await supabase
       .from('appointments')
       .select('*, clinic:clinics(*), doctor:doctors(*), queue_entries(*)')
       .eq('tracking_code_10_digit', cleanCode)
-      .single()
+      .order('appointment_date', { ascending: false })
+      .limit(1)
+      .maybeSingle()
 
     if (error) return null
     return data ? mapAppointment(data) : null
@@ -296,10 +303,38 @@ export async function getAppointmentByTrackingCode(code: string): Promise<Appoin
   }
 }
 
+export async function getAllAppointmentsByTrackingCode(code: string): Promise<Appointment[]> {
+  try {
+    const cleanCode = code.trim()
+    if (!cleanCode) return []
+    const { data, error } = await supabase
+      .from('appointments')
+      .select('*, clinic:clinics(*), doctor:doctors(*), queue_entries(*)')
+      .eq('tracking_code_10_digit', cleanCode)
+      .order('appointment_date', { ascending: false })
+
+    if (error || !data) return []
+    return data.map(mapAppointment)
+  } catch {
+    return []
+  }
+}
+
 export async function getAppointmentByTrackingCodeOrContact(identifier: string): Promise<Appointment | null> {
   try {
     const clean = identifier.trim()
     if (!clean) return null
+
+    // 0. Try UUID directly if format matches
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    if (uuidRegex.test(clean)) {
+      const { data, error } = await supabase
+        .from('appointments')
+        .select('*, clinic:clinics(*), doctor:doctors(*), queue_entries(*)')
+        .eq('id', clean)
+        .maybeSingle()
+      if (!error && data) return mapAppointment(data)
+    }
 
     // 1. Try 10-digit code directly
     if (/^\d{10}$/.test(clean)) {
@@ -343,6 +378,115 @@ export async function getAppointmentByTrackingCodeOrContact(identifier: string):
     return await getAppointmentByTrackingCode(clean)
   } catch {
     return null
+  }
+}
+
+export interface LinkedConsultationsResult {
+  targetAppointment: Appointment | null
+  initialAppointment: Appointment | null
+  followupAppointment: Appointment | null
+  allConsultations: Appointment[]
+  invoices: Record<string, BillingInvoice | null>
+  isLinked: boolean
+}
+
+export async function getLinkedConsultations(appointmentIdOrCode: string): Promise<LinkedConsultationsResult> {
+  const result: LinkedConsultationsResult = {
+    targetAppointment: null,
+    initialAppointment: null,
+    followupAppointment: null,
+    allConsultations: [],
+    invoices: {},
+    isLinked: false,
+  }
+
+  try {
+    const target = await getAppointmentByTrackingCodeOrContact(appointmentIdOrCode)
+    if (!target) return result
+
+    result.targetAppointment = target
+    const relatedAppts: Appointment[] = [target]
+
+    // 1. Check if target notes contain a previous tracking code reference e.g. "Previous Code: #4829104812" or "Ref: #4829104812"
+    let previousCode: string | null = null
+    if (target.notes) {
+      const match = target.notes.match(/(?:Previous Code|Previous Ref|Ref):\s*#?([A-Za-z0-9]{6,12})/i)
+      if (match && match[1]) {
+        previousCode = match[1].trim()
+      }
+    }
+
+    if (previousCode && previousCode !== target.trackingCode10Digit) {
+      const prevAppt = await getAppointmentByTrackingCode(previousCode)
+      if (prevAppt && !relatedAppts.some((a) => a.id === prevAppt.id)) {
+        relatedAppts.push(prevAppt)
+      }
+    }
+
+    // 2. Fetch other visits for this patient at the same clinic
+    if (target.clinicId && (target.patientMobile || target.userId)) {
+      let query = supabase
+        .from('appointments')
+        .select('*, doctor:doctors(*), clinic:clinics(*), queue_entries(*)')
+        .eq('clinic_id', target.clinicId)
+
+      if (target.patientMobile) {
+        query = query.eq('patient_mobile', target.patientMobile)
+      } else if (target.userId) {
+        query = query.eq('user_id', target.userId)
+      }
+
+      const { data: siblings } = await query.order('appointment_date', { ascending: true })
+      if (siblings && siblings.length > 0) {
+        for (const s of siblings) {
+          const mapped = mapAppointment(s)
+          if (!relatedAppts.some((a) => a.id === mapped.id)) {
+            relatedAppts.push(mapped)
+          }
+        }
+      }
+    }
+
+    // 3. Sort chronologically (date, time, createdAt)
+    relatedAppts.sort((a, b) => {
+      const dateA = `${a.appointmentDate} ${a.appointmentTime || '00:00'}`
+      const dateB = `${b.appointmentDate} ${b.appointmentTime || '00:00'}`
+      return dateA.localeCompare(dateB)
+    })
+
+    result.allConsultations = relatedAppts
+    result.isLinked = relatedAppts.length > 1 || Boolean(previousCode)
+
+    if (relatedAppts.length > 1) {
+      // Index 0 is the initial consultation, latest is followup
+      result.initialAppointment = relatedAppts[0]
+      result.followupAppointment = relatedAppts[relatedAppts.length - 1]
+    } else if (target.notes && (target.notes.toLowerCase().includes('follow-up') || target.notes.toLowerCase().includes('previous code'))) {
+      result.followupAppointment = target
+      result.isLinked = true
+    } else {
+      result.initialAppointment = target
+    }
+
+    // 4. Fetch billing invoices for all linked appointments
+    const apptIds = relatedAppts.map((a) => a.id).filter(Boolean)
+    if (apptIds.length > 0) {
+      const { data: invData } = await supabase
+        .from('billing_invoices')
+        .select('*')
+        .in('appointment_id', apptIds)
+
+      if (invData && invData.length > 0) {
+        for (const inv of invData) {
+          result.invoices[inv.appointment_id] = mapBillingInvoice(inv)
+        }
+      }
+    }
+
+    return result
+  } catch (err) {
+    console.error('Error fetching linked consultations:', err)
+    return result
   }
 }
 
@@ -459,7 +603,15 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
 
     try {
       let existingProf: any = null
-      if (cleanEmail) {
+      if (resolvedUserId) {
+        const { data: profById } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', resolvedUserId)
+          .maybeSingle()
+        if (profById) existingProf = profById
+      }
+      if (!existingProf && cleanEmail) {
         const { data } = await supabase
           .from('profiles')
           .select('*')
@@ -487,13 +639,13 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
           updatePayload.updated_at = new Date().toISOString()
           await supabase.from('profiles').update(updatePayload).eq('id', existingProf.id)
         }
-      } else {
+      } else if (cleanEmail) {
         const newProfId = resolvedUserId || crypto.randomUUID()
         const newProfile: any = {
           id: newProfId,
           full_name: patientNameClean,
           email: cleanEmail,
-          phone: cleanMobile,
+          phone: cleanMobile || null,
           age: Number(appt.patientAge) || null,
           gender: appt.patientGender || null,
           role: 'patient',
@@ -503,11 +655,22 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
         const { data: createdProf, error: profErr } = await supabase.from('profiles').insert(newProfile).select().single()
         if (!profErr && createdProf) {
           resolvedUserId = createdProf.id
+        } else {
+          resolvedUserId = null
         }
+      } else {
+        // Guest or unauthenticated patient without email: profiles.email has a NOT NULL constraint, fallback to null
+        resolvedUserId = null
       }
     } catch (profErr) {
       console.warn('Patient directory profile link note:', profErr)
+      resolvedUserId = null
     }
+
+    const isPayAtDesk = appt.paymentMode === 'PAY_AT_DESK'
+    const fee = Number(appt.feeAmount) || 0
+    const serviceCharge = isPayAtDesk ? Number((fee * 0.05).toFixed(2)) : 0
+    const totalAmt = isPayAtDesk ? fee + serviceCharge : fee
 
     const dbPayload: any = {
       id: apptId,
@@ -522,9 +685,14 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
       patient_email: cleanEmail,
       appointment_date: apptDate,
       appointment_time: apptTime,
-      checkin_status: 'checked_in',
-      payment_status: normalizePaymentStatus(appt.paymentStatus),
-      fee_amount: Number(appt.feeAmount) || 0,
+      checkin_status: isPayAtDesk ? 'not_checked_in' : 'checked_in',
+      payment_status: isPayAtDesk ? 'pending' : normalizePaymentStatus(appt.paymentStatus),
+      payment_mode: isPayAtDesk ? 'PAY_AT_DESK' : 'ONLINE',
+      status: isPayAtDesk ? 'WAITING_FOR_APPROVAL' : 'APPROVED',
+      attempt_number: 1,
+      service_charge_amount: serviceCharge,
+      total_amount: totalAmt,
+      fee_amount: fee,
       is_walkin: isWalkin,
       slot_id: appt.slotId || null,
     }
@@ -536,6 +704,11 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
       .single()
 
     if (error) throw error
+
+    // Pay at Desk appointments MUST NOT be enrolled into live queue or count towards slot capacity until approved
+    if (isPayAtDesk) {
+      return mapAppointment(data)
+    }
 
     // Enroll into live queue_entries with slot-aware ordering:
     // Place walk-in / appointment at the LAST position of their time slot, and shift later appointments (+1)
@@ -750,7 +923,7 @@ export async function updateAppointmentStatus(id: string, status: string): Promi
     try {
       const { data: targetAppt } = await supabase
         .from('appointments')
-        .select('id, user_id, clinic_id, tracking_code_10_digit, patient_name, clinics(name)')
+        .select('id, user_id, clinic_id, doctor_id, tracking_code_10_digit, patient_name, clinics(name)')
         .eq('id', id)
         .maybeSingle()
 
@@ -789,6 +962,11 @@ export async function updateAppointmentStatus(id: string, status: string): Promi
             meta_json: JSON.stringify({ tracking_code: code10, status: qStatus }),
             created_at: nowIso,
           })
+        }
+
+        // Dynamically reindex live queue: person inside becomes Turn 1, waiting patients align behind
+        if (targetAppt.clinic_id) {
+          await reindexActiveQueue(targetAppt.clinic_id, (targetAppt as any).doctor_id)
         }
 
         // When a patient enters cabin or completes, notify approaching patients in queue
@@ -884,7 +1062,6 @@ export async function createSlot(slot: Partial<Slot>): Promise<Slot | null> {
       max_capacity: slot.maxCapacity || 10,
       booked_count: slot.bookedCount || 0,
       is_published: slot.isPublished ?? true,
-      is_available: slot.isAvailable ?? true,
     }
 
     const { data, error } = await supabase
@@ -893,9 +1070,13 @@ export async function createSlot(slot: Partial<Slot>): Promise<Slot | null> {
       .select()
       .single()
 
-    if (error) throw error
+    if (error) {
+      console.error('Error creating slot in Supabase:', error)
+      throw error
+    }
     return data ? mapSlot(data) : null
-  } catch {
+  } catch (err) {
+    console.error('Failed to create slot:', err)
     return null
   }
 }
@@ -1001,20 +1182,91 @@ export async function reorderQueuePosition(
   }
 }
 
+export async function reindexActiveQueue(
+  clinicId: string,
+  doctorId?: string | null
+): Promise<boolean> {
+  try {
+    let query = supabase
+      .from('queue_entries')
+      .select('id, appointment_id, clinic_id, doctor_id, queue_position, status, appointments(appointment_time)')
+      .eq('clinic_id', clinicId)
+      .in('status', ['waiting', 'inside'])
+
+    if (doctorId) {
+      query = query.eq('doctor_id', doctorId)
+    }
+
+    const { data: entries, error } = await query
+    if (error || !entries || entries.length === 0) return true
+
+    // Group by doctorId if doctorId was not explicitly provided to partition per doctor's cabin
+    const groups: Record<string, typeof entries> = {}
+    for (const entry of entries) {
+      const key = entry.doctor_id || '__clinic__'
+      if (!groups[key]) groups[key] = []
+      groups[key].push(entry)
+    }
+
+    for (const key of Object.keys(groups)) {
+      const group = groups[key]
+      // Sort: inside (0) vs waiting (1), then chronological appointment_time, then existing queue_position
+      group.sort((a, b) => {
+        const aInside = a.status === 'inside' ? 0 : 1
+        const bInside = b.status === 'inside' ? 0 : 1
+        if (aInside !== bInside) return aInside - bInside
+
+        const aTime = (a.appointments as any)?.appointment_time || ''
+        const bTime = (b.appointments as any)?.appointment_time || ''
+        if (aTime && bTime && aTime !== bTime) {
+          return aTime.localeCompare(bTime)
+        }
+        return (a.queue_position || 0) - (b.queue_position || 0)
+      })
+
+      // Two-pass update with negative offsets to avoid unique constraint collisions
+      for (let i = 0; i < group.length; i++) {
+        await supabase
+          .from('queue_entries')
+          .update({ queue_position: -((group[i].queue_position || 0) + 10000), updated_at: new Date().toISOString() })
+          .eq('id', group[i].id)
+      }
+
+      for (let i = 0; i < group.length; i++) {
+        await supabase
+          .from('queue_entries')
+          .update({ queue_position: i + 1, updated_at: new Date().toISOString() })
+          .eq('id', group[i].id)
+      }
+    }
+    return true
+  } catch (err) {
+    console.error('Error reindexing active queue:', err)
+    return false
+  }
+}
+
 export async function shiftAppointmentDate(
   appointmentId: string,
   newDate: string,
   newTime?: string,
-  reason?: string
+  reason?: string,
+  newSlotId?: string
 ): Promise<boolean> {
   try {
     const updatePayload: any = {
       appointment_date: newDate,
-      checkin_status: 'waiting',
+      checkin_status: 'checked_in',
       updated_at: new Date().toISOString(),
     }
     if (newTime) {
       updatePayload.appointment_time = newTime
+    }
+    if (newSlotId) {
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      if (uuidRegex.test(newSlotId.trim())) {
+        updatePayload.slot_id = newSlotId.trim()
+      }
     }
 
     const { data: updatedAppt, error } = await supabase
@@ -1026,7 +1278,7 @@ export async function shiftAppointmentDate(
 
     if (error) throw error
 
-    // Manage Queue Entry on Reschedule
+    // Manage Queue Entry on Reschedule / Follow-Up
     try {
       const todayStr = new Date().toISOString().split('T')[0]
       const targetTime = newTime || updatedAppt?.appointment_time
@@ -1039,7 +1291,7 @@ export async function shiftAppointmentDate(
         .maybeSingle()
 
       if (newDate === todayStr) {
-        // Patient rescheduled to today: reposition slot-aware
+        // Patient rescheduled/follow-up to today: reposition slot-aware
         const { data: activeEntries } = await supabase
           .from('queue_entries')
           .select('id, appointment_id, queue_position, status')
@@ -1081,6 +1333,8 @@ export async function shiftAppointmentDate(
             .update({
               queue_position: nextPos,
               status: 'waiting',
+              called_at: null,
+              completed_at: null,
               updated_at: new Date().toISOString(),
             })
             .eq('id', existingQ.id)
@@ -1095,11 +1349,11 @@ export async function shiftAppointmentDate(
           })
         }
       } else {
-        // Rescheduled to a future date: remove from today's active queue
+        // Rescheduled / follow-up to a future date: remove from today's active queue
         if (existingQ) {
           await supabase
             .from('queue_entries')
-            .update({ status: 'scheduled', updated_at: new Date().toISOString() })
+            .delete()
             .eq('id', existingQ.id)
         }
       }
@@ -1423,14 +1677,19 @@ export async function getPatientNotifications(criteria?: {
     const hasPersonalFilter = Boolean(userId || apptSet.size > 0 || codeSet.size > 0)
 
     const filtered = rows.filter((n: any) => {
-      if (n.target_audience === 'all_users' || n.type === 'clinic_broadcast') {
+      // 1. General system announcements and broadcasts intended for everyone
+      if (n.target_audience === 'all_users' || n.type === 'broadcast' || n.type === 'system_announcement' || n.type === 'clinic_broadcast') {
         return true
       }
+      // 2. If the user is an anonymous guest with no account or tracked codes, NEVER leak personal notifications
       if (!hasPersonalFilter) {
-        return true
+        return false
       }
+      // 3. Match authenticated user ID
       if (userId && n.user_id === userId) return true
+      // 4. Match specific appointment ID
       if (n.appointment_id && apptSet.has(n.appointment_id)) return true
+      // 5. Match specific 10-digit tracking codes in title, message or meta
       const text = `${n.title || ''} ${n.message || ''} ${n.meta_json || ''}`
       for (const code of codeSet) {
         if (code && text.includes(code)) return true
@@ -1578,17 +1837,43 @@ export async function saveOrUpdateInvoicePayment(params: {
     const finalRemarks = buildCombinedRemarks(combinedRemarksWithReceipt, updatedPayments)
 
     const itemsToSave = params.items && params.items.length > 0
-      ? params.items.map((it) => ({
-          itemName: it.itemName || it.name || 'Clinical Service',
-          quantity: Number(it.quantity || 1),
-          price: Number(it.price || 0),
-          total: Number(it.total || (Number(it.price || 0) * Number(it.quantity || 1))),
-        }))
+      ? params.items.map((it) => {
+          const name = it.name || it.itemName || (it as any).item_name || 'Clinical Service'
+          const qty = Number(it.quantity || 1)
+          const pr = Number(it.price || 0)
+          const tot = Number(it.total || pr * qty)
+          return {
+            id: it.id || crypto.randomUUID(),
+            item_name: name,
+            itemName: name,
+            name: name,
+            quantity: qty,
+            price: pr,
+            total: tot,
+          }
+        })
       : (Array.isArray(existing?.items) && existing.items.length > 0
-          ? existing.items
+          ? existing.items.map((it: any) => {
+              const name = it.item_name || it.itemName || it.name || 'Clinical Service'
+              const qty = Number(it.quantity || 1)
+              const pr = Number(it.price || 0)
+              const tot = Number(it.total || pr * qty)
+              return {
+                id: it.id || crypto.randomUUID(),
+                item_name: name,
+                itemName: name,
+                name: name,
+                quantity: qty,
+                price: pr,
+                total: tot,
+              }
+            })
           : [
               {
+                id: crypto.randomUUID(),
+                item_name: 'Consultation & Clinical Services',
                 itemName: 'Consultation & Clinical Services',
+                name: 'Consultation & Clinical Services',
                 quantity: 1,
                 price: totalAmount,
                 total: totalAmount,
@@ -1596,42 +1881,100 @@ export async function saveOrUpdateInvoicePayment(params: {
             ])
 
     const balanceDue = Math.max(0, totalAmount - calculatedTotalPaid)
-    const dbPaymentStatus = (calculatedTotalPaid >= totalAmount && totalAmount > 0) ? 'paid' : (calculatedTotalPaid > 0 ? 'partial' : 'pending')
+    // PostgreSQL payment_status_enum accepts 'paid' or 'pending' natively
+    const dbPaymentStatus = (calculatedTotalPaid >= totalAmount && totalAmount > 0) ? 'paid' : 'pending'
 
-    const invoicePayload: any = {
-      id: existing?.id || crypto.randomUUID(),
-      appointment_id: appointmentId,
-      clinic_id: clinicId,
-      items: itemsToSave,
-      total_amount: totalAmount,
-      paid_amount: calculatedTotalPaid,
-      balance_due: balanceDue,
-      payment_status: dbPaymentStatus,
-      paid_at: calculatedTotalPaid > 0 ? (existing?.paid_at || nowIso) : null,
-      remarks: finalRemarks,
-      created_at: existing?.created_at || nowIso,
-      updated_at: nowIso,
+    let savedData: any = null
+
+    if (existing?.id) {
+      // Update existing invoice without mutating primary key id or appointment_id
+      const { data, error } = await supabase
+        .from('billing_invoices')
+        .update({
+          items: itemsToSave,
+          total_amount: totalAmount,
+          paid_amount: calculatedTotalPaid,
+          balance_due: balanceDue,
+          payment_status: dbPaymentStatus,
+          paid_at: calculatedTotalPaid > 0 ? (existing.paid_at || nowIso) : null,
+          remarks: finalRemarks,
+          updated_at: nowIso,
+        })
+        .eq('id', existing.id)
+        .select()
+        .maybeSingle()
+
+      if (error) {
+        console.error('Supabase billing_invoices update failed:', error)
+        throw error
+      }
+      savedData = data
+    } else {
+      // Insert new invoice record
+      const newInvoiceId = crypto.randomUUID()
+      const { data, error } = await supabase
+        .from('billing_invoices')
+        .insert({
+          id: newInvoiceId,
+          appointment_id: appointmentId,
+          clinic_id: clinicId,
+          items: itemsToSave,
+          total_amount: totalAmount,
+          paid_amount: calculatedTotalPaid,
+          balance_due: balanceDue,
+          payment_status: dbPaymentStatus,
+          paid_at: calculatedTotalPaid > 0 ? nowIso : null,
+          remarks: finalRemarks,
+          created_at: nowIso,
+          updated_at: nowIso,
+        })
+        .select()
+        .maybeSingle()
+
+      if (error) {
+        // Fallback: row might already exist for this appointment_id
+        console.warn('Insert encountered error, falling back to update by appointment_id:', error.message)
+        const { data: updateFallback, error: updateErr } = await supabase
+          .from('billing_invoices')
+          .update({
+            items: itemsToSave,
+            total_amount: totalAmount,
+            paid_amount: calculatedTotalPaid,
+            balance_due: balanceDue,
+            payment_status: dbPaymentStatus,
+            paid_at: calculatedTotalPaid > 0 ? nowIso : null,
+            remarks: finalRemarks,
+            updated_at: nowIso,
+          })
+          .eq('appointment_id', appointmentId)
+          .select()
+          .maybeSingle()
+
+        if (updateErr) {
+          console.error('Supabase billing_invoices fallback update failed:', updateErr)
+          throw updateErr
+        }
+        savedData = updateFallback
+      } else {
+        savedData = data
+      }
     }
 
-    const { data, error } = await supabase
-      .from('billing_invoices')
-      .upsert(invoicePayload, { onConflict: 'appointment_id' })
-      .select()
-      .single()
+    // Also update the appointment fee_amount and payment_status safely
+    try {
+      await supabase
+        .from('appointments')
+        .update({
+          fee_amount: totalAmount,
+          payment_status: dbPaymentStatus,
+          updated_at: nowIso,
+        })
+        .eq('id', appointmentId)
+    } catch (apptErr) {
+      console.warn('Could not sync fee_amount to appointments table:', apptErr)
+    }
 
-    if (error) throw error
-
-    // Also update the appointment fee_amount and payment_status
-    await supabase
-      .from('appointments')
-      .update({
-        fee_amount: totalAmount,
-        payment_status: dbPaymentStatus,
-        updated_at: nowIso,
-      })
-      .eq('id', appointmentId)
-
-    return data ? mapBillingInvoice(data) : null
+    return savedData ? mapBillingInvoice(savedData) : null
   } catch (err) {
     console.error('Error saving billing invoice:', err)
     return null
@@ -1655,29 +1998,230 @@ export async function uploadReceiptFile(fileName: string, fileBlob: Blob): Promi
   }
 }
 
-export async function updateDoctorPresence(doctorId: string, isInClinic: boolean): Promise<boolean> {
+const lastPresenceBroadcastMap = new Map<string, { isInClinic: boolean; timestamp: number }>()
+
+export async function notifyDoctorPresenceToPatients(
+  doctorId: string,
+  isInClinic: boolean,
+  clinicId?: string
+): Promise<number> {
   try {
+    // 60-second cooldown per doctor per presence state
+    const now = Date.now()
+    const last = lastPresenceBroadcastMap.get(doctorId)
+    if (last && last.isInClinic === isInClinic && now - last.timestamp < 60_000) {
+      return 0
+    }
+    lastPresenceBroadcastMap.set(doctorId, { isInClinic, timestamp: now })
+
+    const { data: doc } = await supabase
+      .from('doctors')
+      .select('full_name, active_clinic_id, clinic_id')
+      .eq('id', doctorId)
+      .single()
+
+    const doctorName = doc?.full_name?.trim() || 'Doctor'
+    const targetClinicId = clinicId || doc?.active_clinic_id || doc?.clinic_id
+
+    let clinicName = 'the clinic'
+    if (targetClinicId) {
+      const { data: clinic } = await supabase.from('clinics').select('name').eq('id', targetClinicId).single()
+      if (clinic?.name) {
+        clinicName = clinic.name.trim()
+      }
+    }
+
+    const today = new Date().toISOString().split('T')[0]
+    const { data: appts, error } = await supabase
+      .from('appointments')
+      .select('id, user_id, patient_name, tracking_code_10_digit, checkin_status')
+      .eq('doctor_id', doctorId)
+      .eq('appointment_date', today)
+
+    if (error || !appts || appts.length === 0) return 0
+
+    const waitingAppts = appts.filter(a => {
+      const st = (a.checkin_status || '').toLowerCase()
+      return ['waiting', 'checked_in', 'booked', 'inside', 'pending'].includes(st)
+    })
+
+    if (waitingAppts.length === 0) return 0
+
+    const title = isInClinic
+      ? `🩺 Dr. ${doctorName} Has Arrived!`
+      : `⏳ Dr. ${doctorName} Temporarily Stepped Out`
+
+    const notifType = isInClinic ? 'doctor_arrival' : 'doctor_status'
+    let sentCount = 0
+
+    for (const appt of waitingAppts) {
+      const pName = appt.patient_name || 'Patient'
+      const code = appt.tracking_code_10_digit || ''
+      const cleanBody = isInClinic
+        ? `Hi ${pName}, Dr. ${doctorName} has arrived at ${clinicName}! OPD consultations are starting now. Please check your live queue position and be near the clinic.`
+        : `Hi ${pName}, Dr. ${doctorName} has temporarily stepped out from ${clinicName}. Consultations are briefly paused and will resume shortly.`
+
+      const leftLabel = 'Doctor Status'
+      const leftVal = isInClinic ? 'In Clinic • Active' : 'Briefly Away'
+      const rightLabel = isInClinic ? 'Live Queue' : 'Queue Status'
+      const rightVal = isInClinic ? 'Consultations Started' : 'Briefly Paused'
+      const codePart = code ? `|code=${code}|trackingCode=${code}` : ''
+
+      const taggedMessage = `${cleanBody}\n[[META:leftLabel=${leftLabel}|leftVal=${leftVal}|rightLabel=${rightLabel}|rightVal=${rightVal}${codePart}]]`
+
+      const { error: insertErr } = await supabase.from('notifications').insert({
+        id: crypto.randomUUID(),
+        appointment_id: appt.id && appt.id.length === 36 ? appt.id : null,
+        user_id: appt.user_id && appt.user_id.length === 36 ? appt.user_id : null,
+        title,
+        message: taggedMessage,
+        type: notifType,
+        target_audience: 'specific',
+        is_read: false,
+        created_at: new Date().toISOString(),
+      })
+
+      if (!insertErr) {
+        sentCount++
+        try {
+          supabase.functions.invoke('send-fcm-alert', {
+            body: {
+              title: title.trim(),
+              message: cleanBody,
+              appointmentId: appt.id || undefined,
+              trackingCode: code || undefined,
+              userId: appt.user_id || undefined,
+              type: notifType,
+            },
+          }).catch(() => {})
+        } catch {}
+      }
+    }
+
+    return sentCount
+  } catch (err) {
+    console.error('Error broadcasting doctor presence:', err)
+    return 0
+  }
+}
+
+export async function updateDoctorPresence(doctorId: string, isInClinic: boolean, clinicId?: string): Promise<boolean> {
+  try {
+    const updatePayload: Record<string, any> = { is_in_clinic: isInClinic }
+    if (isInClinic && clinicId) {
+      updatePayload.active_clinic_id = clinicId
+      updatePayload.clinic_id = clinicId
+    } else if (!isInClinic) {
+      updatePayload.active_clinic_id = null
+    }
+
     const { error } = await supabase
       .from('doctors')
-      .update({ is_in_clinic: isInClinic })
+      .update(updatePayload)
       .eq('id', doctorId)
+
+    if (!error) {
+      notifyDoctorPresenceToPatients(doctorId, isInClinic, clinicId).catch(console.error)
+    }
+
     return !error
   } catch {
     return false
   }
 }
 
-export async function updateClinicBreak(clinicId: string, isOnBreak: boolean): Promise<boolean> {
+export async function sendClinicBreakToLiveQueue(
+  clinicId: string,
+  breakWindowText?: string
+): Promise<number> {
+  try {
+    const { data: clinic } = await supabase
+      .from('clinics')
+      .select('name')
+      .eq('id', clinicId)
+      .single()
+
+    const clinicName = clinic?.name?.trim() || 'the clinic'
+    const today = new Date().toISOString().split('T')[0]
+
+    // Query appointments for this clinic on today's date ONLY
+    const { data: appts, error } = await supabase
+      .from('appointments')
+      .select('id, user_id, patient_name, tracking_code_10_digit, checkin_status, appointment_time')
+      .eq('clinic_id', clinicId)
+      .eq('appointment_date', today)
+
+    if (error || !appts || appts.length === 0) return 0
+
+    // Filter strictly to live queue patients (waiting, checked_in, inside)
+    // Completed, done, finished, cancelled, no_show are strictly excluded!
+    const liveQueueAppts = appts.filter(a => {
+      const st = (a.checkin_status || '').toLowerCase()
+      return ['waiting', 'checked_in', 'inside'].includes(st)
+    })
+
+    if (liveQueueAppts.length === 0) return 0
+
+    const title = `${clinicName} is Currently on Break`
+    const breakInfo = breakWindowText ? ` (${breakWindowText})` : ''
+    let sentCount = 0
+
+    for (const appt of liveQueueAppts) {
+      const pName = appt.patient_name || 'Patient'
+      const code = appt.tracking_code_10_digit || ''
+      const cleanBody = `Hi ${pName}, ${clinicName} is currently on a short break${breakInfo}. Queue movement is paused and your consultation will resume shortly.`
+
+      const leftLabel = 'Estimated Time Left'
+      const leftVal = 'Clinic on Break'
+      const rightLabel = 'Your Appointment Time'
+      const rightVal = breakWindowText || appt.appointment_time || 'Paused Briefly'
+      const codePart = code ? `|code=${code}|trackingCode=${code}` : ''
+
+      const taggedMessage = `${cleanBody}\n[[META:leftLabel=${leftLabel}|leftVal=${leftVal}|rightLabel=${rightLabel}|rightVal=${rightVal}${codePart}]]`
+
+      const { error: insertErr } = await supabase.from('notifications').insert({
+        id: crypto.randomUUID(),
+        appointment_id: appt.id && appt.id.length === 36 ? appt.id : null,
+        user_id: appt.user_id && appt.user_id.length === 36 ? appt.user_id : null,
+        title,
+        message: taggedMessage,
+        type: 'clinic_break',
+        target_audience: 'specific',
+        is_read: false,
+        created_at: new Date().toISOString(),
+      })
+
+      if (!insertErr) {
+        sentCount++
+        try {
+          supabase.functions.invoke('send-fcm-alert', {
+            body: {
+              title: title.trim(),
+              message: cleanBody,
+              appointmentId: appt.id || undefined,
+              trackingCode: code || undefined,
+              userId: appt.user_id || undefined,
+              type: 'clinic_break',
+            },
+          }).catch(() => {})
+        } catch {}
+      }
+    }
+
+    return sentCount
+  } catch (err) {
+    console.error('Error sending clinic break to live queue:', err)
+    return 0
+  }
+}
+
+export async function updateClinicBreak(clinicId: string, isOnBreak: boolean, breakWindowText?: string): Promise<boolean> {
   const ok = await updateClinic(clinicId, {
     isOnBreak,
     breakUpdatedAt: new Date().toISOString(),
   })
   if (ok && isOnBreak) {
-    await sendBroadcastNotification(
-      clinicId,
-      'Clinic is Currently on a Break',
-      'The clinic is temporarily on break. Queue consultations are paused and will resume shortly.'
-    )
+    sendClinicBreakToLiveQueue(clinicId, breakWindowText).catch(console.error)
   }
   return ok
 }
@@ -1715,7 +2259,10 @@ export async function updateClinic(id: string, updates: Partial<Clinic>): Promis
       deletion_scheduled_at: updates.deletionScheduledAt !== undefined ? updates.deletionScheduledAt : (currentMeta.deletion_scheduled_at ?? current?.deletion_scheduled_at),
       payment_gateway_provider: updates.paymentGatewayProvider !== undefined ? updates.paymentGatewayProvider : (currentMeta.payment_gateway_provider ?? current?.payment_gateway_provider),
       payment_api_key: updates.paymentApiKey !== undefined ? updates.paymentApiKey : (currentMeta.payment_api_key ?? current?.payment_api_key),
-      payment_secret_key: updates.paymentSecretKey !== undefined ? updates.paymentSecretKey : (currentMeta.payment_secret_key ?? current?.payment_secret_key),
+      // eSewa secrets are strictly stored server-side in clinic_payment_credentials, never in public description JSON
+      payment_secret_key: (updates.paymentGatewayProvider === 'esewa' || currentMeta.payment_gateway_provider === 'esewa' || current?.payment_gateway_provider === 'esewa')
+        ? undefined
+        : (updates.paymentSecretKey !== undefined ? updates.paymentSecretKey : (currentMeta.payment_secret_key ?? current?.payment_secret_key)),
       merchant_id: updates.merchantId !== undefined ? updates.merchantId : (currentMeta.merchant_id ?? current?.merchant_id),
       is_direct_payment_enabled: updates.isDirectPaymentEnabled !== undefined ? updates.isDirectPaymentEnabled : (currentMeta.is_direct_payment_enabled ?? current?.is_direct_payment_enabled),
     }
@@ -1754,7 +2301,8 @@ export async function updateClinic(id: string, updates: Partial<Clinic>): Promis
     if (updates.deletionScheduledAt !== undefined) payload.deletion_scheduled_at = updates.deletionScheduledAt
     if (updates.paymentGatewayProvider !== undefined) payload.payment_gateway_provider = updates.paymentGatewayProvider
     if (updates.paymentApiKey !== undefined) payload.payment_api_key = updates.paymentApiKey
-    if (updates.paymentSecretKey !== undefined) payload.payment_secret_key = updates.paymentSecretKey
+    const isEsewaProviderUpdate = updates.paymentGatewayProvider === 'esewa' || currentMeta.payment_gateway_provider === 'esewa' || current?.payment_gateway_provider === 'esewa'
+    if (updates.paymentSecretKey !== undefined && !isEsewaProviderUpdate) payload.payment_secret_key = updates.paymentSecretKey
     if (updates.merchantId !== undefined) payload.merchant_id = updates.merchantId
     if (updates.isDirectPaymentEnabled !== undefined) payload.is_direct_payment_enabled = updates.isDirectPaymentEnabled
 
@@ -1809,6 +2357,9 @@ export async function updateDoctor(doctorId: string, updates: Partial<Doctor>): 
     if (updates.profilePictureUrl !== undefined) payload.profile_picture_url = updates.profilePictureUrl
 
     const { error } = await supabase.from('doctors').update(payload).eq('id', doctorId)
+    if (!error && updates.isInClinic !== undefined) {
+      notifyDoctorPresenceToPatients(doctorId, updates.isInClinic, updates.clinicId || updates.activeClinicId).catch(console.error)
+    }
     return !error
   } catch {
     return false
@@ -1819,29 +2370,56 @@ export async function sendManualNotification(
   appointmentId: string,
   title: string,
   message: string,
-  _estimatedTimeLeft?: string,
-  _expectedTime?: string,
-  _trackingCode?: string,
+  estimatedTimeLeft?: string,
+  expectedTime?: string,
+  trackingCode?: string,
   userId?: string,
   _clinicId?: string
 ): Promise<boolean> {
   try {
+    const cleanBody = message.replace(/\[\[META:.*?\]\]/g, '').trim()
+    const pos = (estimatedTimeLeft || '').replace(/[|\]]/g, '').trim()
+    const expected = (expectedTime || '').replace(/[|\]]/g, '').trim()
+    const code = (trackingCode || '').replace(/[|\]]/g, '').trim()
+
+    let taggedMessage = cleanBody
+    if (code || pos || expected) {
+      taggedMessage = `${cleanBody}\n[[META:trackingCode=${code}|pos=${pos}|expected=${expected}|code=${code}|leftLabel=Est. Time|leftVal=${pos || 'Soon'}|rightLabel=Expected|rightVal=${expected || 'Queue Active'}]]`
+    }
+
     const { error } = await supabase.from('notifications').insert({
       id: crypto.randomUUID(),
       appointment_id: appointmentId && appointmentId.length === 36 ? appointmentId : null,
       user_id: userId && userId.length === 36 ? userId : null,
       title: title.trim(),
-      message: message.trim(),
+      message: taggedMessage,
       type: 'queue_alert',
       target_audience: 'specific',
       is_read: false,
       created_at: new Date().toISOString(),
     })
+
+    if (!error) {
+      try {
+        supabase.functions.invoke('send-fcm-alert', {
+          body: {
+            title: title.trim(),
+            message: cleanBody,
+            appointmentId: appointmentId || undefined,
+            trackingCode: code || undefined,
+            userId: userId || undefined,
+            type: 'queue_alert',
+          },
+        }).catch(() => {})
+      } catch {}
+    }
+
     return !error
   } catch {
     return false
   }
 }
+
 
 export async function sendEarlyArrivalInviteNotification(
   appointmentId: string,
@@ -1869,18 +2447,39 @@ export async function sendEarlyArrivalInvite(params: {
   try {
     const title = '⚡ Doctor is Free Now! Come in early?'
     const slotText = params.originalSlot ? ` (Booked slot: ${params.originalSlot})` : ''
-    const message = `Dear ${params.patientName}, the doctor has finished consultations earlier than scheduled. Since you opted in for early calls, you are welcome to come in early now!${slotText}`
+    const cleanBody = `Dear ${params.patientName}, the doctor has finished consultations earlier than scheduled. Since you opted in for early calls, you are welcome to come in early now!${slotText}`
+    const code = params.trackingCode ? params.trackingCode.replace(/[|\]]/g, '').trim() : ''
+    const taggedMessage = code
+      ? `${cleanBody}\n[[META:trackingCode=${code}|code=${code}|leftLabel=Early Call|leftVal=Doctor Free|rightLabel=Slot|rightVal=${params.originalSlot || 'Now'}]]`
+      : cleanBody
+
     const { error } = await supabase.from('notifications').insert({
       id: crypto.randomUUID(),
       appointment_id: params.appointmentId && params.appointmentId.length === 36 ? params.appointmentId : null,
       user_id: params.userId && params.userId.length === 36 ? params.userId : null,
       title,
-      message,
+      message: taggedMessage,
       type: 'early_arrival',
       target_audience: 'specific',
       is_read: false,
       created_at: new Date().toISOString(),
     })
+
+    if (!error) {
+      try {
+        supabase.functions.invoke('send-fcm-alert', {
+          body: {
+            title: title.trim(),
+            message: cleanBody,
+            appointmentId: params.appointmentId || undefined,
+            trackingCode: code || undefined,
+            userId: params.userId || undefined,
+            type: 'early_arrival',
+          },
+        }).catch(() => {})
+      } catch {}
+    }
+
     return !error
   } catch (err) {
     console.error('Error sending early arrival invite:', err)
@@ -1960,6 +2559,234 @@ export async function getMedicalQualifications(): Promise<MedicalQualification[]
 }
 
 // ==========================================
+// LOCATIONS & CITIES API (App & Web Dropdown)
+// ==========================================
+
+export const DEFAULT_NEPAL_CITIES = [
+  'All Nepal',
+  'Kathmandu',
+  'Lalitpur',
+  'Bhaktapur',
+  'Pokhara',
+  'Janakpur',
+  'Biratnagar',
+  'Birgunj',
+  'Dharan',
+  'Chitwan',
+  'Butwal',
+  'Nepalgunj',
+  'Hetauda',
+  'Dhangadhi',
+]
+
+/**
+ * Fetch all active city names for the Location selector dropdown
+ * Guarantees 'All Nepal' is at index 0 and unique.
+ */
+export async function getCityLocations(): Promise<string[]> {
+  try {
+    const { data, error } = await supabase
+      .from('medical_qualifications')
+      .select('degree_name, is_active')
+      .eq('level', 'LOCATION_OPTION')
+      .eq('is_active', true)
+      .order('degree_name', { ascending: true })
+
+    if (error) throw error
+    if (!data || data.length === 0) {
+      return DEFAULT_NEPAL_CITIES
+    }
+
+    const cityNames = data
+      .map((d: any) => d.degree_name?.trim())
+      .filter((n: string | undefined): n is string => Boolean(n) && n.toLowerCase() !== 'all nepal')
+
+    return ['All Nepal', ...Array.from(new Set(cityNames))]
+  } catch (err) {
+    console.warn('Error fetching cities from database, using defaults:', err)
+    return DEFAULT_NEPAL_CITIES
+  }
+}
+
+/**
+ * Fetch full location details (names, coordinates, aliases, active status)
+ */
+export async function getLocationDetails(): Promise<CityLocation[]> {
+  try {
+    const { data, error } = await supabase
+      .from('medical_qualifications')
+      .select('*')
+      .eq('level', 'LOCATION_OPTION')
+      .order('degree_name', { ascending: true })
+
+    if (error) throw error
+    return (data || []).map((d: any) => ({
+      id: d.id,
+      name: d.degree_name,
+      coordinates: d.field_of_study || '27.7172, 85.3240',
+      aliases: d.description || d.degree_name?.toLowerCase(),
+      isActive: d.is_active ?? true,
+      createdAt: d.created_at,
+      updatedAt: d.updated_at,
+    }))
+  } catch (err) {
+    console.warn('Error fetching location details:', err)
+    return DEFAULT_NEPAL_CITIES.slice(1).map((name, i) => ({
+      id: `default-${i}`,
+      name,
+      coordinates: '27.7172, 85.3240',
+      aliases: name.toLowerCase(),
+      isActive: true,
+    }))
+  }
+}
+
+/**
+ * Add a new city / location option to the database
+ */
+export async function addCityLocation(payload: {
+  name: string
+  coordinates?: string
+  aliases?: string
+  isActive?: boolean
+}): Promise<CityLocation | null> {
+  const cleanName = payload.name.trim()
+  if (!cleanName) throw new Error('City name cannot be empty')
+
+  const cleanCoords = payload.coordinates?.trim() || '27.7172, 85.3240'
+  const cleanAliases = payload.aliases?.trim() || cleanName.toLowerCase()
+  const isActive = payload.isActive ?? true
+
+  const { data, error } = await supabase
+    .from('medical_qualifications')
+    .insert([
+      {
+        degree_name: cleanName,
+        level: 'LOCATION_OPTION',
+        field_of_study: cleanCoords,
+        description: cleanAliases,
+        is_active: isActive,
+      },
+    ])
+    .select()
+
+  if (error) {
+    console.error('Error adding city location:', error)
+    throw error
+  }
+
+  const inserted = data?.[0]
+  if (!inserted) return null
+
+  return {
+    id: inserted.id,
+    name: inserted.degree_name,
+    coordinates: inserted.field_of_study,
+    aliases: inserted.description,
+    isActive: inserted.is_active,
+    createdAt: inserted.created_at,
+    updatedAt: inserted.updated_at,
+  }
+}
+
+/**
+ * Update a city / location option
+ */
+export async function updateCityLocation(
+  id: string,
+  updates: Partial<{ name: string; coordinates?: string; aliases?: string; isActive?: boolean }>
+): Promise<boolean> {
+  const payload: any = { updated_at: new Date().toISOString() }
+  if (updates.name !== undefined) payload.degree_name = updates.name.trim()
+  if (updates.coordinates !== undefined) payload.field_of_study = updates.coordinates.trim()
+  if (updates.aliases !== undefined) payload.description = updates.aliases.trim()
+  if (updates.isActive !== undefined) payload.is_active = updates.isActive
+
+  const { error } = await supabase.from('medical_qualifications').update(payload).eq('id', id)
+  if (error) {
+    console.error('Error updating city location:', error)
+    throw error
+  }
+  return true
+}
+
+/**
+ * Delete a city / location option from the database
+ */
+export async function deleteCityLocation(id: string): Promise<boolean> {
+  const { error } = await supabase.from('medical_qualifications').delete().eq('id', id)
+  if (error) {
+    console.error('Error deleting city location:', error)
+    throw error
+  }
+  return true
+}
+
+// ==========================================
+// SUPABASE STORAGE CDN IMAGE RESOLUTION
+// ==========================================
+export const SUPABASE_STORAGE_PUBLIC_URL = 'https://ojfoofojcpabqegxmsab.supabase.co/storage/v1/object/public'
+
+export function resolveStorageUrl(
+  pathOrUrl?: string | null,
+  defaultBucket: 'clinic_logos' | 'clinic_photos' | 'doctor_photos' | 'clinic_pictures' = 'clinic_logos'
+): string | undefined {
+  if (!pathOrUrl) return undefined
+  const raw = pathOrUrl.trim()
+  if (!raw) return undefined
+  if (
+    raw.startsWith('http://') ||
+    raw.startsWith('https://') ||
+    raw.startsWith('data:') ||
+    raw.startsWith('blob:')
+  ) {
+    return raw
+  }
+
+  const cleanPath = raw.replace(/^\/+/, '')
+  const knownBuckets = [
+    'clinic_logos',
+    'clinic-logos',
+    'clinic_photos',
+    'clinic-photos',
+    'clinic_pictures',
+    'clinic-pictures',
+    'clinics',
+    'doctor_photos',
+    'doctor-photos',
+    'doctors',
+    'avatars',
+    'pictures',
+    'logos',
+    'lab_reports',
+    'reports',
+  ]
+
+  const hasKnownBucket = knownBuckets.some((b) => cleanPath.startsWith(`${b}/`))
+  if (hasKnownBucket) {
+    return `${SUPABASE_STORAGE_PUBLIC_URL}/${cleanPath}`
+  }
+
+  return `${SUPABASE_STORAGE_PUBLIC_URL}/${defaultBucket}/${cleanPath}`
+}
+
+export function resolveClinicLogoUrl(clinic?: Clinic | null): string | undefined {
+  if (!clinic) return undefined
+  return resolveStorageUrl(clinic.logoUrl || clinic.photoUrl, 'clinic_logos')
+}
+
+export function resolveClinicCoverUrl(clinic?: Clinic | null): string | undefined {
+  if (!clinic) return undefined
+  const pic = clinic.pictures && clinic.pictures.length > 0 ? clinic.pictures[0] : (clinic.logoUrl || clinic.photoUrl)
+  return resolveStorageUrl(pic, 'clinic_photos')
+}
+
+export function resolveDoctorPhotoUrl(doctor?: Doctor | null): string | undefined {
+  if (!doctor) return undefined
+  return resolveStorageUrl(doctor.profilePictureUrl, 'doctor_photos')
+}
+
+// ==========================================
 // HELPER MAPPERS
 // ==========================================
 function mapClinic(c: any): Clinic {
@@ -1987,6 +2814,8 @@ function mapClinic(c: any): Clinic {
   }
 
   const defaultExpiry = new Date(Date.now() + 30 * 86400000).toISOString()
+  const rawLogo = c.logo_url || meta.logo_url || (pics.length > 0 ? pics[0] : null)
+  const rawPhoto = c.photo_url || meta.photo_url || c.logo_url || meta.logo_url || (pics.length > 0 ? pics[0] : null)
 
   return {
     id: c.id,
@@ -2003,15 +2832,15 @@ function mapClinic(c: any): Clinic {
     panNumber: c.pan_number || meta.pan_number,
     managerPhone: c.manager_phone || meta.manager_phone,
     registrationDocUrl: c.registration_doc_url || meta.registration_doc_url,
-    pictures: pics,
+    pictures: pics.map((p) => resolveStorageUrl(p, 'clinic_photos') || p),
     specialties: c.specialties || meta.specialties || [],
     createdAt: c.created_at,
     updatedAt: c.updated_at,
     isArchived: c.is_archived ?? meta.is_archived ?? false,
     archivedAt: c.archived_at || meta.archived_at,
     deletionScheduledAt: c.deletion_scheduled_at || meta.deletion_scheduled_at,
-    logoUrl: c.logo_url || meta.logo_url || (pics.length > 0 ? pics[0] : null),
-    photoUrl: c.photo_url || meta.photo_url || c.logo_url || meta.logo_url || (pics.length > 0 ? pics[0] : null),
+    logoUrl: resolveStorageUrl(rawLogo, 'clinic_logos'),
+    photoUrl: resolveStorageUrl(rawPhoto, 'clinic_photos'),
     isOnBreak: c.is_on_break ?? meta.is_on_break ?? false,
     breakUpdatedAt: c.break_updated_at || meta.break_updated_at,
     weeklyScheduleJson: c.weekly_schedule_json || meta.weekly_schedule_json,
@@ -2044,6 +2873,7 @@ function mapDoctor(d: any): Doctor {
 
   const startYear = d.starting_practicing_year || certMeta.starting_practicing_year || 2018
   const role = d.practitioner_role || certMeta.practitioner_role || 'doctor'
+  const rawPic = d.profile_picture_url || certMeta.profile_picture_url
 
   return {
     id: d.id,
@@ -2063,9 +2893,13 @@ function mapDoctor(d: any): Doctor {
     isInClinic: d.is_in_clinic ?? true,
     clinicId: d.clinic_id,
     activeClinicId: d.active_clinic_id || d.clinic_id,
+    primaryClinicId: d.primary_clinic_id || d.clinic_id,
     kycStatus: d.kyc_status,
-    profilePictureUrl: d.profile_picture_url || certMeta.profile_picture_url,
+    profilePictureUrl: resolveStorageUrl(rawPic, 'doctor_photos'),
+    licenseDocUrl: d.license_doc_url,
+    certificatesDocUrl: d.certificates_doc_url,
     description: d.description || certMeta.description,
+    bio: d.bio || d.description || certMeta.description || certMeta.bio,
     practitionerRole: role,
     isLabTechnician: role === 'lab_technician' || (d.specialty && d.specialty.toLowerCase().includes('lab')),
   }
@@ -2075,7 +2909,22 @@ function mapAppointment(a: any): Appointment {
   const qe = Array.isArray(a.queue_entries) ? a.queue_entries[0] : a.queue_entries
   let derivedStatus = 'waiting'
 
-  if (qe?.status) {
+  const todayIso = new Date().toISOString().split('T')[0]
+  const isFutureOrToday = (a.appointment_date || '') >= todayIso
+
+  if (isFutureOrToday && a.checkin_status === 'waiting') {
+    // If appointment is booked/rescheduled for today or future and checkin_status is waiting,
+    // do not let a stale 'done' queue entry from a previous date override it to completed!
+    if (qe?.status && qe.status !== 'done' && qe.status !== 'no_show') {
+      if (qe.status === 'inside') derivedStatus = 'in_consultation'
+      else if (qe.status === 'sample_collected') derivedStatus = 'sample_collected'
+      else if (qe.status === 'processing') derivedStatus = 'processing'
+      else if (qe.status === 'report_prepared') derivedStatus = 'report_prepared'
+      else derivedStatus = 'waiting'
+    } else {
+      derivedStatus = 'waiting'
+    }
+  } else if (qe?.status) {
     if (qe.status === 'inside') derivedStatus = 'in_consultation'
     else if (qe.status === 'done') derivedStatus = 'completed'
     else if (qe.status === 'no_show') derivedStatus = 'cancelled'
@@ -2102,6 +2951,7 @@ function mapAppointment(a: any): Appointment {
     userId: a.user_id,
     clinicId: a.clinic_id,
     doctorId: a.doctor_id,
+    slotId: a.slot_id || null,
     patientName: a.patient_name,
     patientAge: a.patient_age,
     patientGender: a.patient_gender,
@@ -2112,12 +2962,23 @@ function mapAppointment(a: any): Appointment {
     checkinStatus: derivedStatus as any,
     paymentStatus: a.payment_status === 'pending' ? 'unpaid' : (a.payment_status || 'unpaid'),
     feeAmount: Number(a.fee_amount || 0),
-    queueNumber: qe?.queue_position || a.queue_number || 1,
+    queueNumber: qe?.queue_position || a.queue_position || a.queue_number || 1,
+    queuePosition: qe?.queue_position || a.queue_position || a.queue_number || 1,
     notes: a.notes || (a.is_walkin ? 'Walk-In Reception Registration' : ''),
+    isWalkin: Boolean(a.is_walkin),
     optInEarlyCall: Boolean(a.opt_in_early_call),
     createdAt: a.created_at,
     updatedAt: qe?.updated_at || a.updated_at,
     selectedTests: parsedTests,
+    selectedLabTests: a.selected_lab_tests,
+    paymentMode: a.payment_mode || 'ONLINE',
+    status: a.status || 'APPROVED',
+    attemptNumber: a.attempt_number || 1,
+    serviceChargeAmount: Number(a.service_charge_amount || 0),
+    totalAmount: Number(a.total_amount || a.fee_amount || 0),
+    expiresAt: a.expires_at || null,
+    approvedAt: a.approved_at || null,
+    rejectedAt: a.rejected_at || null,
     clinic: a.clinic ? mapClinic(a.clinic) : undefined,
     doctor: a.doctor ? mapDoctor(a.doctor) : undefined,
   }
@@ -2210,24 +3071,46 @@ function mapNotification(n: any): DactorNotification {
 }
 
 function mapBillingInvoice(b: any): BillingInvoice {
+  const total = Number(b.total_amount || 0)
+  const paid = Number(b.paid_amount || 0)
+  const balance = Number(b.balance_due || Math.max(0, total - paid))
+  let effectiveStatus: string = b.payment_status || 'unpaid'
+  if (paid >= total && total > 0) {
+    effectiveStatus = 'paid'
+  } else if (paid > 0) {
+    effectiveStatus = 'partial'
+  } else if (b.payment_status === 'pending') {
+    effectiveStatus = 'unpaid'
+  }
+
+  let rawItems = b.items
+  if (typeof rawItems === 'string') {
+    try { rawItems = JSON.parse(rawItems) } catch {}
+  }
+
   return {
     id: b.id,
     appointmentId: b.appointment_id,
     clinicId: b.clinic_id,
-    items: Array.isArray(b.items)
-      ? b.items.map((it: any) => ({
-          id: it.id || crypto.randomUUID(),
-          itemName: it.itemName || it.item_name || it.name || 'Clinical Service',
-          name: it.name || it.itemName || it.item_name || 'Clinical Service',
-          quantity: Number(it.quantity || 1),
-          price: Number(it.price || it.unitPrice || 0),
-          total: Number(it.total || (Number(it.price || 0) * Number(it.quantity || 1))),
-        }))
+    items: Array.isArray(rawItems)
+      ? rawItems.map((it: any) => {
+          const name = it.name || it.itemName || it.item_name || 'Clinical Service'
+          const price = Number(it.price || it.unitPrice || 0)
+          const qty = Number(it.quantity || 1)
+          return {
+            id: it.id || crypto.randomUUID(),
+            itemName: name,
+            name: name,
+            quantity: qty,
+            price: price,
+            total: Number(it.total || price * qty),
+          }
+        })
       : [],
-    totalAmount: Number(b.total_amount || 0),
-    paidAmount: Number(b.paid_amount || 0),
-    balanceDue: Number(b.balance_due || 0),
-    paymentStatus: b.payment_status === 'pending' ? 'unpaid' : (b.payment_status || 'unpaid'),
+    totalAmount: total,
+    paidAmount: paid,
+    balanceDue: balance,
+    paymentStatus: effectiveStatus as any,
     paidAt: b.paid_at,
     remarks: b.remarks,
     receiptUrl: b.receipt_url,
@@ -2367,6 +3250,231 @@ export function isSlotTimeExpired(slotDate: string, endTimeStr?: string, startTi
   return currentMinutes >= endMins
 }
 
+export function formatMinutesTo12Hour(totalMinutes: number): string {
+  let normalized = totalMinutes % (24 * 60)
+  if (normalized < 0) normalized += 24 * 60
+  let h = Math.floor(normalized / 60)
+  const m = normalized % 60
+  const ampm = h >= 12 ? 'PM' : 'AM'
+  h = h % 12
+  if (h === 0) h = 12
+  const mStr = String(m).padStart(2, '0')
+  return `${h}:${mStr} ${ampm}`
+}
+
+export function computeMultiSlotDailyPosition(params: {
+  targetAppointmentId: string
+  targetSlotId?: string | null
+  targetAppointmentTime?: string | null
+  appointmentDate: string
+  allSlotsForDate: Slot[]
+  allAppointmentsForDate: Appointment[]
+  doctorId?: string | null
+  avgConsultationMinutes?: number
+  nowDate?: Date
+}): MultiSlotPositionResult {
+  const {
+    targetAppointmentId,
+    targetSlotId,
+    targetAppointmentTime,
+    appointmentDate,
+    allSlotsForDate = [],
+    allAppointmentsForDate = [],
+    doctorId,
+    avgConsultationMinutes = 10,
+    nowDate = new Date(),
+  } = params
+
+  const targetDateStr = (appointmentDate || '').trim().slice(0, 10)
+
+  // Compare calendar days
+  const now = new Date(nowDate.getTime())
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  const todayStr = `${year}-${month}-${day}`
+
+  const tomorrowObj = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+  const tomYear = tomorrowObj.getFullYear()
+  const tomMonth = String(tomorrowObj.getMonth() + 1).padStart(2, '0')
+  const tomDay = String(tomorrowObj.getDate()).padStart(2, '0')
+  const tomorrowStr = `${tomYear}-${tomMonth}-${tomDay}`
+
+  const isToday = targetDateStr === todayStr
+  const isTomorrow = targetDateStr === tomorrowStr
+  const isFutureDate = targetDateStr > todayStr
+
+  let dateLabel = ''
+  if (isToday) {
+    dateLabel = 'Today'
+  } else if (isTomorrow) {
+    dateLabel = 'Tomorrow'
+  } else {
+    const parts = targetDateStr.split('-')
+    if (parts.length === 3) {
+      const y = parseInt(parts[0], 10)
+      const m = parseInt(parts[1], 10) - 1
+      const d = parseInt(parts[2], 10)
+      const targetObj = new Date(y, m, d)
+      const monthShort = targetObj.toLocaleDateString('en-US', { month: 'short' })
+      dateLabel = `${d} ${monthShort}`
+    } else {
+      dateLabel = targetDateStr || 'Upcoming'
+    }
+  }
+
+  // Filter relevant published slots and non-cancelled appointments
+  const relevantSlots = (allSlotsForDate || []).filter((slot) => {
+    const isPub = slot.isPublished !== false
+    const matchesDoc = !doctorId || !slot.doctorId || slot.doctorId === doctorId
+    return isPub && matchesDoc
+  })
+
+  const relevantAppointments = (allAppointmentsForDate || []).filter((appt) => {
+    const notCancelled = appt.checkinStatus !== 'cancelled'
+    const matchesDoc = !doctorId || !appt.doctorId || appt.doctorId === doctorId
+    return notCancelled && matchesDoc
+  })
+
+  // Sort slots chronologically
+  const sortedSlots = [...relevantSlots].sort((a, b) => {
+    const aStart = parseTimeToMinutes(a.startTime)
+    const bStart = parseTimeToMinutes(b.startTime)
+    if (aStart !== bStart) return aStart - bStart
+
+    const aEnd = parseTimeToMinutes(a.endTime)
+    const bEnd = parseTimeToMinutes(b.endTime)
+    if (aEnd !== bEnd) return aEnd - bEnd
+
+    return a.id.localeCompare(b.id)
+  })
+
+  // Match target slot
+  let targetSlot = sortedSlots.find((s) => s.id === targetSlotId)
+  if (!targetSlot && targetAppointmentTime) {
+    const targetTimeMins = parseTimeToMinutes(targetAppointmentTime)
+    targetSlot = sortedSlots.find((slot) => {
+      const sMins = parseTimeToMinutes(slot.startTime)
+      const eMins = parseTimeToMinutes(slot.endTime)
+      return (targetTimeMins >= sMins && targetTimeMins < eMins) || targetTimeMins === sMins
+    })
+  }
+
+  let priorAppointmentsCount = 0
+  let positionInSlot = 1
+  let cumulativePos = 1
+
+  if (targetSlot && sortedSlots.length > 0) {
+    const targetSlotIndex = sortedSlots.findIndex((s) => s.id === targetSlot!.id)
+    const priorSlotIds = new Set(
+      targetSlotIndex > 0 ? sortedSlots.slice(0, targetSlotIndex).map((s) => s.id) : []
+    )
+    const targetSlotStartMins = parseTimeToMinutes(targetSlot.startTime)
+
+    const priorAppointments = relevantAppointments.filter((appt) => {
+      if (appt.id === targetAppointmentId) return false
+      if (appt.slotId && priorSlotIds.has(appt.slotId)) return true
+      if (!appt.slotId && appt.appointmentTime) {
+        const apptMins = parseTimeToMinutes(appt.appointmentTime)
+        return apptMins < targetSlotStartMins
+      }
+      return false
+    })
+    priorAppointmentsCount = priorAppointments.length
+
+    const inSlotAppointments = relevantAppointments.filter((appt) => {
+      if (appt.slotId === targetSlot!.id) return true
+      if (!appt.slotId && appt.appointmentTime) {
+        return parseTimeToMinutes(appt.appointmentTime) === targetSlotStartMins
+      }
+      return appt.id === targetAppointmentId
+    })
+
+    const uniqueInSlot = Array.from(new Map(inSlotAppointments.map((a) => [a.id, a])).values())
+    uniqueInSlot.sort((a, b) => {
+      const aMins = parseTimeToMinutes(a.appointmentTime)
+      const bMins = parseTimeToMinutes(b.appointmentTime)
+      if (aMins !== bMins) return aMins - bMins
+      return a.id.localeCompare(b.id)
+    })
+
+    const inSlotIndex = uniqueInSlot.findIndex((a) => a.id === targetAppointmentId)
+    positionInSlot = inSlotIndex >= 0 ? inSlotIndex + 1 : 1
+    cumulativePos = priorAppointmentsCount + positionInSlot
+  } else {
+    const sortedAppts = [...relevantAppointments].sort((a, b) => {
+      const aMins = parseTimeToMinutes(a.appointmentTime)
+      const bMins = parseTimeToMinutes(b.appointmentTime)
+      if (aMins !== bMins) return aMins - bMins
+      return a.id.localeCompare(b.id)
+    })
+    const myIdx = sortedAppts.findIndex((a) => a.id === targetAppointmentId)
+    cumulativePos = myIdx >= 0 ? myIdx + 1 : 1
+    priorAppointmentsCount = Math.max(0, cumulativePos - 1)
+    positionInSlot = 1
+  }
+
+  const effectiveSlotStartStr =
+    targetSlot?.startTime?.trim() || targetAppointmentTime?.trim() || '09:00 AM'
+  const effectiveSlotEndStr = targetSlot?.endTime?.trim() || ''
+
+  const slotStartMins = parseTimeToMinutes(effectiveSlotStartStr)
+  const formattedSlotStart = formatMinutesTo12Hour(slotStartMins)
+
+  const avgMins = Math.max(1, avgConsultationMinutes || 10)
+  const staggerMinutes = Math.max(0, positionInSlot - 1) * avgMins
+  const approxAppointmentTimeMins = slotStartMins + staggerMinutes
+  const approxTimeFormatted = formatMinutesTo12Hour(approxAppointmentTimeMins)
+
+  const approxAppointmentTimeText = `${approxTimeFormatted} (±15 min)`
+  const windowStart = formatMinutesTo12Hour(approxAppointmentTimeMins - 15)
+  const windowEnd = formatMinutesTo12Hour(approxAppointmentTimeMins + 15)
+  const timeWindowText = `${windowStart} – ${windowEnd}`
+
+  return {
+    cumulativePosition: cumulativePos,
+    patientsAheadInDay: Math.max(0, cumulativePos - 1),
+    positionInSlot,
+    slotStartTimeText: formattedSlotStart,
+    slotEndTimeText: effectiveSlotEndStr,
+    approxAppointmentTimeText,
+    timeWindowText,
+    dateLabel,
+    isToday,
+    isTomorrow,
+    isFutureDate,
+  }
+}
+
+export async function calculateMultiSlotDailyPosition(
+  clinicId: string,
+  doctorId: string | null | undefined,
+  appointmentDate: string,
+  targetAppointmentId: string,
+  targetSlotId: string | null | undefined,
+  targetAppointmentTime: string | null | undefined,
+  avgConsultationMinutes: number = 10,
+  nowDate?: Date
+): Promise<MultiSlotPositionResult> {
+  const targetDateStr = (appointmentDate || '').trim().slice(0, 10)
+  const [slots, appointments] = await Promise.all([
+    clinicId && targetDateStr ? getSlots(clinicId, targetDateStr) : Promise.resolve([]),
+    clinicId && targetDateStr ? getAppointmentsByClinic(clinicId, targetDateStr) : Promise.resolve([]),
+  ])
+
+  return computeMultiSlotDailyPosition({
+    targetAppointmentId,
+    targetSlotId,
+    targetAppointmentTime,
+    appointmentDate: targetDateStr,
+    allSlotsForDate: slots,
+    allAppointmentsForDate: appointments,
+    doctorId,
+    avgConsultationMinutes,
+    nowDate,
+  })
+}
+
 export async function getPatientProfileByEmail(email: string): Promise<PatientProfile | null> {
   try {
     const cleanEmail = email.trim().toLowerCase()
@@ -2428,6 +3536,129 @@ export async function getPatientProfileById(id: string): Promise<PatientProfile 
   } catch {
     return null
   }
+}
+
+export interface ActiveUserSession {
+  role: 'clinic_manager' | 'doctor' | 'patient'
+  email: string | null
+  portalTab: 'portal' | 'doctor-portal' | 'patient-portal'
+}
+
+export function getLoggedInUserSession(): ActiveUserSession | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const lastRole = localStorage.getItem('dactor_last_active_role')
+    const lastPortal = localStorage.getItem('dactor_last_active_portal')
+
+    // Helper: Resolve Patient session
+    const resolvePatientSession = (): ActiveUserSession | null => {
+      const isPatAuth =
+        localStorage.getItem('dactor_patient_logged_in') === 'true' ||
+        Boolean(localStorage.getItem('dactor_patient_session')) ||
+        Boolean(localStorage.getItem('dactor_patient_email'))
+      if (isPatAuth) {
+        let email = localStorage.getItem('dactor_patient_email') || null
+        if (!email && localStorage.getItem('dactor_patient_session')) {
+          try {
+            const parsed = JSON.parse(localStorage.getItem('dactor_patient_session')!)
+            email = parsed?.email || null
+          } catch {}
+        }
+        return {
+          role: 'patient',
+          email,
+          portalTab: 'patient-portal',
+        }
+      }
+      return null
+    }
+
+    // Helper: Resolve Doctor session
+    const resolveDoctorSession = (): ActiveUserSession | null => {
+      const hasDocPending = Boolean(localStorage.getItem('dactor_doctor_pending_kyc'))
+      const isDocAuth =
+        (localStorage.getItem('dactor_doctor_logged_in') === 'true' &&
+          (Boolean(localStorage.getItem('dactor_doctor_session')) || Boolean(localStorage.getItem('dactor_doctor_email')))) ||
+        hasDocPending
+      if (isDocAuth) {
+        let email = localStorage.getItem('dactor_doctor_email') || null
+        if (!email && hasDocPending) {
+          try {
+            const parsed = JSON.parse(localStorage.getItem('dactor_doctor_pending_kyc')!)
+            email = parsed?.email || null
+          } catch {}
+        }
+        if (!email && localStorage.getItem('dactor_doctor_session')) {
+          try {
+            const parsed = JSON.parse(localStorage.getItem('dactor_doctor_session')!)
+            email = parsed?.email || null
+          } catch {}
+        }
+        return {
+          role: 'doctor',
+          email,
+          portalTab: 'doctor-portal',
+        }
+      }
+      return null
+    }
+
+    // Helper: Resolve Clinic session
+    const resolveClinicSession = (): ActiveUserSession | null => {
+      let hasClinicPending = false
+      try {
+        const raw = localStorage.getItem('dactor_pending_verification')
+        if (raw && raw !== 'null' && raw !== '{}') {
+          const parsed = JSON.parse(raw)
+          if (parsed && (parsed.clinicName || parsed.email)) {
+            hasClinicPending = true
+          }
+        }
+      } catch {}
+
+      const isClinicAuth = localStorage.getItem('dactor_clinic_logged_in') === 'true' || hasClinicPending
+      if (isClinicAuth) {
+        let email = localStorage.getItem('dactor_clinic_email') || null
+        if (!email && hasClinicPending) {
+          try {
+            const parsed = JSON.parse(localStorage.getItem('dactor_pending_verification')!)
+            email = parsed?.email || null
+          } catch {}
+        }
+        return {
+          role: 'clinic_manager',
+          email,
+          portalTab: 'portal',
+        }
+      }
+      return null
+    }
+
+    // 1. Honor explicit last-active role if set
+    if (lastRole === 'patient' || lastPortal === 'patient-portal') {
+      const pat = resolvePatientSession()
+      if (pat) return pat
+    } else if (lastRole === 'doctor' || lastPortal === 'doctor-portal') {
+      const doc = resolveDoctorSession()
+      if (doc) return doc
+    } else if (lastRole === 'clinic_manager' || lastPortal === 'portal') {
+      const clinic = resolveClinicSession()
+      if (clinic) return clinic
+    }
+
+    // 2. Default prioritization: Patient > Doctor > Clinic
+    const patientSession = resolvePatientSession()
+    if (patientSession) return patientSession
+
+    const doctorSession = resolveDoctorSession()
+    if (doctorSession) return doctorSession
+
+    const clinicSession = resolveClinicSession()
+    if (clinicSession) return clinicSession
+  } catch {
+    return null
+  }
+  return null
 }
 
 export interface EmailPortalAssociation {
@@ -2717,6 +3948,76 @@ export async function getClinicPaymentConfig(clinicId: string): Promise<PaymentG
   }
 }
 
+export async function getAppointmentById(id: string): Promise<Appointment | null> {
+  try {
+    const cleanId = id.trim()
+    if (!cleanId) return null
+    const { data, error } = await supabase
+      .from('appointments')
+      .select('*, clinic:clinics(*), doctor:doctors(*), queue_entries(*)')
+      .eq('id', cleanId)
+      .maybeSingle()
+    if (error || !data) return null
+    return mapAppointment(data)
+  } catch {
+    return null
+  }
+}
+
+export async function startEsewaPayment(
+  appointmentId: string,
+  returnUrl?: string
+): Promise<{ attemptId: string; checkoutUrl: string; transactionUuid: string }> {
+  const { data, error } = await supabase.functions.invoke('appointment-payment', {
+    body: {
+      action: 'initiate',
+      appointmentId,
+      returnUrl,
+    },
+  })
+  if (error || !data?.checkoutUrl) {
+    const errMsg = data?.error || error?.message || 'Failed to initiate eSewa payment'
+    throw new Error(errMsg)
+  }
+  return data
+}
+
+export async function refreshEsewaPayment(
+  appointmentId: string
+): Promise<{ status: 'complete' | 'pending' | 'failed' | 'not_started'; reference: string | null }> {
+  const { data, error } = await supabase.functions.invoke('appointment-payment', {
+    body: {
+      action: 'refresh',
+      appointmentId,
+    },
+  })
+  if (error) {
+    throw new Error(error.message || 'Failed to refresh eSewa payment status')
+  }
+  return data || { status: 'pending', reference: null }
+}
+
+export async function saveClinicEsewaCredentials(params: {
+  clinicId: string
+  productCode: string
+  secretKey?: string
+  environment?: 'test' | 'live'
+}): Promise<boolean> {
+  const { data, error } = await supabase.functions.invoke('appointment-payment', {
+    body: {
+      action: 'save_esewa_credentials',
+      clinicId: params.clinicId,
+      productCode: params.productCode,
+      secretKey: params.secretKey,
+      environment: params.environment || 'test',
+    },
+  })
+  if (error || data?.error) {
+    throw new Error(data?.error || error?.message || 'Could not save eSewa credentials')
+  }
+  return true
+}
+
 export async function recordPaymentTransaction(record: {
   appointmentId: string
   trackingCode: string
@@ -2745,17 +4046,42 @@ export async function recordPaymentTransaction(record: {
       })
       .eq('id', record.appointmentId)
 
-    // 2. Create or update billing invoice in Supabase
+    // 2. Create or update billing invoice in Supabase (preserving existing line items)
+    const { data: existingInv } = await supabase
+      .from('billing_invoices')
+      .select('id, items, remarks, total_amount')
+      .eq('appointment_id', record.appointmentId)
+      .maybeSingle()
+
+    const existingItems = Array.isArray(existingInv?.items) && existingInv.items.length > 0
+      ? existingInv.items
+      : [
+          {
+            id: crypto.randomUUID(),
+            item_name: 'Consultation & Clinical Services',
+            itemName: 'Consultation & Clinical Services',
+            name: 'Consultation & Clinical Services',
+            quantity: 1,
+            price: record.amount,
+            total: record.amount,
+          },
+        ]
+
+    const effectiveTotal = Math.max(record.amount, Number(existingInv?.total_amount || 0))
+    const paidAmt = dbPayStatus === 'paid' ? effectiveTotal : 0
     const invoicePayload = {
-      id: crypto.randomUUID(),
+      id: existingInv?.id || crypto.randomUUID(),
       appointment_id: record.appointmentId,
       clinic_id: record.clinicId,
-      total_amount: record.amount,
-      paid_amount: dbPayStatus === 'paid' ? record.amount : 0,
-      balance_due: dbPayStatus === 'paid' ? 0 : record.amount,
+      items: existingItems,
+      total_amount: effectiveTotal,
+      paid_amount: paidAmt,
+      balance_due: Math.max(0, effectiveTotal - paidAmt),
       payment_status: dbPayStatus,
       paid_at: dbPayStatus === 'paid' ? nowIso : null,
-      remarks: `Method: ${record.paymentMethod} (Txn: ${txnId}) • ${record.notes || ''}`.trim(),
+      remarks: existingInv?.remarks
+        ? `${existingInv.remarks}\nMethod: ${record.paymentMethod} (Txn: ${txnId}) • ${record.notes || ''}`.trim()
+        : `Method: ${record.paymentMethod} (Txn: ${txnId}) • ${record.notes || ''}`.trim(),
     }
 
     const { error: invError } = await supabase
@@ -2842,7 +4168,7 @@ export async function getPatientTransactions(criteria: {
 // DOCTOR AFFILIATED CLINICS & DIRECTORY HELPERS
 // ==========================================
 export async function getAffiliatedClinicsForDoctor(
-  doctorId: string,
+  doctorId?: string,
   doctorEmail?: string
 ): Promise<Clinic[]> {
   try {
@@ -2853,14 +4179,16 @@ export async function getAffiliatedClinicsForDoctor(
       const doc = await getDoctorById(doctorId)
       if (doc?.clinicId) clinicIdSet.add(doc.clinicId)
       if (doc?.activeClinicId) clinicIdSet.add(doc.activeClinicId)
+      if (doc?.primaryClinicId) clinicIdSet.add(doc.primaryClinicId)
     }
 
-    // Check clinic invitations for this doctor email or doctorId
+    // Check clinic invitations for this doctor email (schema column is 'email')
     if (doctorEmail) {
+      const cleanEmail = doctorEmail.trim().toLowerCase()
       const { data: invites } = await supabase
         .from('clinic_invitations')
         .select('clinic_id, status')
-        .or(`doctor_email.ilike.${doctorEmail.trim().toLowerCase()},doctor_id.eq.${doctorId}`)
+        .ilike('email', cleanEmail)
         .eq('status', 'accepted')
 
       if (invites) {
@@ -2870,9 +4198,23 @@ export async function getAffiliatedClinicsForDoctor(
       }
     }
 
+    // Check slots table for clinics where this doctor has slots
+    if (doctorId) {
+      const { data: docSlots } = await supabase
+        .from('slots')
+        .select('clinic_id')
+        .eq('doctor_id', doctorId)
+        .limit(50)
+
+      if (docSlots) {
+        docSlots.forEach((s) => {
+          if (s.clinic_id) clinicIdSet.add(s.clinic_id)
+        })
+      }
+    }
+
     if (clinicIdSet.size === 0) {
-      // Fallback: return all approved clinics
-      return await getClinics()
+      return []
     }
 
     const clinicIds = Array.from(clinicIdSet)
@@ -2882,14 +4224,45 @@ export async function getAffiliatedClinicsForDoctor(
       .in('id', clinicIds)
 
     if (error || !clinicsData || clinicsData.length === 0) {
-      return await getClinics()
+      return []
     }
 
-    return clinicsData.map(mapClinic)
+    return clinicsData.map(mapClinic).filter((c) => !c.isArchived)
   } catch (err) {
     console.error('Error fetching affiliated clinics for doctor:', err)
-    return await getClinics()
+    return []
   }
+}
+
+export function linkDoctorsWithClinics(doctors: Doctor[], clinics: Clinic[]): DoctorHomeItem[] {
+  const clinicMap = new Map<string, Clinic>()
+  clinics.forEach((c) => {
+    if (!c.isArchived) clinicMap.set(c.id, c)
+  })
+
+  return doctors.map((doc) => {
+    const linkedClinicIds = new Set<string>()
+    if (doc.clinicId) linkedClinicIds.add(doc.clinicId)
+    if (doc.activeClinicId) linkedClinicIds.add(doc.activeClinicId)
+    if (doc.primaryClinicId) linkedClinicIds.add(doc.primaryClinicId)
+
+    const practicingClinics: Clinic[] = []
+    linkedClinicIds.forEach((id) => {
+      const c = clinicMap.get(id)
+      if (c && !practicingClinics.some((existing) => existing.id === c.id)) {
+        practicingClinics.push(c)
+      }
+    })
+
+    return {
+      doctor: {
+        ...doc,
+        practicingClinics,
+      },
+      practicingClinics,
+      hasDocInClinic: Boolean(doc.isInClinic),
+    }
+  })
 }
 
 export async function getDoctorAppointments(
@@ -2915,6 +4288,20 @@ export async function getDoctorAppointments(
   }
 }
 
+export interface PatientDirectoryConsultation {
+  id: string
+  appointmentDate: string
+  appointmentTime: string
+  doctorName?: string
+  doctorSpecialty?: string
+  trackingCode: string
+  checkinStatus: string
+  paymentStatus: string
+  feeAmount: number
+  notes?: string
+  isFollowup: boolean
+}
+
 export async function getClinicPatientDirectory(clinicId: string): Promise<{
   id: string
   fullName: string
@@ -2925,12 +4312,13 @@ export async function getClinicPatientDirectory(clinicId: string): Promise<{
   lastVisitDate?: string
   visitCount: number
   trackingCodes: string[]
+  consultations: PatientDirectoryConsultation[]
 }[]> {
   try {
-    // 1. Get all appointments for this clinic
+    // 1. Get all appointments for this clinic with doctor join
     const { data: appts } = await supabase
       .from('appointments')
-      .select('id, user_id, patient_name, patient_mobile, patient_gender, patient_age, patient_email, appointment_date, tracking_code_10_digit')
+      .select('id, user_id, patient_name, patient_mobile, patient_gender, patient_age, patient_email, appointment_date, appointment_time, checkin_status, payment_status, fee_amount, tracking_code_10_digit, doctor:doctors(full_name, specialty)')
       .eq('clinic_id', clinicId)
       .order('appointment_date', { ascending: false })
 
@@ -2944,11 +4332,31 @@ export async function getClinicPatientDirectory(clinicId: string): Promise<{
       lastVisitDate?: string
       visitCount: number
       trackingCodes: string[]
+      consultations: PatientDirectoryConsultation[]
     }>()
 
     if (appts) {
       for (const a of appts) {
         const key = a.patient_mobile ? a.patient_mobile.trim() : (a.user_id || a.patient_name.toLowerCase())
+        const doctorObj = a.doctor as any
+        const docName = Array.isArray(doctorObj) ? doctorObj[0]?.full_name : doctorObj?.full_name
+        const docSpec = Array.isArray(doctorObj) ? doctorObj[0]?.specialty : doctorObj?.specialty
+        const isFollowup = Number(a.fee_amount) === 0
+
+        const consultItem: PatientDirectoryConsultation = {
+          id: a.id,
+          appointmentDate: a.appointment_date,
+          appointmentTime: a.appointment_time || 'OPD',
+          doctorName: docName || undefined,
+          doctorSpecialty: docSpec || undefined,
+          trackingCode: a.tracking_code_10_digit || '',
+          checkinStatus: a.checkin_status || 'booked',
+          paymentStatus: a.payment_status || 'unpaid',
+          feeAmount: Number(a.fee_amount) || 0,
+          notes: undefined,
+          isFollowup,
+        }
+
         if (!patientMap.has(key)) {
           patientMap.set(key, {
             id: a.user_id || a.id,
@@ -2960,6 +4368,7 @@ export async function getClinicPatientDirectory(clinicId: string): Promise<{
             lastVisitDate: a.appointment_date,
             visitCount: 1,
             trackingCodes: a.tracking_code_10_digit ? [a.tracking_code_10_digit] : [],
+            consultations: [consultItem],
           })
         } else {
           const item = patientMap.get(key)!
@@ -2967,6 +4376,7 @@ export async function getClinicPatientDirectory(clinicId: string): Promise<{
           if (a.tracking_code_10_digit && !item.trackingCodes.includes(a.tracking_code_10_digit)) {
             item.trackingCodes.push(a.tracking_code_10_digit)
           }
+          item.consultations.push(consultItem)
         }
       }
     }
@@ -3100,12 +4510,13 @@ export async function purgeExpiredClinicData(clinicId: string): Promise<boolean>
   }
 }
 
-export async function updateAppointmentNotes(appointmentId: string, notes: string): Promise<boolean> {
+export async function updateAppointmentNotes(appointmentId: string, _notes: string): Promise<boolean> {
   try {
+    // Note: PostgreSQL appointments table does not have a notes column in schema cache.
+    // To prevent PostgREST PGRST204 failure, update updated_at cleanly without failing the doctor's workflow
     const { error } = await supabase
       .from('appointments')
       .update({
-        notes: notes.trim(),
         updated_at: new Date().toISOString(),
       })
       .eq('id', appointmentId)
@@ -3121,8 +4532,8 @@ export async function updateSlot(
 ): Promise<boolean> {
   try {
     const payload: any = {}
-    if (updates.startTime !== undefined) payload.start_time = updates.startTime
-    if (updates.endTime !== undefined) payload.end_time = updates.endTime
+    if (updates.startTime !== undefined) payload.start_time = formatTimeForPostgres(updates.startTime)
+    if (updates.endTime !== undefined) payload.end_time = formatTimeForPostgres(updates.endTime)
     if (updates.maxCapacity !== undefined) payload.max_capacity = updates.maxCapacity
     const { error } = await supabase.from('slots').update(payload).eq('id', slotId)
     return !error
@@ -3554,3 +4965,142 @@ export async function getSupportTicketByCodeOrContact(query: string): Promise<Su
   return null
 }
 
+
+
+// ==========================================
+// PAY AT DESK CLINIC RPC & HELPER FUNCTIONS
+// ==========================================
+
+export async function getPendingPayAtDeskRequests(clinicId: string): Promise<Appointment[]> {
+  try {
+    const { data: rpcData, error: rpcError } = await supabase.rpc('list_pending_pay_at_desk_requests', {
+      p_clinic_id: clinicId,
+    })
+
+    if (!rpcError && Array.isArray(rpcData)) {
+      return rpcData.map((row: any) => ({
+        id: row.id,
+        trackingCode10Digit: row.tracking_code_10_digit,
+        userId: row.user_id,
+        clinicId: row.clinic_id,
+        doctorId: row.doctor_id,
+        slotId: row.slot_id,
+        patientName: row.patient_name,
+        patientAge: row.patient_age,
+        patientGender: row.patient_gender,
+        patientMobile: row.patient_mobile,
+        patientEmail: row.patient_email,
+        appointmentDate: row.appointment_date,
+        appointmentTime: row.appointment_time,
+        checkinStatus: 'not_checked_in',
+        paymentStatus: 'unpaid',
+        feeAmount: Number(row.fee_amount || 0),
+        serviceChargeAmount: Number(row.service_charge_amount || 0),
+        totalAmount: Number(row.total_amount || 0),
+        paymentMode: 'PAY_AT_DESK',
+        status: row.status || 'WAITING_FOR_APPROVAL',
+        attemptNumber: row.attempt_number || 1,
+        expiresAt: row.expires_at,
+        createdAt: row.created_at,
+        notes: row.notes,
+        doctor: row.doctor_name
+          ? ({
+              id: row.doctor_id || '',
+              fullName: row.doctor_name,
+              email: '',
+              specialty: row.doctor_specialty || '',
+              clinicId: row.clinic_id,
+              consultationFee: Number(row.fee_amount || 0),
+              kycStatus: 'approved',
+              isInClinic: true,
+            } as Doctor)
+          : undefined,
+      }))
+    }
+
+    // Direct table fallback
+    const { data, error } = await supabase
+      .from('appointments')
+      .select('*, doctor:doctors(*), clinic:clinics(*)')
+      .eq('clinic_id', clinicId)
+      .eq('payment_mode', 'PAY_AT_DESK')
+      .eq('status', 'WAITING_FOR_APPROVAL')
+      .order('created_at', { ascending: true })
+
+    if (error) throw error
+    return (data || []).map(mapAppointment)
+  } catch (err) {
+    console.error('Error fetching pending pay at desk requests:', err)
+    return []
+  }
+}
+
+export async function getPendingPayAtDeskCount(clinicId: string): Promise<number> {
+  try {
+    const { count, error } = await supabase
+      .from('appointments')
+      .select('id', { count: 'exact', head: true })
+      .eq('clinic_id', clinicId)
+      .eq('payment_mode', 'PAY_AT_DESK')
+      .eq('status', 'WAITING_FOR_APPROVAL')
+
+    if (error) throw error
+    return count || 0
+  } catch (err) {
+    console.error('Error getting pending pay at desk count:', err)
+    return 0
+  }
+}
+
+export async function approvePayAtDeskAppointment(appointmentId: string, clinicId: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('approve_pay_at_desk_appointment', {
+      p_appointment_id: appointmentId,
+      p_clinic_id: clinicId,
+    })
+
+    if (error) {
+      return { success: false, error: error.message }
+    }
+    return { success: true }
+  } catch (err: any) {
+    console.error('Error approving pay at desk appointment:', err)
+    return { success: false, error: err.message || 'Failed to approve request' }
+  }
+}
+
+export async function rejectPayAtDeskAppointment(appointmentId: string, clinicId: string, reason?: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('reject_pay_at_desk_appointment', {
+      p_appointment_id: appointmentId,
+      p_clinic_id: clinicId,
+      p_reason: reason || null,
+    })
+
+    if (error) {
+      return { success: false, error: error.message }
+    }
+    return { success: true }
+  } catch (err: any) {
+    console.error('Error rejecting pay at desk appointment:', err)
+    return { success: false, error: err.message || 'Failed to reject request' }
+  }
+}
+
+
+export async function retryPayAtDeskAppointment(appointmentId: string, patientMobile?: string): Promise<{ success: boolean; data?: any; error?: string }> {
+  try {
+    const { data, error } = await supabase.rpc('retry_pay_at_desk_appointment', {
+      p_appointment_id: appointmentId,
+      p_patient_mobile: patientMobile || null,
+    })
+
+    if (error) {
+      return { success: false, error: error.message }
+    }
+    return { success: true, data }
+  } catch (err: any) {
+    console.error('Error retrying pay at desk appointment:', err)
+    return { success: false, error: err.message || 'Failed to retry appointment request' }
+  }
+}

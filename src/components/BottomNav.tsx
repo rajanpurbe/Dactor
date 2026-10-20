@@ -11,7 +11,7 @@ import {
 
 interface BottomNavProps {
   activeTab: string
-  setActiveTab: (tab: string) => void
+  setActiveTab: (tab: string, params?: any) => void
   onOpenTrackerModal: () => void
   authRole?: 'clinic_manager' | 'doctor' | 'patient' | null
 }
@@ -22,6 +22,23 @@ export const BottomNav: React.FC<BottomNavProps> = ({
   onOpenTrackerModal,
   authRole,
 }) => {
+  // Completely hide mobile bottom navigation bar when inside any specific portal
+  if (
+    [
+      'portal',
+      'clinic-portal',
+      'admin-portal',
+      'doctor-portal',
+      'patient-portal',
+      'my-health',
+      'records',
+      'account',
+      'book',
+    ].includes(activeTab)
+  ) {
+    return null
+  }
+
   interface NavItem {
     id: string
     label: string
@@ -79,7 +96,11 @@ export const BottomNav: React.FC<BottomNavProps> = ({
               key={item.id}
               type="button"
               onClick={() => {
-                setActiveTab(item.id)
+                if (item.id === 'home') {
+                  setActiveTab('home', { intentionalHome: true })
+                } else {
+                  setActiveTab(item.id)
+                }
                 window.scrollTo({ top: 0, behavior: 'smooth' })
               }}
               className={`flex flex-col items-center justify-center py-1 px-1 rounded-2xl transition-all cursor-pointer ${

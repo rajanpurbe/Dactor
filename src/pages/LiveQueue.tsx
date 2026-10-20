@@ -31,9 +31,15 @@ import {
   Hourglass,
   Receipt,
   ArrowLeft,
-  Zap,
 } from 'lucide-react'
-import { Appointment, Clinic, Doctor, LabReport, BillingInvoice } from '../types'
+import {
+  Appointment,
+  Clinic,
+  Doctor,
+  LabReport,
+  BillingInvoice,
+  MultiSlotPositionResult,
+} from '../types'
 import {
   getAppointmentByTrackingCode,
   getAppointmentByTrackingCodeOrContact,
@@ -43,7 +49,18 @@ import {
   getLabReportsByTrackingCode,
   shiftAppointmentDate,
   cancelAppointment,
+  retryPayAtDeskAppointment,
+  calculateMultiSlotDailyPosition,
+  getLinkedConsultations,
+  LinkedConsultationsResult,
+  resolveStorageUrl,
+  resolveClinicLogoUrl,
+  resolveClinicCoverUrl,
+  resolveDoctorPhotoUrl,
 } from '../services/db'
+import { printAppointmentBill, printPrescription } from '../utils/medicalDocPrinter'
+import { supabase } from '../lib/supabase'
+import { playChimeSound } from '../utils/audioChime'
 import { updatePageSEO } from '../utils/seo'
 
 interface LiveQueueProps {
@@ -67,9 +84,18 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
   const [doctor, setDoctor] = useState<Doctor | null>(null)
   const [clinicQueue, setClinicQueue] = useState<Appointment[]>([])
   const [labReports, setLabReports] = useState<LabReport[]>([])
+  const [multiSlotResult, setMultiSlotResult] = useState<MultiSlotPositionResult | null>(null)
+  const [linkedConsultations, setLinkedConsultations] = useState<LinkedConsultationsResult | null>(null)
   const [loading, setLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
   const [copyFeedback, setCopyFeedback] = useState(false)
+
+  // Real-time Visual Notification Alert Banner State
+  const [activeAlert, setActiveAlert] = useState<{
+    id: string
+    title: string
+    message: string
+  } | null>(null)
 
   // Live Consultation Timer
   const [currentEpochSecond, setCurrentEpochSecond] = useState<number>(() =>
@@ -93,6 +119,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
 
   // Prescription & Bill Modal
   const [showPrescriptionModal, setShowPrescriptionModal] = useState(false)
+  const [selectedPrescriptionApptId, setSelectedPrescriptionApptId] = useState<string | null>(null)
 
   // Reschedule Modal
   const [showRescheduleModal, setShowRescheduleModal] = useState(false)
@@ -100,6 +127,10 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
   const [rescheduleTime, setRescheduleTime] = useState('')
   const [rescheduleProcessing, setRescheduleProcessing] = useState(false)
   const [rescheduleMsg, setRescheduleMsg] = useState('')
+
+  // Pay at Desk state
+  const [retryingPayAtDesk, setRetryingPayAtDesk] = useState(false)
+  const [payAtDeskError, setPayAtDeskError] = useState<string | null>(null)
 
   // 1-second interval ticker for live in-cabin consultation elapsed time
   useEffect(() => {
@@ -117,10 +148,16 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     setErrorMsg('')
 
     try {
-      const appt = await getAppointmentByTrackingCodeOrContact(clean)
-      setAppointment(appt)
+      const [appt, linked] = await Promise.all([
+        getAppointmentByTrackingCodeOrContact(clean),
+        getLinkedConsultations(clean),
+      ])
+      const effectiveAppt = appt || linked?.targetAppointment || null
+      setAppointment(effectiveAppt)
+      setLinkedConsultations(linked)
 
-      if (appt) {
+      if (effectiveAppt) {
+        const appt = effectiveAppt
         const effectiveCode = appt.trackingCode10Digit || clean
         // Fetch clinic details
         if (appt.clinicId) {
@@ -133,6 +170,23 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
           setClinicQueue(queueList)
           setLabReports(reportsData)
 
+          const avgMins = clinicData?.avgConsultationTimeMinutes || 10
+          try {
+            const multiSlot = await calculateMultiSlotDailyPosition(
+              appt.clinicId,
+              appt.doctorId,
+              appt.appointmentDate,
+              appt.id,
+              appt.slotId,
+              appt.appointmentTime,
+              avgMins
+            )
+            setMultiSlotResult(multiSlot)
+          } catch (e) {
+            console.error('Error calculating multi-slot position:', e)
+            setMultiSlotResult(null)
+          }
+
           // Fetch attending doctor if linked
           if (appt.doctorId) {
             const doc = await getDoctorById(appt.doctorId)
@@ -142,6 +196,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
           }
         }
       } else {
+        setMultiSlotResult(null)
         if (!silent) setErrorMsg(`No booking record found for '${clean}'.`)
       }
     } catch {
@@ -176,6 +231,97 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     return () => clearInterval(interval)
   }, [activeCode])
 
+  // Active Supabase Realtime WebSocket subscription for instant alerts & queue changes
+  useEffect(() => {
+    if (!activeCode && !appointment) return
+
+    const apptId = appointment?.id
+    const trackingCode = appointment?.trackingCode10Digit || activeCode
+    const channelTopic = `live_queue_channel_${trackingCode || apptId || 'guest'}`
+
+    const channel = supabase
+      .channel(channelTopic)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'notifications' },
+        (payload) => {
+          const newNotif = (payload.new || payload.old) as any
+          if (!newNotif) return
+
+          const msg = newNotif.message || ''
+          const title = newNotif.title || ''
+          const targetAudience = newNotif.target_audience
+          const notifType = newNotif.type
+
+          const matchesTracking = Boolean(
+            trackingCode && (
+              newNotif.appointment_id === trackingCode ||
+              msg.includes(trackingCode) ||
+              title.includes(trackingCode)
+            )
+          )
+          const matchesAppt = Boolean(
+            apptId && (
+              newNotif.appointment_id === apptId ||
+              msg.includes(apptId)
+            )
+          )
+          const matchesUser = Boolean(
+            appointment?.userId && newNotif.user_id === appointment.userId
+          )
+          const isBroadcast = targetAudience === 'all_users' || notifType === 'clinic_broadcast'
+
+          if (matchesTracking || matchesAppt || matchesUser || isBroadcast) {
+            playChimeSound()
+            const cleanMsg = msg.replace(/\[\[META:.*?\]\]/g, '').trim()
+            setActiveAlert({
+              id: newNotif.id || String(Date.now()),
+              title: title || 'Queue Alert',
+              message: cleanMsg,
+            })
+            if (activeCode) {
+              fetchQueueData(activeCode, true)
+            }
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'appointments' },
+        (payload) => {
+          const appt = payload.new as any
+          if (appt && (appt.id === apptId || appt.tracking_code_10_digit === trackingCode)) {
+            if (activeCode) {
+              fetchQueueData(activeCode, true)
+            }
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'queue_entries' },
+        () => {
+          if (activeCode) {
+            fetchQueueData(activeCode, true)
+          }
+        }
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(channel)
+    }
+  }, [activeCode, appointment?.id, appointment?.trackingCode10Digit, appointment?.userId])
+
+  // Auto-dismiss visual alert banner after 12 seconds
+  useEffect(() => {
+    if (!activeAlert) return
+    const timer = setTimeout(() => {
+      setActiveAlert(null)
+    }, 12000)
+    return () => clearTimeout(timer)
+  }, [activeAlert])
+
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     const clean = inputCode.trim()
@@ -195,7 +341,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
 
   // Calculations for live queue status
   const waitingPatients = useMemo(
-    () => clinicQueue.filter((a) => a.checkinStatus === 'waiting'),
+    () => clinicQueue.filter((a) => a.checkinStatus === 'waiting' && a.status !== 'WAITING_FOR_APPROVAL' && a.status !== 'UNAPPROVED' && a.status !== 'EXPIRED'),
     [clinicQueue]
   )
   const inConsultationPatient = useMemo(
@@ -203,13 +349,75 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     [clinicQueue]
   )
 
-  let patientsAhead = 0
-  if (appointment && appointment.checkinStatus === 'waiting') {
-    const myIndex = waitingPatients.findIndex((a) => a.id === appointment.id)
-    patientsAhead = myIndex >= 0 ? myIndex : 0
-    if (inConsultationPatient && inConsultationPatient.id !== appointment.id) {
-      patientsAhead += 1
+  // Check if the appointment is tomorrow or a future date
+  const isFutureOrTomorrow = useMemo(() => {
+    if (multiSlotResult) {
+      return multiSlotResult.isTomorrow || multiSlotResult.isFutureDate
     }
+    if (!appointment?.appointmentDate) return false
+    const apptDate = appointment.appointmentDate.trim().slice(0, 10)
+    const now = new Date()
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+    return apptDate > todayStr
+  }, [multiSlotResult, appointment?.appointmentDate])
+
+  const dateLabel = useMemo(() => {
+    if (multiSlotResult?.dateLabel) return multiSlotResult.dateLabel
+    if (!appointment?.appointmentDate) return 'visit'
+    const apptDate = appointment.appointmentDate.trim().slice(0, 10)
+    const now = new Date()
+    const tom = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+    const tomStr = `${tom.getFullYear()}-${String(tom.getMonth() + 1).padStart(2, '0')}-${String(tom.getDate()).padStart(2, '0')}`
+    if (apptDate === tomStr) return 'Tomorrow'
+    try {
+      const parts = apptDate.split('-')
+      if (parts.length === 3) {
+        const y = parseInt(parts[0], 10)
+        const m = parseInt(parts[1], 10) - 1
+        const d = parseInt(parts[2], 10)
+        const dt = new Date(y, m, d)
+        return `${d} ${dt.toLocaleDateString('en-US', { month: 'short' })}`
+      }
+    } catch {}
+    return apptDate
+  }, [multiSlotResult?.dateLabel, appointment?.appointmentDate])
+
+  const slotStartTimeStr = useMemo(() => {
+    if (multiSlotResult?.slotStartTimeText) return multiSlotResult.slotStartTimeText
+    if (!appointment?.appointmentTime) return '09:00 AM'
+    const token = appointment.appointmentTime.split(/[-–]|to/)[0]?.trim()
+    return token || '09:00 AM'
+  }, [multiSlotResult?.slotStartTimeText, appointment?.appointmentTime])
+
+  let patientsAhead = 0
+  let displayTokenNumber = appointment?.queueNumber || 1
+
+  if (isFutureOrTomorrow) {
+    patientsAhead = multiSlotResult ? Math.max(0, multiSlotResult.patientsAheadInDay) : 0
+    displayTokenNumber = multiSlotResult?.cumulativePosition || appointment?.queueNumber || 1
+  } else if (appointment) {
+    // For today: count active queue patients ahead
+    const activeWaiting = clinicQueue.filter(
+      (a) =>
+        a.id !== inConsultationPatient?.id &&
+        !['completed', 'done', 'cancelled', 'no_show'].includes(a.checkinStatus?.toLowerCase() || '') &&
+        a.status !== 'WAITING_FOR_APPROVAL' &&
+        a.status !== 'UNAPPROVED' &&
+        a.status !== 'EXPIRED'
+    )
+    const myPos = appointment.queuePosition || appointment.queueNumber || 0
+    let aheadCount = 0
+    if (myPos > 0) {
+      aheadCount = activeWaiting.filter((a) => (a.queuePosition || a.queueNumber || 0) < myPos).length
+    } else {
+      const idx = activeWaiting.findIndex((a) => a.id === appointment.id)
+      aheadCount = idx >= 0 ? idx : 0
+    }
+    if (inConsultationPatient && inConsultationPatient.id !== appointment.id) {
+      aheadCount += 1
+    }
+    patientsAhead = Math.max(0, aheadCount)
+    displayTokenNumber = appointment.queueNumber || (myPos > 0 ? myPos : 1)
   }
 
   const clinicAvgMinutes = clinic?.avgConsultationTimeMinutes || 10
@@ -222,10 +430,14 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     labReports.length > 0
 
   const isConsultancyCompleted =
-    appointment?.checkinStatus === 'completed' ||
-    appointment?.checkinStatus === 'done' ||
-    (appointment as any)?.queueStatus === 'completed' ||
-    (appointment as any)?.queueStatus === 'done'
+    appointment?.checkinStatus !== 'waiting' &&
+    appointment?.checkinStatus !== 'scheduled' &&
+    (
+      appointment?.checkinStatus === 'completed' ||
+      appointment?.checkinStatus === 'done' ||
+      (appointment as any)?.queueStatus === 'completed' ||
+      (appointment as any)?.queueStatus === 'done'
+    )
 
   const isInsideChamber =
     ['inside', 'in_consultation', 'called', 'serving'].includes(
@@ -411,11 +623,32 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     approxTimeText,
     suggestedArrivalText,
     slotNoticeText,
-    canOfferEarlyArrival,
     displayWaitText
   } = useMemo(() => {
     const now = new Date()
     const isDoctorFree = isDoctorInClinic && !inConsultationPatient && clinic?.isOnBreak !== true
+
+    // When appointment is tomorrow or on a future date, use multi-slot calculations directly
+    if (isFutureOrTomorrow) {
+      if (multiSlotResult) {
+        return {
+          effectiveExpectedTime: now,
+          timeWindowText: `${multiSlotResult.timeWindowText} (±15 min)`,
+          approxTimeText: multiSlotResult.approxAppointmentTimeText,
+          suggestedArrivalText: `Scheduled slot for ${multiSlotResult.dateLabel}`,
+          slotNoticeText: `Scheduled for ${multiSlotResult.dateLabel} • Approx. ${multiSlotResult.approxAppointmentTimeText}`,
+          displayWaitText: multiSlotResult.approxAppointmentTimeText,
+        }
+      }
+      return {
+        effectiveExpectedTime: now,
+        timeWindowText: `${slotStartTimeStr} (±15 min)`,
+        approxTimeText: `Scheduled for ${dateLabel}`,
+        suggestedArrivalText: `Scheduled slot for ${dateLabel}`,
+        slotNoticeText: `Scheduled for ${dateLabel} • Syncing queue line position...`,
+        displayWaitText: `Scheduled for ${dateLabel}`,
+      }
+    }
 
     let arrivalStr = ''
     let slotStartFmt = ''
@@ -436,18 +669,17 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
 
     const dynamicTime = new Date(now.getTime() + estimatedWaitMinutes * 60000)
     const isSlotInFuture = slotStartDate ? now.getTime() < slotStartDate.getTime() : false
-    const canEarly = Boolean(isDoctorFree && isSlotInFuture && appointment?.optInEarlyCall && patientsAhead === 0)
 
     let finalExpected: Date
     let waitText: string
 
     if (patientsAhead === 0) {
-      if (isSlotInFuture && !canEarly) {
+      if (isSlotInFuture) {
         finalExpected = slotStartDate || now
         const diffMins = Math.round((finalExpected.getTime() - now.getTime()) / 60000)
-        waitText = diffMins > 60 ? `Starts at ${slotStartFmt}` : `~${diffMins} min`
+        waitText = diffMins > 60 ? `Starts at ${slotStartFmt}` : `~${Math.max(0, diffMins)} min`
       } else {
-        // Position 1 and current time is within slot, doctor free early, or slot is over:
+        // Position 1 and current time is within slot or slot is over:
         finalExpected = now
         waitText = 'Arrive Fast'
       }
@@ -458,7 +690,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
         const slotStaggered = new Date(slotStartDate.getTime() + patientsAhead * clinicAvgMinutes * 60000)
         finalExpected = dynamicTime.getTime() > slotStaggered.getTime() ? dynamicTime : slotStaggered
         const diffMins = Math.round((finalExpected.getTime() - now.getTime()) / 60000)
-        waitText = diffMins > 60 ? `~${Math.round(diffMins / 60)} hr` : `~${diffMins} min`
+        waitText = diffMins > 60 ? `~${Math.round(diffMins / 60)} hr` : `~${Math.max(0, diffMins)} min`
       } else {
         // Current time is within slot or slot is over: calculate dynamically based on active queue
         finalExpected = dynamicTime
@@ -478,10 +710,9 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
       approxTimeText: isArriveFast ? 'Your turn, arrive fast' : `around ${fmt(finalExpected)}`,
       suggestedArrivalText: arrivalAdvice,
       slotNoticeText: isArriveFast ? 'You are at position 1! You are next in line — arrive fast.' : notice,
-      canOfferEarlyArrival: canEarly,
       displayWaitText: waitText
     }
-  }, [slotStartDate, isDoctorInClinic, inConsultationPatient, clinic?.isOnBreak, appointment?.optInEarlyCall, patientsAhead, estimatedWaitMinutes])
+  }, [slotStartDate, isDoctorInClinic, inConsultationPatient, clinic?.isOnBreak, patientsAhead, estimatedWaitMinutes, isFutureOrTomorrow, multiSlotResult, dateLabel, slotStartTimeStr])
 
   // Formatted expected call time
   const formattedExpectedTime = approxTimeText
@@ -535,6 +766,39 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
       {/* 2. OVERLAPPING CONTENT CONTAINER (Negative offset over Teal Header)        */}
       {/* ========================================================================= */}
       <div className="max-w-4xl mx-auto px-3 sm:px-6 lg:px-8 -mt-6 sm:-mt-8 space-y-4 sm:space-y-5">
+        {/* Real-Time Live Notification Alert Banner */}
+        {activeAlert && (
+          <div className="liquid-glass-elevated bg-gradient-to-r from-amber-500/20 via-teal-500/20 to-cyan-500/20 border-2 border-amber-400/60 dark:border-amber-400/80 rounded-3xl p-4 sm:p-5 shadow-glass-elevated animate-in zoom-in-95 duration-300 relative overflow-hidden">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3.5">
+                <div className="w-10 h-10 rounded-2xl bg-amber-500/20 text-amber-500 dark:text-amber-300 flex items-center justify-center shrink-0 border border-amber-500/30 animate-bounce">
+                  <BellRing className="w-5 h-5" />
+                </div>
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-full bg-amber-500/30 text-amber-900 dark:text-amber-200 text-[10px] font-black uppercase tracking-wider">
+                      Live Alert
+                    </span>
+                    <h3 className="text-sm sm:text-base font-black text-slate-900 dark:text-white">
+                      {activeAlert.title}
+                    </h3>
+                  </div>
+                  <p className="text-xs sm:text-sm text-slate-700 dark:text-slate-200 font-medium leading-relaxed">
+                    {activeAlert.message}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setActiveAlert(null)}
+                className="w-7 h-7 rounded-full bg-slate-500/10 hover:bg-slate-500/20 text-slate-500 dark:text-slate-400 flex items-center justify-center shrink-0 transition cursor-pointer"
+                title="Dismiss alert"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Search Input Bar (If not loaded or searching another code) */}
         <div className="liquid-glass-elevated rounded-3xl p-2 sm:p-2.5 border-teal-500/30 shadow-glass-elevated">
           <form onSubmit={handleSearchSubmit} className="flex items-center gap-1.5 sm:gap-2">
@@ -605,7 +869,406 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
               </button>
             </div>
 
+            {/* PRESERVED QUICK PATIENT CONTROLS BAR */}
+            <div className="liquid-glass-card rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-2.5 border border-white/40 dark:border-white/10 shadow-glass-sm">
+              <div className="text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                <Receipt className="w-4 h-4 text-teal-600 dark:text-teal-400" />
+                <span>Patient Actions & Documents:</span>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => printAppointmentBill(appointment)}
+                  className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs shadow-xs transition flex items-center space-x-1 cursor-pointer active:scale-95"
+                  title="Download and print official medical bill"
+                >
+                  <Download className="w-3.5 h-3.5 text-teal-300" />
+                  <span>Download Bill</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => printPrescription(appointment)}
+                  className="px-3 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs shadow-xs transition flex items-center space-x-1 cursor-pointer active:scale-95"
+                  title="Download official doctor prescription"
+                >
+                  <Stethoscope className="w-3.5 h-3.5 text-white" />
+                  <span>Download Rx</span>
+                </button>
+                {!isCalledInsideOrDone && (
+                  <button
+                    type="button"
+                    onClick={() => handleActionWithAuth('reschedule')}
+                    className="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs shadow-xs transition flex items-center space-x-1 cursor-pointer active:scale-95"
+                    title="Reschedule appointment date or slot"
+                  >
+                    <Calendar className="w-3.5 h-3.5" />
+                    <span>Reschedule</span>
+                  </button>
+                )}
+                {clinic?.contactPhone && (
+                  <a
+                    href={`tel:${clinic.contactPhone}`}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 text-emerald-800 dark:text-emerald-300 font-bold text-xs border border-emerald-300 dark:border-emerald-700 transition flex items-center space-x-1"
+                    title={`Call Clinic Reception (${clinic.contactPhone})`}
+                  >
+                    <Phone className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                    <span>Call Reception</span>
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => fetchQueueData(activeCode)}
+                  className="p-1.5 rounded-xl liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70 text-slate-700 dark:text-slate-300 transition cursor-pointer active:scale-95"
+                  title="Refresh Queue Status"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* DUAL-CONSULTATION BREAKDOWN: INITIAL & FOLLOW-UP VISITS */}
+            {linkedConsultations && linkedConsultations.isLinked && (
+              <div className="liquid-glass-elevated rounded-3xl p-5 border border-teal-500/30 space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-white/20 dark:border-white/10">
+                  <div className="flex items-center space-x-2">
+                    <Stethoscope className="w-5 h-5 text-teal-600 dark:text-teal-400" />
+                    <h3 className="font-black text-sm text-slate-900 dark:text-white uppercase tracking-wider">
+                      Dual-Consultation Clinical Breakdown
+                    </h3>
+                  </div>
+                  <span className="text-[11px] font-bold text-teal-700 dark:text-teal-300 bg-teal-500/10 px-2.5 py-0.5 rounded-full border border-teal-500/20">
+                    2 Linked Visits Recorded
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Visit 1: Initial Consultation */}
+                  {linkedConsultations.initialAppointment && (
+                    <div className="p-4 rounded-2xl bg-blue-50/60 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 space-y-3">
+                      <div className="flex items-center justify-between pb-2 border-b border-blue-100 dark:border-blue-900">
+                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wide bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 border border-blue-200 dark:border-blue-700">
+                          1. Initial Consultation (Paid)
+                        </span>
+                        <span className="font-mono text-xs font-bold text-slate-700 dark:text-slate-300">
+                          #{linkedConsultations.initialAppointment.trackingCode10Digit}
+                        </span>
+                      </div>
+
+                      <div className="text-xs space-y-1.5 text-slate-700 dark:text-slate-300">
+                        <div>
+                          <strong className="text-slate-900 dark:text-white">Doctor:</strong>{' '}
+                          {linkedConsultations.initialAppointment.doctor?.fullName || doctor?.fullName || 'OPD Specialist'}
+                          {linkedConsultations.initialAppointment.doctor?.specialty ? ` (${linkedConsultations.initialAppointment.doctor?.specialty})` : ''}
+                        </div>
+                        <div>
+                          <strong className="text-slate-900 dark:text-white">Date:</strong>{' '}
+                          {linkedConsultations.initialAppointment.appointmentDate} • {linkedConsultations.initialAppointment.appointmentTime || '10:00 AM'}
+                        </div>
+                        <div>
+                          <strong className="text-slate-900 dark:text-white">Total Bill:</strong> NPR{' '}
+                          {linkedConsultations.initialAppointment.feeAmount || 500}{' '}
+                          <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                            ({linkedConsultations.initialAppointment.paymentStatus || 'Paid'})
+                          </span>
+                        </div>
+                        {linkedConsultations.initialAppointment.notes && (
+                          <div className="mt-1 p-2 rounded-xl bg-white/70 dark:bg-slate-900/60 border border-blue-100 dark:border-blue-900 text-[11px]">
+                            <strong>Clinical Notes & Rx:</strong> {linkedConsultations.initialAppointment.notes}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="pt-2 border-t border-blue-100 dark:border-blue-900 flex items-center gap-2 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => printAppointmentBill(linkedConsultations.initialAppointment!)}
+                          className="flex-1 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800 hover:bg-blue-50 dark:hover:bg-slate-700 text-blue-900 dark:text-blue-200 font-bold text-xs border border-blue-200 dark:border-blue-700 transition flex items-center justify-center space-x-1 cursor-pointer"
+                        >
+                          <Receipt className="w-3.5 h-3.5 text-blue-600" />
+                          <span>Download Initial Bill</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => printPrescription(linkedConsultations.initialAppointment!)}
+                          className="flex-1 py-1.5 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs transition flex items-center justify-center space-x-1 cursor-pointer"
+                        >
+                          <Stethoscope className="w-3.5 h-3.5" />
+                          <span>View Initial Rx</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Visit 2: Follow-Up Consultation */}
+                  {linkedConsultations.followupAppointment && (
+                    <div className="p-4 rounded-2xl bg-teal-50/60 dark:bg-teal-950/30 border border-teal-200 dark:border-teal-800 space-y-3">
+                      <div className="flex items-center justify-between pb-2 border-b border-teal-100 dark:border-teal-900">
+                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wide bg-teal-100 dark:bg-teal-900/60 text-teal-800 dark:text-teal-200 border border-teal-200 dark:border-teal-700">
+                          2. Follow-Up Consultation (Rs. 0 Free)
+                        </span>
+                        <span className="font-mono text-xs font-bold text-teal-700 dark:text-teal-300">
+                          #{linkedConsultations.followupAppointment.trackingCode10Digit}
+                        </span>
+                      </div>
+
+                      <div className="text-xs space-y-1.5 text-slate-700 dark:text-slate-300">
+                        <div>
+                          <strong className="text-slate-900 dark:text-white">Doctor:</strong>{' '}
+                          {linkedConsultations.followupAppointment.doctor?.fullName || doctor?.fullName || 'OPD Specialist'}
+                        </div>
+                        <div>
+                          <strong className="text-slate-900 dark:text-white">Date:</strong>{' '}
+                          {linkedConsultations.followupAppointment.appointmentDate} • {linkedConsultations.followupAppointment.appointmentTime || '11:00 AM'}
+                        </div>
+                        <div>
+                          <strong className="text-slate-900 dark:text-white">Status:</strong>{' '}
+                          <span className="font-bold text-teal-700 dark:text-teal-300 uppercase">
+                            {linkedConsultations.followupAppointment.checkinStatus.replace('_', ' ')}
+                          </span>
+                          {' • '}
+                          <strong className="text-slate-900 dark:text-white">Fee:</strong>{' '}
+                          <span className="text-emerald-600 dark:text-emerald-400 font-bold">NPR 0 (Free Follow-Up)</span>
+                        </div>
+                        {linkedConsultations.followupAppointment.notes && (
+                          <div className="mt-1 p-2 rounded-xl bg-white/70 dark:bg-slate-900/60 border border-teal-100 dark:border-teal-900 text-[11px]">
+                            <strong>Remarks:</strong> {linkedConsultations.followupAppointment.notes}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="pt-2 border-t border-teal-100 dark:border-teal-900 flex items-center gap-2 flex-wrap">
+                        {linkedConsultations.followupAppointment.checkinStatus === 'completed' ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => printAppointmentBill(linkedConsultations.followupAppointment!)}
+                              className="flex-1 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800 hover:bg-teal-50 dark:hover:bg-slate-700 text-teal-900 dark:text-teal-200 font-bold text-xs border border-teal-200 dark:border-teal-700 transition flex items-center justify-center space-x-1 cursor-pointer"
+                            >
+                              <Receipt className="w-3.5 h-3.5 text-teal-600" />
+                              <span>Follow-Up Bill</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => printPrescription(linkedConsultations.followupAppointment!)}
+                              className="flex-1 py-1.5 px-3 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs transition flex items-center justify-center space-x-1 cursor-pointer"
+                            >
+                              <Stethoscope className="w-3.5 h-3.5" />
+                              <span>Follow-Up Rx</span>
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleActionWithAuth('reschedule')}
+                              className="flex-1 py-1.5 px-3 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs transition flex items-center justify-center space-x-1 cursor-pointer"
+                            >
+                              <Calendar className="w-3.5 h-3.5" />
+                              <span>Reschedule Follow-Up</span>
+                            </button>
+                            {clinic?.contactPhone && (
+                              <a
+                                href={`tel:${clinic.contactPhone}`}
+                                className="flex-1 py-1.5 px-3 rounded-xl bg-white dark:bg-slate-800 hover:bg-teal-50 text-teal-900 dark:text-teal-200 font-bold text-xs border border-teal-300 dark:border-teal-700 transition flex items-center justify-center space-x-1"
+                              >
+                                <Phone className="w-3.5 h-3.5 text-teal-600" />
+                                <span>Clinic Help</span>
+                              </a>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* 2. CLINIC ON BREAK ALERT BANNER (If clinic is on break) */}
+            {appointment.paymentMode === 'PAY_AT_DESK' && appointment.status !== 'APPROVED' ? (
+              <div className="liquid-glass-elevated rounded-3xl p-5 sm:p-7 space-y-5 animate-in fade-in duration-200">
+                {/* Header Status Badge & Attempt Counter */}
+                <div className="flex flex-wrap items-center justify-between gap-2.5 pb-4 border-b border-white/20 dark:border-white/5">
+                  <span
+                    className={`px-3.5 py-1 rounded-full text-xs font-black uppercase tracking-wider border shadow-xs ${
+                      appointment.status === 'WAITING_FOR_APPROVAL'
+                        ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30'
+                        : appointment.status === 'UNAPPROVED'
+                        ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30'
+                        : 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border-slate-500/30'
+                    }`}
+                  >
+                    {appointment.status === 'WAITING_FOR_APPROVAL'
+                      ? 'Waiting for Clinic Approval'
+                      : appointment.status === 'UNAPPROVED'
+                      ? 'Unapproved'
+                      : 'Request Expired'}
+                  </span>
+
+                  <div className="flex items-center space-x-1.5 text-xs font-bold text-slate-500 dark:text-slate-400">
+                    <Clock className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                    <span>Attempt {appointment.attemptNumber || 1} of 3</span>
+                  </div>
+                </div>
+
+                {/* Status Main Message */}
+                <div className="space-y-2">
+                  <h3 className="text-xl sm:text-2xl font-black text-slate-900 dark:text-white">
+                    {appointment.status === 'WAITING_FOR_APPROVAL' && 'Waiting for approval from clinic'}
+                    {appointment.status === 'UNAPPROVED' && 'Unapproved'}
+                    {appointment.status === 'EXPIRED' && 'Request expired'}
+                  </h3>
+                  <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300">
+                    {appointment.status === 'WAITING_FOR_APPROVAL' &&
+                      'Your Pay at Desk booking request has been submitted to the clinic counter. You will be assigned a live queue token as soon as reception approves your request.'}
+                    {appointment.status === 'UNAPPROVED' &&
+                      ((appointment.attemptNumber || 1) < 3
+                        ? 'The clinic unapproved your booking request. You can retry sending this request to the clinic.'
+                        : 'The clinic unapproved your booking request. Maximum send attempts (3 of 3) have been reached.')}
+                    {appointment.status === 'EXPIRED' &&
+                      'This booking request has expired because it was not approved within 2 days or the slot time has passed.'}
+                  </p>
+                </div>
+
+                {payAtDeskError && (
+                  <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-700 dark:text-rose-300 text-xs flex items-center space-x-2">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    <span>{payAtDeskError}</span>
+                  </div>
+                )}
+
+                {/* Amount Breakdown Summary */}
+                <div className="p-4 rounded-2xl liquid-glass-subtle border border-white/30 dark:border-white/10 space-y-2 text-xs">
+                  <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                    <span>Consultation Fee</span>
+                    <span className="font-semibold text-slate-800 dark:text-slate-200">
+                      Rs. {appointment.feeAmount}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                    <span>Pay at Desk Service Charge (5%)</span>
+                    <span className="font-semibold text-slate-800 dark:text-slate-200">
+                      Rs. {appointment.serviceChargeAmount || Number((appointment.feeAmount * 0.05).toFixed(2))}
+                    </span>
+                  </div>
+                  <div className="border-t border-white/20 dark:border-white/10 pt-2 flex justify-between font-black text-sm text-slate-900 dark:text-white">
+                    <span>Total Payable at Desk</span>
+                    <span className="text-teal-600 dark:text-teal-400">
+                      Rs. {appointment.totalAmount || (appointment.feeAmount + Number((appointment.feeAmount * 0.05).toFixed(2)))}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Action Buttons based on status */}
+                <div className="flex flex-wrap items-center gap-3 pt-2">
+                  {appointment.status === 'WAITING_FOR_APPROVAL' && (
+                    clinic?.contactPhone ? (
+                      <a
+                        href={`tel:${clinic.contactPhone}`}
+                        className="flex-1 py-3 px-5 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-bold text-xs sm:text-sm shadow-glass-base flex items-center justify-center space-x-2 transition cursor-pointer active:scale-[0.98]"
+                      >
+                        <Phone className="w-4 h-4" />
+                        <span>Call Clinic ({clinic.contactPhone})</span>
+                      </a>
+                    ) : (
+                      <button
+                        disabled
+                        className="flex-1 py-3 px-5 rounded-2xl bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-500 font-bold text-xs sm:text-sm cursor-not-allowed flex items-center justify-center space-x-2"
+                        title="Clinic has not provided a contact phone number"
+                      >
+                        <Phone className="w-4 h-4" />
+                        <span>Call Clinic (No Phone Listed)</span>
+                      </button>
+                    )
+                  )}
+
+                  {appointment.status === 'UNAPPROVED' && (
+                    (appointment.attemptNumber || 1) < 3 ? (
+                      <button
+                        type="button"
+                        disabled={retryingPayAtDesk}
+                        onClick={async () => {
+                          setRetryingPayAtDesk(true)
+                          setPayAtDeskError(null)
+                          try {
+                            const res = await retryPayAtDeskAppointment(appointment.id, appointment.patientMobile || undefined)
+                            if (res.success) {
+                              await fetchQueueData(activeCode)
+                            } else {
+                              setPayAtDeskError(res.error || 'Failed to retry request')
+                            }
+                          } catch (err: any) {
+                            setPayAtDeskError(err.message || 'Failed to retry request')
+                          } finally {
+                            setRetryingPayAtDesk(false)
+                          }
+                        }}
+                        className="flex-1 py-3 px-5 rounded-2xl bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-700 hover:to-orange-700 text-white font-bold text-xs sm:text-sm shadow-glass-base flex items-center justify-center space-x-2 transition cursor-pointer active:scale-[0.98] disabled:opacity-50"
+                      >
+                        {retryingPayAtDesk ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                            <span>Retrying Request...</span>
+                          </>
+                        ) : (
+                          <>
+                            <RefreshCw className="w-4 h-4" />
+                            <span>Retry Request ({3 - (appointment.attemptNumber || 1)} retries left)</span>
+                          </>
+                        )}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (appointment.clinicId) {
+                            if (onNavigate) {
+                              onNavigate('clinic-detail', { clinicId: appointment.clinicId })
+                            } else {
+                              window.location.href = `/?clinic=${appointment.clinicId}#clinic-detail`
+                            }
+                          }
+                        }}
+                        className="flex-1 py-3 px-5 rounded-2xl bg-gradient-to-r from-teal-600 to-cyan-600 hover:from-teal-700 hover:to-cyan-700 text-white font-bold text-xs sm:text-sm shadow-glass-base flex items-center justify-center space-x-2 transition cursor-pointer active:scale-[0.98]"
+                      >
+                        <Calendar className="w-4 h-4" />
+                        <span>Book Another Slot</span>
+                      </button>
+                    )
+                  )}
+
+                  {appointment.status === 'EXPIRED' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (appointment.clinicId) {
+                          if (onNavigate) {
+                            onNavigate('clinic-detail', { clinicId: appointment.clinicId })
+                          } else {
+                            window.location.href = `/?clinic=${appointment.clinicId}#clinic-detail`
+                          }
+                        }
+                      }}
+                      className="flex-1 py-3 px-5 rounded-2xl bg-gradient-to-r from-teal-600 to-cyan-600 hover:from-teal-700 hover:to-cyan-700 text-white font-bold text-xs sm:text-sm shadow-glass-base flex items-center justify-center space-x-2 transition cursor-pointer active:scale-[0.98]"
+                    >
+                      <Calendar className="w-4 h-4" />
+                      <span>Book Again</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => fetchQueueData(activeCode)}
+                    className="py-3 px-4 rounded-2xl liquid-glass-subtle hover:bg-white/80 dark:hover:bg-slate-800/80 text-slate-700 dark:text-slate-300 font-bold text-xs transition flex items-center space-x-1.5 cursor-pointer active:scale-95 border border-white/30 dark:border-white/10"
+                    title="Refresh Status"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    <span>Refresh</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
             {clinic?.isOnBreak && !isConsultancyCompleted && (
               <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 flex items-center space-x-3 text-amber-900 dark:text-amber-300 shadow-glass-sm backdrop-blur-sm">
                 <div className="w-9 h-9 rounded-full bg-amber-500 text-white flex items-center justify-center shrink-0">
@@ -626,19 +1289,29 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
             {!isConsultancyCompleted && !isLabClinic && (
               <div
                 className={`p-3.5 rounded-2xl border text-xs flex items-center space-x-2.5 backdrop-blur-sm ${
-                  isDoctorInClinic
+                  isFutureOrTomorrow
+                    ? 'bg-sky-500/10 border-sky-500/20 text-sky-900 dark:text-sky-300'
+                    : isDoctorInClinic
                     ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-900 dark:text-emerald-300'
                     : 'bg-amber-500/10 border-amber-500/20 text-amber-900 dark:text-amber-300'
                 }`}
               >
                 <span
                   className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                    isDoctorInClinic ? 'bg-emerald-500 animate-ping' : 'bg-amber-500'
+                    isFutureOrTomorrow
+                      ? 'bg-sky-500'
+                      : isDoctorInClinic
+                      ? 'bg-emerald-500 animate-ping'
+                      : 'bg-amber-500'
                   }`}
                 />
                 <span className="font-bold">
-                  {isDoctorInClinic
-                    ? `Doctor is inside the clinic cabin • Attending active OPD tokens`
+                  {isFutureOrTomorrow
+                    ? `Doctor session scheduled for ${dateLabel} • Starts at ${slotStartTimeStr} (±15 min)`
+                    : isDoctorInClinic
+                    ? inConsultationPatient
+                      ? `Doctor is inside the clinic cabin • Attending active OPD tokens`
+                      : `Doctor is inside and available • Consultations proceeding smoothly`
                     : `Doctor Temporarily Away • Will resume consultations shortly`}
                 </span>
               </div>
@@ -677,6 +1350,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                           ? 'CURRENT'
                           : isConsultancyCompleted
                           ? 'VISIT'
+                          : isFutureOrTomorrow
+                          ? 'LINE NO.'
                           : patientsAhead === 0
                           ? 'UP NEXT'
                           : 'POSITION'}
@@ -686,9 +1361,9 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                           ? 'NOW'
                           : isConsultancyCompleted
                           ? '✓'
-                          : patientsAhead >= 0
-                          ? patientsAhead
-                          : '—'}
+                          : isFutureOrTomorrow
+                          ? `${multiSlotResult?.cumulativePosition || displayTokenNumber}`
+                          : `${Math.max(0, patientsAhead)}`}
                       </span>
                     </div>
                   </div>
@@ -722,13 +1397,17 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                       ? 'You are in OPD session'
                       : isConsultancyCompleted
                       ? 'Consultation completed'
+                      : isFutureOrTomorrow && patientsAhead === 0
+                      ? `1st in line for ${dateLabel}`
+                      : isFutureOrTomorrow
+                      ? `${patientsAhead} patients ahead for ${dateLabel}`
                       : patientsAhead === 0
                       ? "You're next in line!"
                       : `${patientsAhead} patients ahead`}
                     </h3>
 
                     <span className="px-2 sm:px-2.5 py-0.5 rounded-md liquid-glass-subtle text-slate-700 dark:text-slate-300 text-[11px] sm:text-xs font-bold">
-                      Token #{appointment.queueNumber || 1}
+                      Token #{displayTokenNumber}
                     </span>
                   </div>
 
@@ -743,6 +1422,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                       ? 'Currently with specialist in consultation cabin'
                       : isConsultancyCompleted
                       ? 'Thank you for visiting • Prescription & bill available below'
+                      : isFutureOrTomorrow
+                      ? `Scheduled for ${dateLabel} • Approx. ${multiSlotResult?.approxAppointmentTimeText || `${slotStartTimeStr} (±15 min)`}`
                       : slotNoticeText || (patientsAhead === 0
                       ? '0 patients ahead • Please stay close to the consultation cabin'
                       : `${patientsAhead} ahead in line • Est. wait: ~${estimatedWaitMinutes} mins`)}
@@ -812,54 +1493,59 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div className="p-4 rounded-2xl liquid-glass-subtle space-y-0.5">
                       <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                        Your Booked Window
+                        {isFutureOrTomorrow ? 'Your Slot' : 'Your Booked Window'}
                       </span>
                       <div className="text-base font-black text-slate-900 dark:text-white">
-                        {appointment.appointmentTime || 'Real-time queue'}
+                        {isFutureOrTomorrow
+                          ? `${dateLabel}, ${slotStartTimeStr} (±15 min)`
+                          : appointment.appointmentTime
+                          ? `${appointment.appointmentTime} (±15 min)`
+                          : '09:00 AM (±15 min)'}
                       </div>
                       <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                        {suggestedArrivalText || `Date: ${appointment.appointmentDate}`}
+                        {isFutureOrTomorrow
+                          ? 'Scheduled slot'
+                          : suggestedArrivalText || `Date: ${appointment.appointmentDate}`}
                       </span>
                     </div>
 
-                    <div className={`p-4 rounded-2xl liquid-glass-subtle space-y-0.5 ${canOfferEarlyArrival ? 'border border-emerald-500/40 bg-emerald-500/10' : 'border-teal-500/30'}`}>
-                      <span className={`text-[10px] font-bold uppercase tracking-wider ${canOfferEarlyArrival ? 'text-emerald-700 dark:text-emerald-300' : 'text-teal-700 dark:text-teal-300'}`}>
-                        {canOfferEarlyArrival ? '⚡ Doctor Free Early' : 'Expected Window'}
+                    <div className="p-4 rounded-2xl liquid-glass-subtle space-y-0.5 border border-teal-500/30">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-teal-700 dark:text-teal-300">
+                        {isFutureOrTomorrow
+                          ? 'Scheduled Window'
+                          : 'Expected Window'}
                       </span>
-                      <div className={`text-base font-black ${canOfferEarlyArrival ? 'text-emerald-900 dark:text-emerald-200' : 'text-teal-900 dark:text-teal-200'}`}>
-                        {displayWaitText}
+                      <div className="text-base font-black text-teal-900 dark:text-teal-200">
+                        {isFutureOrTomorrow && multiSlotResult
+                          ? multiSlotResult.approxAppointmentTimeText
+                          : isFutureOrTomorrow
+                          ? `${slotStartTimeStr} (±15 min)`
+                          : displayWaitText}
                       </div>
-                      <span className={`text-[11px] ${canOfferEarlyArrival ? 'text-emerald-700 dark:text-emerald-400 font-semibold' : 'text-teal-700 dark:text-teal-400'}`}>
-                        {timeWindowText} ({approxTimeText})
+                      <span className="text-[11px] text-teal-700 dark:text-teal-400">
+                        {isFutureOrTomorrow && multiSlotResult
+                          ? `${multiSlotResult.timeWindowText} (±15 min)`
+                          : isFutureOrTomorrow
+                          ? 'Staggered arrival window'
+                          : `${timeWindowText} (${approxTimeText})`}
                       </span>
                     </div>
                   </div>
-
-                  {/* ⚡ Early Arrival Invite Banner if doctor is free now */}
-                  {canOfferEarlyArrival && (
-                    <div className="p-3.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-900 dark:text-emerald-200 flex items-start space-x-3">
-                      <Zap className="w-5 h-5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
-                      <div>
-                        <div className="text-xs font-bold">⚡ Doctor is Free Now! Come in early?</div>
-                        <div className="text-[11px] text-emerald-700 dark:text-emerald-300/90 mt-0.5 leading-relaxed">
-                          The doctor finished earlier consultations ahead of schedule. Since you opted in at booking, you can proceed to the clinic now!
-                        </div>
-                      </div>
-                    </div>
-                  )}
                 </div>
               )}
             </div>
+            </>
+            )}
 
             {/* 5. CLINIC & DOCTOR PROFILE CARD (Call, Directions & Roster) */}
             <div className="liquid-glass-card rounded-3xl p-6 space-y-5">
               {/* Clinic Information */}
               <div className="space-y-3">
                 <div className="flex items-center space-x-3">
-                  {clinic?.photoUrl || clinic?.logoUrl || (clinic?.pictures && clinic.pictures[0]) ? (
+                  {resolveClinicLogoUrl(clinic) || clinic?.photoUrl || clinic?.logoUrl || (clinic?.pictures && clinic.pictures[0]) ? (
                     <img
-                      src={clinic.photoUrl || clinic.logoUrl || clinic.pictures[0]}
-                      alt={clinic.name || 'Clinic'}
+                      src={resolveClinicLogoUrl(clinic) || resolveStorageUrl(clinic?.photoUrl || clinic?.logoUrl || clinic?.pictures?.[0], 'clinic_logos')}
+                      alt={clinic?.name || 'Clinic'}
                       className="w-10 h-10 rounded-xl object-cover shrink-0 border border-teal-500/20 shadow-sm"
                     />
                   ) : (
@@ -916,7 +1602,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                   <div className="w-12 h-12 rounded-2xl bg-teal-500/10 text-teal-700 dark:text-teal-300 border border-teal-500/20 flex items-center justify-center font-black text-lg shrink-0 overflow-hidden">
                     {doctor.profilePictureUrl ? (
                       <img
-                        src={doctor.profilePictureUrl}
+                        src={resolveDoctorPhotoUrl(doctor) || resolveStorageUrl(doctor.profilePictureUrl, 'doctor_photos')}
                         alt={doctor.fullName}
                         className="w-full h-full object-cover"
                       />
@@ -1261,67 +1947,134 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
       {/* ========================================================================= */}
       {/* PRESCRIPTION & BILL MODAL                                                 */}
       {/* ========================================================================= */}
-      {showPrescriptionModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200">
-          <div className="liquid-glass-modal rounded-3xl max-w-lg w-full p-4 sm:p-6 space-y-4 max-h-[92vh] overflow-y-auto">
-            <div className="flex items-center justify-between border-b border-slate-200/50 dark:border-white/10 pb-3">
-              <div className="flex items-center space-x-2">
-                <Receipt className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-600 dark:text-emerald-400" />
-                <h3 className="text-sm sm:text-base font-black text-slate-900 dark:text-white">
-                  Prescription & Billing Receipt
-                </h3>
-              </div>
-              <button
-                onClick={() => setShowPrescriptionModal(false)}
-                className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-full cursor-pointer transition"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+      {showPrescriptionModal && (() => {
+        const hasLinked = linkedConsultations && linkedConsultations.isLinked
+        const activeAppt =
+          (selectedPrescriptionApptId &&
+            linkedConsultations?.allConsultations.find((a) => a.id === selectedPrescriptionApptId)) ||
+          appointment
 
-            <div className="space-y-3 text-xs">
-              <div className="p-3 liquid-glass-subtle rounded-xl space-y-1">
-                <div className="flex justify-between font-bold text-slate-800 dark:text-slate-200">
-                  <span>Patient Name:</span>
-                  <span>{appointment?.patientName}</span>
+        const apptDoctor = activeAppt?.doctor || doctor
+        const apptClinic = activeAppt?.clinic || clinic
+
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-md flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-200">
+            <div className="liquid-glass-modal rounded-3xl max-w-lg w-full p-4 sm:p-6 space-y-4 max-h-[92vh] overflow-y-auto">
+              <div className="flex items-center justify-between border-b border-slate-200/50 dark:border-white/10 pb-3">
+                <div className="flex items-center space-x-2">
+                  <Receipt className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-600 dark:text-emerald-400" />
+                  <h3 className="text-sm sm:text-base font-black text-slate-900 dark:text-white">
+                    Prescription & Billing Documents
+                  </h3>
                 </div>
-                <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                  <span>Facility:</span>
-                  <span>{clinic?.name || 'OPD Clinic'}</span>
-                </div>
-                <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                  <span>Attending Doctor:</span>
-                  <span>{doctor?.fullName || 'OPD Specialist'}</span>
-                </div>
-                <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                  <span>Visit Date:</span>
-                  <span>{appointment?.appointmentDate}</span>
-                </div>
+                <button
+                  onClick={() => setShowPrescriptionModal(false)}
+                  className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-full cursor-pointer transition"
+                >
+                  <X className="w-5 h-5" />
+                </button>
               </div>
 
-              <div className="p-3 liquid-glass-subtle border-emerald-500/30 text-emerald-900 dark:text-emerald-300 rounded-xl space-y-1">
-                <div className="flex justify-between font-bold text-sm">
-                  <span>Total Consultation Fee:</span>
-                  <span>NPR {appointment?.feeAmount || 500}</span>
+              {/* Consultation Tab Switcher if multiple visits exist */}
+              {hasLinked && linkedConsultations.allConsultations.length > 1 && (
+                <div className="flex items-center gap-1.5 p-1 rounded-2xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700">
+                  {linkedConsultations.allConsultations.map((cAppt, idx) => {
+                    const isSelected = (activeAppt?.id || appointment?.id) === cAppt.id
+                    return (
+                      <button
+                        key={cAppt.id}
+                        type="button"
+                        onClick={() => setSelectedPrescriptionApptId(cAppt.id)}
+                        className={`flex-1 py-1.5 px-2 rounded-xl text-[11px] font-bold transition-all cursor-pointer ${
+                          isSelected
+                            ? 'bg-white dark:bg-slate-700 text-teal-800 dark:text-teal-200 shadow-xs'
+                            : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                        }`}
+                      >
+                        {idx === 0 ? '1. Initial Visit' : '2. Follow-Up Visit'}
+                      </button>
+                    )
+                  })}
                 </div>
-                <div className="flex justify-between text-[11px] text-emerald-700 dark:text-emerald-400">
-                  <span>Payment Status:</span>
-                  <span className="font-bold uppercase">{appointment?.paymentStatus || 'Paid'}</span>
-                </div>
-              </div>
-            </div>
+              )}
 
-            <div className="pt-2 flex justify-end">
-              <button
-                onClick={() => setShowPrescriptionModal(false)}
-                className="w-full sm:w-auto px-5 py-2.5 bg-gradient-to-r from-teal-600 to-cyan-600 text-white rounded-xl text-xs font-bold shadow-glass-sm cursor-pointer active:scale-95 border-t border-white/20"
-              >
-                Close
-              </button>
+              <div className="space-y-3 text-xs">
+                <div className="p-3 liquid-glass-subtle rounded-xl space-y-1">
+                  <div className="flex justify-between font-bold text-slate-800 dark:text-slate-200">
+                    <span>Patient Name:</span>
+                    <span>{activeAppt?.patientName}</span>
+                  </div>
+                  <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                    <span>Facility:</span>
+                    <span>{apptClinic?.name || 'OPD Clinic'}</span>
+                  </div>
+                  <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                    <span>Attending Doctor:</span>
+                    <span>{apptDoctor?.fullName || 'OPD Specialist'}</span>
+                  </div>
+                  <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                    <span>Visit Date & Time:</span>
+                    <span>{activeAppt?.appointmentDate} • {activeAppt?.appointmentTime || '10:00 AM'}</span>
+                  </div>
+                  <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                    <span>Tracking Token:</span>
+                    <span className="font-mono font-bold text-teal-600 dark:text-teal-400">#{activeAppt?.trackingCode10Digit}</span>
+                  </div>
+                </div>
+
+                <div className="p-3 liquid-glass-subtle border-emerald-500/30 text-emerald-900 dark:text-emerald-300 rounded-xl space-y-1">
+                  <div className="flex justify-between font-bold text-sm">
+                    <span>Total Consultation Fee:</span>
+                    <span>NPR {activeAppt?.feeAmount ?? 500}</span>
+                  </div>
+                  <div className="flex justify-between text-[11px] text-emerald-700 dark:text-emerald-400">
+                    <span>Payment Status:</span>
+                    <span className="font-bold uppercase">{activeAppt?.paymentStatus || 'Paid'}</span>
+                  </div>
+                </div>
+
+                {activeAppt?.notes && (
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800 text-[11px] space-y-1">
+                    <strong className="text-slate-800 dark:text-slate-200">Clinical Remarks & Instructions:</strong>
+                    <p className="text-slate-600 dark:text-slate-400 whitespace-pre-wrap">{activeAppt.notes}</p>
+                  </div>
+                )}
+              </div>
+
+              {/* Action Buttons: Download Bill, Download Prescription, Close */}
+              <div className="pt-2 flex flex-col sm:flex-row items-center gap-2">
+                {activeAppt && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => printAppointmentBill(activeAppt)}
+                      className="w-full sm:w-1/2 py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer shadow-glass-sm active:scale-95"
+                    >
+                      <Receipt className="w-4 h-4 text-teal-400" />
+                      <span>Download Bill</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => printPrescription(activeAppt)}
+                      className="w-full sm:w-1/2 py-2.5 px-4 bg-teal-600 hover:bg-teal-700 text-white rounded-xl text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer shadow-glass-sm active:scale-95"
+                    >
+                      <Stethoscope className="w-4 h-4 text-white" />
+                      <span>Download Rx</span>
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowPrescriptionModal(false)}
+                  className="w-full sm:w-auto px-4 py-2.5 liquid-glass-subtle text-slate-700 dark:text-slate-300 rounded-xl text-xs font-bold cursor-pointer active:scale-95"
+                >
+                  Close
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* ========================================================================= */}
       {/* RESCHEDULE DATE MODAL                                                     */}

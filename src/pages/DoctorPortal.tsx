@@ -19,6 +19,7 @@ import {
   ShieldCheck,
   FileText,
   Send,
+  MessageSquare,
   X,
   Sliders,
   Edit3,
@@ -205,7 +206,6 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   const [regNmc, setRegNmc] = useState('')
   const [regPersonalPhone, setRegPersonalPhone] = useState('')
   const [regPublicPhone, setRegPublicPhone] = useState('')
-  const [regClinicId, setRegClinicId] = useState('')
   const [regFee, setRegFee] = useState(500)
   const [regDesc, setRegDesc] = useState('')
   const [regPhotoFile, setRegPhotoFile] = useState<File | null>(null)
@@ -220,35 +220,6 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   const [specialtiesList, setSpecialtiesList] = useState<MedicalSpecialty[]>([])
   const [qualificationsList, setQualificationsList] = useState<MedicalQualification[]>([])
   const [allClinics, setAllClinics] = useState<Clinic[]>([])
-  const [regClinicTypeFilter, setRegClinicTypeFilter] = useState<
-    'all' | 'single_visit' | 'multi_visit' | 'diagnostic_lab'
-  >('all')
-
-  const displayedClinics = useMemo(() => {
-    if (regClinicTypeFilter === 'all') return allClinics
-    if (regClinicTypeFilter === 'diagnostic_lab') {
-      return allClinics.filter(
-        (c) =>
-          c.type === 'diagnostic_lab' ||
-          c.type?.includes('lab') ||
-          c.name?.toLowerCase().includes('lab') ||
-          c.name?.toLowerCase().includes('imaging') ||
-          c.name?.toLowerCase().includes('mri') ||
-          c.name?.toLowerCase().includes('scan') ||
-          c.specialties?.some(
-            (s) =>
-              s.toLowerCase().includes('lab') ||
-              s.toLowerCase().includes('patholog') ||
-              s.toLowerCase().includes('mri') ||
-              s.toLowerCase().includes('scan')
-          )
-      )
-    }
-    if (regClinicTypeFilter === 'single_visit') {
-      return allClinics.filter((c) => c.type === 'single_visit' || c.type === 'single_doctor')
-    }
-    return allClinics.filter((c) => c.type === 'multi_visit' || c.type === 'polyclinic')
-  }, [allClinics, regClinicTypeFilter])
 
   // Load initial taxonomies and existing session
   useEffect(() => {
@@ -304,12 +275,11 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   const loadDoctorClinicsAndAppointments = async (doctor: Doctor) => {
     setLoadingAppts(true)
     try {
-      const clinics = await getAffiliatedClinicsForDoctor(doctor.id)
+      const clinics = await getAffiliatedClinicsForDoctor(doctor.id, doctor.email)
       setAffiliatedClinics(clinics)
       const primaryClinic =
         clinics.find((c) => c.id === (doctor.activeClinicId || doctor.clinicId)) ||
-        clinics[0] ||
-        null
+        (clinics.length > 0 ? clinics[0] : null)
       setSelectedClinic(primaryClinic)
 
       const todayStr = new Date().toISOString().split('T')[0]
@@ -364,6 +334,10 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
       localStorage.setItem('dactor_doctor_session', JSON.stringify(doctor))
       localStorage.setItem('dactor_doctor_email', doctor.email || '')
       localStorage.setItem('dactor_doctor_logged_in', 'true')
+      try {
+        sessionStorage.removeItem('dactor_explicit_home')
+        sessionStorage.removeItem('dactor_allow_home')
+      } catch {}
       window.dispatchEvent(new Event('storage'))
     } catch {}
   }
@@ -540,8 +514,8 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
         nmcLicenseNumber: regNmc.trim(),
         personalMobileNumber: cleanPersonal,
         publicMobileNumber: cleanPublic || undefined,
-        clinicId: regClinicId || undefined,
-        activeClinicId: regClinicId || undefined,
+        clinicId: undefined,
+        activeClinicId: undefined,
         consultationFee: regFee || 500,
         description: regDesc.trim() || undefined,
         profilePictureUrl: photoUrl,
@@ -551,7 +525,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
         isInClinic: true,
       }
 
-      setRegStatusMsg('Saving verified practitioner KYC to Supabase...')
+      setRegStatusMsg('Saving verified practitioner KYC...')
       const created = await createDoctor(payload)
       if (!created) throw new Error('Failed to create doctor profile.')
 
@@ -830,10 +804,15 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
 
   // Queue Analytics
   const todayDateStr = new Date().toISOString().split('T')[0]
-  const todayAppointments = useMemo(
-    () => appointments.filter((a) => a.appointmentDate === todayDateStr),
-    [appointments, todayDateStr]
-  )
+  const todayAppointments = useMemo(() => {
+    const list = appointments.filter((a) => a.appointmentDate === todayDateStr)
+    return [...list].sort((a, b) => {
+      const aInside = a.checkinStatus === 'in_consultation' || a.checkinStatus === 'inside' ? 0 : 1
+      const bInside = b.checkinStatus === 'in_consultation' || b.checkinStatus === 'inside' ? 0 : 1
+      if (aInside !== bInside) return aInside - bInside
+      return (a.appointmentTime || '').localeCompare(b.appointmentTime || '')
+    })
+  }, [appointments, todayDateStr])
   const waitingPatients = useMemo(
     () => todayAppointments.filter((a) => a.checkinStatus === 'waiting'),
     [todayAppointments]
@@ -866,6 +845,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
       lastVisitDate: string
       notes: string[]
       lastStatus: string
+      allVisits: Appointment[]
     }>()
 
     appointments.forEach((a) => {
@@ -873,6 +853,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
       const existing = map.get(key)
       if (existing) {
         existing.totalVisits += 1
+        existing.allVisits.push(a)
         if (a.trackingCode10Digit && !existing.trackingCodes.includes(a.trackingCode10Digit)) {
           existing.trackingCodes.push(a.trackingCode10Digit)
         }
@@ -894,6 +875,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
           lastVisitDate: a.appointmentDate,
           notes: a.notes ? [a.notes] : [],
           lastStatus: a.checkinStatus || 'completed',
+          allVisits: [a],
         })
       }
     })
@@ -1343,34 +1325,16 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                 )}
               </div>
 
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
-                    Clinic Affiliation (Optional)
-                  </label>
-                  <select
-                    value={regClinicTypeFilter}
-                    onChange={(e) => setRegClinicTypeFilter(e.target.value as any)}
-                    className="text-[10px] font-bold text-teal-700 dark:text-teal-300 bg-teal-500/10 border border-teal-500/20 rounded-lg px-2 py-0.5 cursor-pointer"
-                  >
-                    <option value="all">All Center Types</option>
-                    <option value="single_visit">Single-Doctor OPD</option>
-                    <option value="multi_visit">Multi-Specialty Polyclinic</option>
-                    <option value="diagnostic_lab">Diagnostic Lab & Imaging (MRI/CT)</option>
-                  </select>
+              <div className="p-3.5 rounded-2xl liquid-glass-subtle border border-teal-500/20 bg-teal-500/5 dark:bg-teal-900/10 flex items-start space-x-3">
+                <Building2 className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0 mt-0.5" />
+                <div className="text-xs space-y-0.5">
+                  <p className="font-bold text-slate-800 dark:text-slate-200">
+                    Independent Practitioner Registration
+                  </p>
+                  <p className="text-[11px] text-slate-600 dark:text-slate-400">
+                    All practitioners register as independent doctors without automatic clinic affiliations. Partner clinics can invite you to their OPD roster using your email, and you can accept or decline invitations anytime in your Consultation Desk.
+                  </p>
                 </div>
-                <select
-                  value={regClinicId}
-                  onChange={(e) => setRegClinicId(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white bg-white/70 dark:bg-slate-900/80"
-                >
-                  <option value="" className="dark:bg-slate-900 text-slate-900 dark:text-white">Independent / Multi-Clinic Practice</option>
-                  {displayedClinics.map((c) => (
-                    <option key={c.id} value={c.id} className="dark:bg-slate-900 text-slate-900 dark:text-white">
-                      {c.name} • {c.type === 'diagnostic_lab' ? 'Diagnostic Lab (MRI/CT)' : c.type === 'single_visit' ? 'Single-Doctor' : 'Polyclinic'} ({c.addressText || 'Nepal'})
-                    </option>
-                  ))}
-                </select>
               </div>
             </div>
 
@@ -1447,7 +1411,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               {submittingReg ? (
                 <>
                   <RefreshCw className="w-4 h-4 animate-spin" />
-                  <span>Submitting KYC to Supabase...</span>
+                  <span>Submitting KYC...</span>
                 </>
               ) : (
                 <>
@@ -1525,12 +1489,20 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               <span>{currentDoctor?.education || 'MBBS, MD'}</span>
               <span>•</span>
               <span className="truncate max-w-[200px] sm:max-w-none">Logged in: <strong className="text-slate-700 dark:text-slate-300">{currentDoctor?.email}</strong></span>
-              {selectedClinic && (
+              {selectedClinic ? (
                 <>
                   <span>•</span>
                   <span className="font-bold text-teal-700 dark:text-teal-400 flex items-center space-x-1 truncate max-w-[180px] sm:max-w-none">
                     <Building2 className="w-3.5 h-3.5 shrink-0" />
                     <span className="truncate">{selectedClinic.name}</span>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span>•</span>
+                  <span className="font-semibold text-slate-500 dark:text-slate-400 flex items-center space-x-1 truncate">
+                    <Building2 className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                    <span>Independent Practice</span>
                   </span>
                 </>
               )}
@@ -1841,7 +1813,15 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               </span>
             </div>
 
-            {waitingPatients.length === 0 ? (
+            {affiliatedClinics.length === 0 ? (
+              <div className="p-12 text-center space-y-3">
+                <Building2 className="w-12 h-12 text-teal-500/70 mx-auto" />
+                <h4 className="text-base font-bold text-slate-800 dark:text-slate-200">Independent Practitioner Desk</h4>
+                <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                  You are registered as an independent doctor and not currently affiliated with any clinic OPD rosters. Partner clinics can invite you to their facility using your email, and invitations will appear above for you to accept.
+                </p>
+              </div>
+            ) : waitingPatients.length === 0 ? (
               <div className="p-12 text-center space-y-3">
                 <CheckCircle2 className="w-12 h-12 text-emerald-500 mx-auto" />
                 <h4 className="text-base font-bold text-slate-800 dark:text-slate-200">No Waiting Patients in Lobby</h4>
@@ -2049,46 +2029,117 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {doctorPatientsList.map((p, idx) => (
-                  <div
-                    key={idx}
-                    className="p-5 rounded-2xl liquid-glass-subtle border border-white/30 dark:border-white/10 space-y-3"
-                  >
-                    <div className="flex items-start justify-between">
-                      <div>
-                        <h4 className="text-sm font-black text-slate-900 dark:text-white">{p.patientName}</h4>
-                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                          {p.patientAge ? `${p.patientAge} Yrs` : ''} {p.patientGender ? `• ${p.patientGender}` : ''}{' '}
-                          {p.patientMobile ? `• ${p.patientMobile}` : ''}
-                        </p>
-                      </div>
-                      <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-teal-500/10 text-teal-700 dark:text-teal-300 border border-teal-500/20">
-                        {p.totalVisits} {p.totalVisits === 1 ? 'Visit' : 'Visits'}
-                      </span>
-                    </div>
+                {doctorPatientsList.map((p, idx) => {
+                  const cleanMobile = p.patientMobile ? p.patientMobile.replace(/\D/g, '') : ''
+                  const hasFollowup = p.allVisits && p.allVisits.length > 1
 
-                    <div className="text-xs space-y-1 pt-1 border-t border-white/20 dark:border-white/5">
-                      <div className="flex items-center justify-between text-slate-500 dark:text-slate-400">
-                        <span>Last Consulted:</span>
-                        <span className="font-semibold text-slate-700 dark:text-slate-300">{p.lastVisitDate}</span>
-                      </div>
-                      <div className="flex items-center justify-between text-slate-500 dark:text-slate-400">
-                        <span>Active Tracking:</span>
-                        <span className="font-mono text-[11px] font-bold text-slate-800 dark:text-slate-200">
-                          {p.trackingCodes.slice(-1)[0] || 'N/A'}
-                        </span>
-                      </div>
-                      {p.notes.length > 0 && (
-                        <div className="pt-1">
-                          <span className="text-[10px] uppercase font-bold text-slate-400 block">Clinical Remarks:</span>
-                          <p className="text-[11px] text-teal-800 dark:text-teal-300 font-medium line-clamp-2">
-                            {extractCleanClinicalRemarks(p.notes.slice(-1)[0])}
+                  return (
+                    <div
+                      key={idx}
+                      className="p-5 rounded-2xl liquid-glass-subtle border border-white/30 dark:border-white/10 space-y-3"
+                    >
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <div className="flex items-center space-x-2">
+                            <h4 className="text-sm font-black text-slate-900 dark:text-white">{p.patientName}</h4>
+                            {hasFollowup && (
+                              <span className="px-1.5 py-0.5 rounded-full bg-teal-100 dark:bg-teal-900/60 text-teal-800 dark:text-teal-200 text-[10px] font-bold border border-teal-200 dark:border-teal-700">
+                                Follow-Up Patient
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                            {p.patientAge ? `${p.patientAge} Yrs` : ''} {p.patientGender ? `• ${p.patientGender}` : ''}{' '}
+                            {p.patientMobile ? `• ${p.patientMobile}` : ''}
                           </p>
                         </div>
-                      )}
+                        <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-teal-500/10 text-teal-700 dark:text-teal-300 border border-teal-500/20">
+                          {p.totalVisits} {p.totalVisits === 1 ? 'Visit' : 'Visits'}
+                        </span>
+                      </div>
+
+                      <div className="text-xs space-y-1.5 pt-1 border-t border-white/20 dark:border-white/5">
+                        <div className="flex items-center justify-between text-slate-500 dark:text-slate-400">
+                          <span>Last Consulted:</span>
+                          <span className="font-semibold text-slate-700 dark:text-slate-300">{p.lastVisitDate}</span>
+                        </div>
+                        <div className="flex items-center justify-between text-slate-500 dark:text-slate-400">
+                          <span>Active Tracking:</span>
+                          <span className="font-mono text-[11px] font-bold text-slate-800 dark:text-slate-200">
+                            {p.trackingCodes.slice(-1)[0] || 'N/A'}
+                          </span>
+                        </div>
+
+                        {/* Dual Consultation Breakdown summary */}
+                        {hasFollowup && (
+                          <div className="p-2 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200/60 dark:border-slate-700/60 space-y-1 text-[11px]">
+                            <div className="flex justify-between text-blue-800 dark:text-blue-300">
+                              <span>1. Initial Consultation:</span>
+                              <span className="font-semibold">{p.allVisits[0]?.appointmentDate} (#{p.allVisits[0]?.trackingCode10Digit})</span>
+                            </div>
+                            <div className="flex justify-between text-teal-800 dark:text-teal-300">
+                              <span>2. Follow-Up Consultation:</span>
+                              <span className="font-semibold">{p.allVisits[p.allVisits.length - 1]?.appointmentDate} (#{p.allVisits[p.allVisits.length - 1]?.trackingCode10Digit})</span>
+                            </div>
+                          </div>
+                        )}
+
+                        {p.notes.length > 0 && (
+                          <div className="pt-1">
+                            <span className="text-[10px] uppercase font-bold text-slate-400 block">Clinical Remarks:</span>
+                            <p className="text-[11px] text-teal-800 dark:text-teal-300 font-medium line-clamp-2">
+                              {extractCleanClinicalRemarks(p.notes.slice(-1)[0])}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Doctor Patient Action Buttons */}
+                      <div className="pt-2 border-t border-white/20 dark:border-white/5 flex items-center justify-between flex-wrap gap-2">
+                        <div className="flex items-center gap-1.5">
+                          {p.patientMobile && (
+                            <>
+                              <a
+                                href={`tel:${p.patientMobile}`}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-800 dark:text-emerald-300 font-bold text-[11px] border border-emerald-300 dark:border-emerald-700 transition"
+                                title="Direct Phone Call"
+                              >
+                                <Phone className="w-3 h-3 text-emerald-600" />
+                                <span>Call</span>
+                              </a>
+                              {cleanMobile && (
+                                <a
+                                  href={`https://wa.me/977${cleanMobile}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-teal-50 dark:bg-teal-950/40 hover:bg-teal-100 text-teal-800 dark:text-teal-300 font-bold text-[11px] border border-teal-300 dark:border-teal-700 transition"
+                                  title="WhatsApp Patient"
+                                >
+                                  <MessageSquare className="w-3 h-3 text-teal-600" />
+                                  <span>WhatsApp</span>
+                                </a>
+                              )}
+                            </>
+                          )}
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setHistoryPatientName(p.patientName)
+                            setHistoryVisits(p.allVisits)
+                            setHistoryModalOpen(true)
+                          }}
+                          className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-bold text-[11px] shadow-xs transition cursor-pointer active:scale-95"
+                          title="View complete medical history & past consultations"
+                        >
+                          <FileText className="w-3 h-3 text-teal-300" />
+                          <span>Past Visits ({p.totalVisits})</span>
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             )}
           </div>
@@ -2256,7 +2307,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
             {profileSaveSuccess && (
               <div className="p-3 liquid-glass-subtle text-emerald-800 dark:text-emerald-200 font-bold text-xs rounded-xl flex items-center space-x-2 border border-emerald-500/30">
                 <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                <span>Profile updated successfully in Supabase!</span>
+                <span>Profile updated successfully!</span>
               </div>
             )}
 
@@ -2268,7 +2319,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               {savingProfile ? (
                 <>
                   <RefreshCw className="w-4 h-4 animate-spin" />
-                  <span>Saving to Supabase...</span>
+                  <span>Saving changes...</span>
                 </>
               ) : (
                 <>
