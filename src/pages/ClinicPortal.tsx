@@ -229,6 +229,25 @@ interface TimingEstimateResult {
   suggestedArrivalText?: string
 }
 
+function formatPayAtDeskRelativeTime(isoString?: string): string {
+  if (!isoString) return ''
+  try {
+    const millis = new Date(isoString).getTime()
+    const diff = Date.now() - millis
+    const mins = Math.floor(diff / (1000 * 60))
+    const hours = Math.floor(diff / (1000 * 60 * 60))
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24))
+    if (diff < 0) return 'Just now'
+    if (mins < 1) return 'Just now'
+    if (mins < 60) return `${mins}m ago`
+    if (hours < 24) return `${hours}h ago`
+    if (days === 1) return 'Yesterday'
+    return `${days}d ago`
+  } catch {
+    return ''
+  }
+}
+
 function parseSlotStartTime(slotStr?: string): Date | null {
   if (!slotStr) return null
   const token = slotStr.split(/[-–]|to/)[0]?.trim()
@@ -5921,9 +5940,9 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
           <div className="flex items-start space-x-3 p-3.5 rounded-xl bg-amber-50/80 dark:bg-amber-950/20 border border-amber-200/60 dark:border-amber-900/40 text-amber-900 dark:text-amber-200 text-xs">
             <AlertCircle className="w-4 h-4 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
             <div className="space-y-0.5">
-              <p className="font-bold">Pay at Desk Overload Policy</p>
+              <p className="font-bold">Pay at Desk FIFO & Overload Policy</p>
               <p className="text-amber-800 dark:text-amber-300">
-                Approving an appointment always adds the patient to the requested slot even if full (e.g. 12/12 becomes 13). Approved requests immediately enter the live OPD queue.
+                Requests are arranged in chronological order with the oldest on top. Approving from top to bottom ensures patients enter the live queue in fair booking order. Approving also reserves the requested slot (even if full) and assigns an immediate live OPD token.
               </p>
             </div>
           </div>
@@ -5946,15 +5965,29 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
             </GlassCard>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-              {payAtDeskRequests.map((req) => (
+              {payAtDeskRequests.map((req, index) => {
+                const isOldest = index === 0
+                return (
                 <GlassCard
                   key={req.id}
                   variant="elevated"
                   padding="md"
                   radius="xl"
                   specular
-                  className="space-y-3 border border-slate-200/80 dark:border-white/10 hover:shadow-lg transition-all"
+                  className={`space-y-3 border ${
+                    isOldest
+                      ? 'border-amber-400 dark:border-amber-500 shadow-md ring-2 ring-amber-400/30'
+                      : 'border-slate-200/80 dark:border-white/10'
+                  } hover:shadow-lg transition-all`}
                 >
+                  {/* Top Oldest Badge */}
+                  {isOldest && (
+                    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-100 dark:bg-amber-900/40 border border-amber-300/60 text-amber-800 dark:text-amber-300 text-[11px] font-black tracking-wide">
+                      <Clock className="w-3.5 h-3.5 text-amber-600 animate-pulse" />
+                      <span>⚡ OLDEST REQUEST • FIRST IN LINE TO APPROVE</span>
+                    </div>
+                  )}
+
                   {/* Top Bar: 10-Digit ID + Attempt Badge */}
                   <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800">
                     <span className="font-mono text-xs font-black tracking-wider text-slate-800 dark:text-slate-100 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-md">
@@ -5996,6 +6029,12 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                       <Calendar className="w-3.5 h-3.5 text-slate-400" />
                       <span>{req.appointmentDate} • {req.appointmentTime}</span>
                     </div>
+                    {req.createdAt && (
+                      <div className="flex items-center space-x-1.5 text-amber-700 dark:text-amber-300 font-medium pt-0.5">
+                        <Clock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                        <span>Requested: {formatPayAtDeskRelativeTime(req.createdAt)}</span>
+                      </div>
+                    )}
                   </div>
 
                   {/* Fee Breakdown */}
@@ -6039,7 +6078,8 @@ export const ClinicPortal: React.FC<ClinicPortalProps> = () => {
                     View Full Details
                   </button>
                 </GlassCard>
-              ))}
+                )
+              })}
             </div>
           )}
 

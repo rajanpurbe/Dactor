@@ -6019,7 +6019,7 @@ export async function getPendingPayAtDeskRequests(clinicId: string): Promise<App
     })
 
     if (!rpcError && Array.isArray(rpcData)) {
-      return rpcData.map((row: any) => ({
+      const list = rpcData.map((row: any) => ({
         id: row.id,
         trackingCode10Digit: row.tracking_code_10_digit,
         userId: row.user_id,
@@ -6057,6 +6057,11 @@ export async function getPendingPayAtDeskRequests(clinicId: string): Promise<App
             } as Doctor)
           : undefined,
       }))
+      return list.sort((a, b) => {
+        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0
+        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0
+        return timeA - timeB
+      })
     }
 
     // Direct table fallback
@@ -6066,10 +6071,16 @@ export async function getPendingPayAtDeskRequests(clinicId: string): Promise<App
       .eq('clinic_id', clinicId)
       .eq('payment_mode', 'PAY_AT_DESK')
       .eq('status', 'WAITING_FOR_APPROVAL')
+      .neq('checkin_status', 'cancelled')
       .order('created_at', { ascending: true })
 
     if (error) throw error
-    return (data || []).map(mapAppointment)
+    const list = (data || []).map(mapAppointment)
+    return list.sort((a, b) => {
+      const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0
+      const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0
+      return timeA - timeB
+    })
   } catch (err) {
     console.error('Error fetching pending pay at desk requests:', err)
     return []
@@ -6084,6 +6095,7 @@ export async function getPendingPayAtDeskCount(clinicId: string): Promise<number
       .eq('clinic_id', clinicId)
       .eq('payment_mode', 'PAY_AT_DESK')
       .eq('status', 'WAITING_FOR_APPROVAL')
+      .neq('checkin_status', 'cancelled')
 
     if (error) throw error
     return count || 0
@@ -6164,6 +6176,7 @@ export async function findPendingPayAtDeskAppointment(
       .eq('appointment_date', appointmentDate)
       .eq('payment_mode', 'PAY_AT_DESK')
       .eq('status', 'WAITING_FOR_APPROVAL')
+      .neq('checkin_status', 'cancelled')
 
     if (cleanMobile) {
       query = query.eq('patient_mobile', cleanMobile)
@@ -6200,7 +6213,6 @@ export async function cancelPendingPayAtDeskAppointment(appointmentId: string): 
     const { error } = await supabase
       .from('appointments')
       .update({
-        status: 'CANCELLED',
         checkin_status: 'cancelled',
         updated_at: new Date().toISOString(),
       })
