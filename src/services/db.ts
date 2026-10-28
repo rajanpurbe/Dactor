@@ -979,12 +979,7 @@ export async function createAppointment(appt: Partial<Appointment> & { slotId?: 
         if (foundSlot?.id) targetSlotId = foundSlot.id
       }
       if (targetSlotId) {
-        const { data: slotAppts } = await supabase
-          .from('appointments')
-          .select('id, checkin_status')
-          .eq('slot_id', targetSlotId)
-        const realCount = (slotAppts || []).filter((a: any) => a.checkin_status !== 'cancelled').length
-        await supabase.from('slots').update({ booked_count: realCount }).eq('id', targetSlotId)
+        await reconcileSlotBookedCount(targetSlotId)
       }
     } catch {}
 
@@ -1576,6 +1571,30 @@ export async function reindexActiveQueue(
   }
 }
 
+/**
+ * Reconciles booked_count for a slot so it strictly counts approved or paid appointments
+ * (excluding unapproved Pay at Desk and cancelled visits).
+ */
+export async function reconcileSlotBookedCount(slotId: string): Promise<void> {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  if (!slotId || !uuidRegex.test(slotId.trim())) return
+  try {
+    const { data: slotAppts } = await supabase
+      .from('appointments')
+      .select('id, checkin_status, status, payment_status')
+      .eq('slot_id', slotId.trim())
+    const realCount = (slotAppts || []).filter(
+      (a: any) =>
+        a.checkin_status !== 'cancelled' &&
+        a.payment_status !== 'failed' &&
+        (a.status === 'APPROVED' || a.payment_status === 'paid')
+    ).length
+    await supabase.from('slots').update({ booked_count: realCount }).eq('id', slotId.trim())
+  } catch (e) {
+    console.warn('reconcileSlotBookedCount error:', e)
+  }
+}
+
 export async function shiftAppointmentDate(
   appointmentId: string,
   newDate: string,
@@ -1584,9 +1603,16 @@ export async function shiftAppointmentDate(
   newSlotId?: string
 ): Promise<boolean> {
   try {
+    const { data: oldAppt } = await supabase
+      .from('appointments')
+      .select('slot_id')
+      .eq('id', appointmentId)
+      .maybeSingle()
+
     const updatePayload: any = {
       appointment_date: newDate,
-      checkin_status: 'checked_in',
+      checkin_status: 'waiting',
+      status: 'APPROVED',
       updated_at: new Date().toISOString(),
     }
     if (newTime) {
@@ -1607,6 +1633,14 @@ export async function shiftAppointmentDate(
       .single()
 
     if (error) throw error
+
+    // Reconcile slot capacity for old and new slots
+    if (oldAppt?.slot_id && oldAppt.slot_id !== newSlotId) {
+      await reconcileSlotBookedCount(oldAppt.slot_id)
+    }
+    if (newSlotId) {
+      await reconcileSlotBookedCount(newSlotId)
+    }
 
     // Manage Queue Entry on Reschedule / Follow-Up
     try {
@@ -6109,5 +6143,71 @@ export async function retryPayAtDeskAppointment(appointmentId: string, patientMo
   } catch (err: any) {
     console.error('Error retrying pay at desk appointment:', err)
     return { success: false, error: err.message || 'Failed to retry appointment request' }
+  }
+}
+
+/**
+ * Searches for an existing active unapproved Pay at Desk appointment for this patient at the clinic.
+ */
+export async function findPendingPayAtDeskAppointment(
+  clinicId: string,
+  patientMobile: string,
+  appointmentDate: string,
+  patientName?: string
+): Promise<Appointment | null> {
+  try {
+    const cleanMobile = patientMobile.trim().replace(/\D/g, '')
+    let query = supabase
+      .from('appointments')
+      .select('*, clinic:clinics(*), doctor:doctors(*)')
+      .eq('clinic_id', clinicId)
+      .eq('appointment_date', appointmentDate)
+      .eq('payment_mode', 'PAY_AT_DESK')
+      .eq('status', 'WAITING_FOR_APPROVAL')
+
+    if (cleanMobile) {
+      query = query.eq('patient_mobile', cleanMobile)
+    }
+
+    const { data, error } = await query
+    if (error || !data || data.length === 0) return null
+
+    if (patientName && patientName.trim()) {
+      const cleanTarget = patientName.trim().toLowerCase()
+      const matched = data.find((a: any) => (a.patient_name || '').trim().toLowerCase() === cleanTarget)
+      if (matched) return mapAppointment(matched)
+    }
+
+    return mapAppointment(data[0])
+  } catch (err) {
+    console.error('Error finding pending pay at desk appointment:', err)
+    return null
+  }
+}
+
+/**
+ * Atomically cancels a pending unapproved Pay at Desk request so the user can re-book or pay online.
+ */
+export async function cancelPendingPayAtDeskAppointment(appointmentId: string): Promise<boolean> {
+  try {
+    const { error: rpcErr } = await supabase.rpc('cancel_pending_pay_at_desk_appointment', {
+      p_appointment_id: appointmentId,
+    })
+    if (!rpcErr) return true
+  } catch {}
+
+  try {
+    const { error } = await supabase
+      .from('appointments')
+      .update({
+        status: 'CANCELLED',
+        checkin_status: 'cancelled',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', appointmentId)
+    return !error
+  } catch (err) {
+    console.error('Error cancelling pending pay at desk appointment:', err)
+    return false
   }
 }

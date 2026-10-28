@@ -26,8 +26,10 @@ import {
   Share2,
   Layers,
   Lock,
+  QrCode,
+  Store,
 } from 'lucide-react'
-import { Clinic, Doctor, ClinicService, Slot, Appointment, PaymentGatewaysConfig, PAY_AT_DESK_SERVICE_CHARGE_PERCENT } from '../types'
+import { Clinic, Doctor, ClinicService, Slot, Appointment, PaymentGatewaysConfig, OnlineGatewayId, PAY_AT_DESK_SERVICE_CHARGE_PERCENT } from '../types'
 import {
   getClinicById,
   getDoctorsByClinic,
@@ -44,11 +46,17 @@ import {
   getAppointmentByTrackingCodeOrContact,
   shiftAppointmentDate,
   getAppointmentById,
-  startEsewaPayment,
-  refreshEsewaPayment,
+  startOnlinePayment,
+  refreshOnlinePayment,
+  initiateOnlinePaymentPhase,
+  cancelPendingAppointment,
+  findPendingPayAtDeskAppointment,
+  cancelPendingPayAtDeskAppointment,
 } from '../services/db'
 import { supabase } from '../lib/supabase'
 import { updatePageSEO } from '../utils/seo'
+import { escapeHtml } from '../utils/html'
+import { MapLibreLocationViewer } from '../components/MapLibreLocationViewer'
 
 interface ClinicDetailProps {
   clinicId: string
@@ -78,6 +86,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
   const [slotsLoading, setSlotsLoading] = useState(false)
   const [paymentConfig, setPaymentConfig] = useState<PaymentGatewaysConfig | null>(null)
   const [loading, setLoading] = useState(true)
+  const [showMapModal, setShowMapModal] = useState<boolean>(false)
 
   // Active view tab: 'opd' or 'lab'
   const [activeTab, setActiveTab] = useState<'opd' | 'lab'>('opd')
@@ -136,9 +145,14 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
   const [patientUserId, setPatientUserId] = useState<string | undefined>(undefined)
   const [patientNotes, setPatientNotes] = useState('')
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<
-    'esewa' | 'khalti' | 'fonepay' | 'bypass' | 'pay_at_clinic' | 'pay_at_desk'
-  >('esewa')
+    OnlineGatewayId | 'bypass' | 'pay_at_clinic' | 'pay_at_desk'
+  >('pay_at_desk')
   const [paymentCountdown, setPaymentCountdown] = useState(300)
+  const [paymentInitiated, setPaymentInitiated] = useState(false)
+  const [createdPendingApptId, setCreatedPendingApptId] = useState<string | null>(null)
+  const [pendingPayAtDeskAppt, setPendingPayAtDeskAppt] = useState<Appointment | null>(null)
+  const [showPendingPayAtDeskModal, setShowPendingPayAtDeskModal] = useState(false)
+  const [isCancellingPendingDesk, setIsCancellingPendingDesk] = useState(false)
   const [formErrors, setFormErrors] = useState<{ [key: string]: string }>({})
   const [submitting, setSubmitting] = useState(false)
 
@@ -215,6 +229,10 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
       // Strictly use real services from Supabase — NO demo tests
       setServices(sData)
       setPaymentConfig(payCfg)
+      if (payCfg?.availableMethods && payCfg.availableMethods.length > 0) {
+        const firstVerified = payCfg.availableMethods.find((m) => m.is_verified)?.id
+        if (firstVerified) setSelectedPaymentMethod(firstVerified)
+      }
 
       const isLab =
         cData?.type === 'diagnostic_lab' ||
@@ -507,21 +525,26 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
       .on('postgres_changes', { event: '*', schema: 'public', table: 'clinic_services', filter: `clinic_id=eq.${clinicId}` }, () => loadClinicData())
       .subscribe()
 
-    // Restore or check for returning eSewa payment
-    async function checkEsewaReturn() {
+    // Restore or check for returning / background-completed online payment (eSewa, Khalti, Fonepay, ConnectIPS)
+    async function checkOnlinePaymentReturn() {
       try {
         const urlParams = new URLSearchParams(window.location.search)
         const apptIdFromUrl = urlParams.get('appointmentId') || urlParams.get('appointment_id')
         const paymentResult = urlParams.get('payment_result') || urlParams.get('status')
+        const gatewayFromUrl = urlParams.get('gateway')
 
         let apptIdToVerify = apptIdFromUrl
+        let pendingGateway = gatewayFromUrl || ''
         if (!apptIdToVerify) {
           try {
-            const pendingRaw = localStorage.getItem('dactor_pending_esewa_payment')
+            const pendingRaw =
+              localStorage.getItem('dactor_pending_online_payment') ||
+              localStorage.getItem('dactor_pending_esewa_payment')
             if (pendingRaw) {
               const parsed = JSON.parse(pendingRaw)
-              if (parsed.appointmentId && (Date.now() - (parsed.createdAt || 0)) < 3600000) {
+              if (parsed.appointmentId && (Date.now() - (parsed.createdAt || 0)) < 86400000) {
                 apptIdToVerify = parsed.appointmentId
+                pendingGateway = parsed.gateway || pendingGateway
               }
             }
           } catch {}
@@ -529,34 +552,55 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
 
         if (!apptIdToVerify) return
 
-        const refreshRes = await refreshEsewaPayment(apptIdToVerify)
+        const refreshRes = await refreshOnlinePayment(apptIdToVerify)
         const appt = await getAppointmentById(apptIdToVerify)
+        const resolvedGw = (refreshRes.gateway || pendingGateway || 'esewa').toLowerCase()
+        const gwLabel =
+          resolvedGw === 'khalti'
+            ? 'Khalti Digital Wallet'
+            : resolvedGw === 'fonepay'
+            ? 'Fonepay QR / Direct Banking'
+            : resolvedGw === 'connectips'
+            ? 'ConnectIPS Direct Bank'
+            : 'eSewa Mobile Wallet'
+
         if (appt && (appt.paymentStatus === 'paid' || refreshRes.status === 'complete')) {
           setConfirmedAppt(appt)
-          setConfirmedTxnId(refreshRes.reference || `ESEWA-${appt.trackingCode10Digit}`)
-          setConfirmedPayMethod('eSewa Mobile Wallet (Verified)')
+          setConfirmedTxnId(refreshRes.reference || `${resolvedGw.toUpperCase()}-${appt.trackingCode10Digit}`)
+          setConfirmedPayMethod(`${gwLabel} (Verified)`)
           setShowBookingModal(false)
+          localStorage.removeItem('dactor_pending_online_payment')
           localStorage.removeItem('dactor_pending_esewa_payment')
 
           try {
             const url = new URL(window.location.href)
             url.searchParams.delete('payment_result')
             url.searchParams.delete('status')
+            url.searchParams.delete('gateway')
             url.searchParams.delete('appointmentId')
             url.searchParams.delete('appointment_id')
             window.history.replaceState({}, '', url.toString())
           } catch {}
         } else if (refreshRes.status === 'failed' || paymentResult === 'failed') {
-          alert('eSewa transaction was cancelled or could not be verified.')
+          alert(`${gwLabel} transaction was cancelled or could not be verified.`)
+          localStorage.removeItem('dactor_pending_online_payment')
           localStorage.removeItem('dactor_pending_esewa_payment')
         }
       } catch (e) {
-        console.error('Error checking eSewa return in ClinicDetail:', e)
+        console.error('Error checking online payment return in ClinicDetail:', e)
       }
     }
-    checkEsewaReturn()
+    checkOnlinePaymentReturn()
+
+    const onVisibilityFocus = () => {
+      if (document.visibilityState === 'visible') checkOnlinePaymentReturn()
+    }
+    window.addEventListener('focus', onVisibilityFocus)
+    document.addEventListener('visibilitychange', onVisibilityFocus)
 
     return () => {
+      window.removeEventListener('focus', onVisibilityFocus)
+      document.removeEventListener('visibilitychange', onVisibilityFocus)
       supabase.removeChannel(channel)
     }
   }, [clinicId])
@@ -923,7 +967,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
   }
 
   // Handle final appointment + payment submission to Supabase
-  const handleConfirmBookingAndPayment = async () => {
+  const handleConfirmBookingAndPayment = async (forceProceed = false) => {
     if (isLookingUpCode) return
     if (!isReschedule && !validateDetailsForm()) {
       setBookingStep('details')
@@ -938,39 +982,74 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
         return
       }
 
-      // 1. Reschedule & Follow-Up handling: Shift/Update existing appointment in place without generating a new ID
+      // 1. Reschedule & Follow-Up handling
       if ((isReschedule || isReturningPatient) && retainedAppointment) {
-        const ok = await shiftAppointmentDate(
-          retainedAppointment.id,
-          selectedDate,
-          selectedSlotTime || '10:00 AM',
-          isReturningPatient
-            ? `Follow-Up Consultation (Ref: ${retainedAppointment.trackingCode10Digit})`
-            : 'Patient rescheduled via clinic booking portal',
-          selectedSlotId
-        )
-        if (ok) {
-          const updatedAppt: Appointment = {
-            ...retainedAppointment,
+        const isRetainedCompleted = ['done', 'completed'].includes((retainedAppointment.checkinStatus || '').toLowerCase())
+
+        if (isRetainedCompleted) {
+          // COMPLETED VISIT -> Issue a NEW follow-up appointment record, preserving past medical history!
+          const newFollowUpAppt = await createAppointment({
+            clinicId,
+            doctorId: activeTab === 'opd' ? (selectedDoctor?.id || retainedAppointment.doctorId) : undefined,
+            userId: retainedAppointment.userId || patientUserId,
+            slotId: selectedSlotId,
+            trackingCode10Digit: retainedAppointment.trackingCode10Digit,
+            patientName: retainedAppointment.patientName,
+            patientAge: retainedAppointment.patientAge || Number(patientAge),
+            patientGender: retainedAppointment.patientGender || 'Male',
+            patientMobile: retainedAppointment.patientMobile,
+            patientEmail: retainedAppointment.patientEmail,
             appointmentDate: selectedDate,
             appointmentTime: selectedSlotTime || '10:00 AM',
-            slotId: selectedSlotId,
+            feeAmount: 0,
+            paymentStatus: 'paid',
+            paymentMode: 'ONLINE',
+            status: 'APPROVED',
             checkinStatus: 'waiting',
+            notes: `Free Follow-Up Consultation (Ref: #${retainedAppointment.trackingCode10Digit})`
+          })
+
+          if (newFollowUpAppt) {
+            setConfirmedAppt(newFollowUpAppt)
+            setConfirmedTxnId(`FOLLOWUP-${newFollowUpAppt.trackingCode10Digit}`)
+            setConfirmedPayMethod('Free Follow-Up (Retained 10-Digit ID)')
+            setShowBookingModal(false)
+            setSubmitting(false)
+            return
+          } else {
+            alert('Could not schedule follow-up appointment for this slot. Please select another slot.')
+            setSubmitting(false)
+            return
           }
-          setConfirmedAppt(updatedAppt)
-          setConfirmedTxnId(`${isReturningPatient ? 'FOLLOWUP' : 'RESCHEDULED'}-${retainedAppointment.trackingCode10Digit}`)
-          setConfirmedPayMethod(
-            isReturningPatient
-              ? 'Free Follow-Up (Retained 10-Digit ID)'
-              : 'Rescheduled Appointment (Retained Fee)'
-          )
-          setShowBookingModal(false)
-          setSubmitting(false)
-          return
         } else {
-          alert('Could not schedule appointment for this slot. Please select another slot.')
-          setSubmitting(false)
-          return
+          // ACTIVE / UPCOMING VISIT -> Reschedule existing appointment in-place
+          const ok = await shiftAppointmentDate(
+            retainedAppointment.id,
+            selectedDate,
+            selectedSlotTime || '10:00 AM',
+            'Patient rescheduled via clinic booking portal',
+            selectedSlotId
+          )
+          if (ok) {
+            const updatedAppt: Appointment = {
+              ...retainedAppointment,
+              appointmentDate: selectedDate,
+              appointmentTime: selectedSlotTime || '10:00 AM',
+              slotId: selectedSlotId,
+              status: 'APPROVED',
+              checkinStatus: 'waiting',
+            }
+            setConfirmedAppt(updatedAppt)
+            setConfirmedTxnId(`RESCHEDULED-${retainedAppointment.trackingCode10Digit}`)
+            setConfirmedPayMethod('Rescheduled Appointment (Retained Fee)')
+            setShowBookingModal(false)
+            setSubmitting(false)
+            return
+          } else {
+            alert('Could not schedule appointment for this slot. Please select another slot.')
+            setSubmitting(false)
+            return
+          }
         }
       }
 
@@ -989,7 +1068,25 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
       const finalPatientMobile = isLockedDetails && retainedAppointment ? (retainedAppointment.patientMobile || cleanMobile) : cleanMobile
       const finalPatientEmail = isLockedDetails && retainedAppointment ? (retainedAppointment.patientEmail || undefined) : (patientEmail.trim() || undefined)
 
-      if (selectedPaymentMethod === 'esewa' && totalBookingFee > 0 && !isFreeBooking) {
+      // Detect unapproved Pay at Desk appointment for this exact patient
+      if (!isReschedule && !isReturningPatient && !forceProceed) {
+        const pendingDesk = await findPendingPayAtDeskAppointment(
+          clinicId,
+          cleanMobile,
+          selectedDate,
+          finalPatientName
+        )
+        if (pendingDesk) {
+          setPendingPayAtDeskAppt(pendingDesk)
+          setShowPendingPayAtDeskModal(true)
+          setSubmitting(false)
+          return
+        }
+      }
+
+      const isOnlineGateway = (['esewa', 'khalti', 'fonepay', 'connectips'] as const).includes(selectedPaymentMethod as any)
+      if (isOnlineGateway && totalBookingFee > 0 && !isFreeBooking) {
+        const gateway = selectedPaymentMethod as OnlineGatewayId
         const created = await createAppointment({
           id: bookingDraftId,
           clinicId,
@@ -1025,21 +1122,22 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
           if (!existingCodes.includes(code10)) {
             localStorage.setItem('dactor_patient_tracking_codes', JSON.stringify([code10, ...existingCodes]))
           }
-          localStorage.setItem(
-            'dactor_pending_esewa_payment',
-            JSON.stringify({
-              appointmentId: created.id,
-              trackingCode: code10,
-              clinicId,
-              amount: totalBookingFee,
-              returnRoute: 'clinic-detail',
-              createdAt: Date.now(),
-            })
-          )
+          const sessionPayload = JSON.stringify({
+            appointmentId: created.id,
+            trackingCode: code10,
+            clinicId,
+            gateway,
+            amount: totalBookingFee,
+            returnRoute: 'clinic-detail',
+            createdAt: Date.now(),
+          })
+          localStorage.setItem('dactor_pending_online_payment', sessionPayload)
+          localStorage.setItem('dactor_pending_esewa_payment', sessionPayload)
+          sessionStorage.setItem('dactor_pending_payment_phone', finalPatientMobile.trim())
         } catch {}
 
-        const returnUrl = `${window.location.origin}${window.location.pathname}?clinic=${clinicId}&payment_result=checking&appointmentId=${created.id}`
-        const checkout = await startEsewaPayment(created.id, returnUrl)
+        const returnUrl = `${window.location.origin}${window.location.pathname}?clinic=${clinicId}&payment_result=checking&gateway=${gateway}&appointmentId=${created.id}`
+        const checkout = await startOnlinePayment(created.id, gateway, returnUrl, code10, finalPatientMobile)
         window.location.href = checkout.checkoutUrl
         return
       }
@@ -1120,6 +1218,25 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
     }
   }
 
+  const handleCancelPendingDeskAndProceed = async () => {
+    if (!pendingPayAtDeskAppt) return
+    setIsCancellingPendingDesk(true)
+    try {
+      const ok = await cancelPendingPayAtDeskAppointment(pendingPayAtDeskAppt.id)
+      if (ok) {
+        setShowPendingPayAtDeskModal(false)
+        setPendingPayAtDeskAppt(null)
+        await handleConfirmBookingAndPayment(true)
+      } else {
+        alert('Failed to cancel previous request. Please try again.')
+      }
+    } catch (e: any) {
+      alert(`Error: ${e.message || 'Could not cancel request'}`)
+    } finally {
+      setIsCancellingPendingDesk(false)
+    }
+  }
+
   const handleDownloadInvoice = () => {
     if (!confirmedAppt || !clinic) return
     const win = window.open('', '_blank', 'width=800,height=700')
@@ -1128,7 +1245,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
       <!DOCTYPE html>
       <html>
         <head>
-          <title>Dactor Invoice - ${confirmedAppt.trackingCode10Digit}</title>
+          <title>Dactor Invoice - ${escapeHtml(confirmedAppt.trackingCode10Digit)}</title>
           <style>
             body { font-family: 'Plus Jakarta Sans', Arial, sans-serif; padding: 36px; color: #0f172a; }
             .box { max-width: 680px; margin: 0 auto; border: 2px solid #0284c7; border-radius: 16px; padding: 28px; }
@@ -1145,28 +1262,28 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
           <div class="box">
             <div class="header">
               <div>
-                <h2 style="margin:0;font-size:22px;">${clinic.name}</h2>
-                <p style="margin:4px 0 0;font-size:12px;color:#64748b;">${clinic.addressText || 'Nepal'} • ${clinic.contactPhone || ''}</p>
+                <h2 style="margin:0;font-size:22px;">${escapeHtml(clinic.name)}</h2>
+                <p style="margin:4px 0 0;font-size:12px;color:#64748b;">${escapeHtml(clinic.addressText || 'Nepal')} • ${escapeHtml(clinic.contactPhone || '')}</p>
               </div>
               <span class="badge">${isReschedule ? 'RESCHEDULED CONFIRMATION' : confirmedAppt.paymentStatus === 'paid' ? 'PAID RECEIPT' : 'PAY AT CLINIC'}</span>
             </div>
             <div>
               <div style="font-size:11px;text-transform:uppercase;color:#64748b;font-weight:700;">10-Digit Universal Queue & Report Tracking Code</div>
-              <div class="code">${confirmedAppt.trackingCode10Digit}</div>
+              <div class="code">${escapeHtml(confirmedAppt.trackingCode10Digit)}</div>
             </div>
             <table>
-              <tr><th>Patient Name</th><td><strong>${confirmedAppt.patientName}</strong> (${confirmedAppt.patientAge} yrs, ${confirmedAppt.patientGender})</td></tr>
-              <tr><th>Contact Mobile</th><td>${confirmedAppt.patientMobile}</td></tr>
-              <tr><th>Queue Token Number</th><td><strong>Token #${confirmedAppt.queueNumber || 1}</strong></td></tr>
-              <tr><th>Date & Slot</th><td>${confirmedAppt.appointmentDate} • ${confirmedAppt.appointmentTime}</td></tr>
+              <tr><th>Patient Name</th><td><strong>${escapeHtml(confirmedAppt.patientName)}</strong> (${escapeHtml(confirmedAppt.patientAge)} yrs, ${escapeHtml(confirmedAppt.patientGender)})</td></tr>
+              <tr><th>Contact Mobile</th><td>${escapeHtml(confirmedAppt.patientMobile)}</td></tr>
+              <tr><th>Queue Token Number</th><td><strong>Token #${escapeHtml(confirmedAppt.queueNumber || 1)}</strong></td></tr>
+              <tr><th>Date & Slot</th><td>${escapeHtml(confirmedAppt.appointmentDate)} • ${escapeHtml(confirmedAppt.appointmentTime)}</td></tr>
               <tr><th>Service / Doctor</th><td>${
                 confirmedAppt.selectedTests && confirmedAppt.selectedTests.length > 0
-                  ? `Diagnostic Lab: ${confirmedAppt.selectedTests.join(', ')}`
-                  : selectedDoctor?.fullName || 'OPD Doctor Consultation'
+                  ? `Diagnostic Lab: ${escapeHtml(confirmedAppt.selectedTests.join(', '))}`
+                  : escapeHtml(selectedDoctor?.fullName || 'OPD Doctor Consultation')
               }</td></tr>
               ${!isReschedule ? `
-              <tr><th>Payment Method & Txn ID</th><td>${confirmedPayMethod || 'Direct'} (${confirmedTxnId || 'N/A'})</td></tr>
-              <tr><th>Total Amount</th><td class="total">Rs. ${confirmedAppt.feeAmount}</td></tr>
+              <tr><th>Payment Method & Txn ID</th><td>${escapeHtml(confirmedPayMethod || 'Direct')} (${escapeHtml(confirmedTxnId || 'N/A')})</td></tr>
+              <tr><th>Total Amount</th><td class="total">Rs. ${escapeHtml(confirmedAppt.feeAmount)}</td></tr>
               ` : ''}
             </table>
             <p style="margin-top:24px;font-size:11px;color:#64748b;text-align:center;">
@@ -1547,6 +1664,15 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                   <MapPin className="w-3.5 h-3.5 text-slate-500 shrink-0" />
                   <span className="font-semibold truncate max-w-[200px] sm:max-w-none">{clinic.addressText || 'Nepal'}</span>
                 </span>
+                <button
+                  type="button"
+                  onClick={() => setShowMapModal(true)}
+                  className="inline-flex items-center space-x-1 px-2.5 sm:px-3 py-1 rounded-xl bg-teal-500/10 text-teal-700 dark:text-teal-300 hover:bg-teal-500/20 font-bold border border-teal-500/20 transition text-[11px] backdrop-blur-sm cursor-pointer active:scale-95"
+                  title="View on Interactive Map"
+                >
+                  <MapPin className="w-3.5 h-3.5 shrink-0" />
+                  <span>View on Map</span>
+                </button>
                 <a
                   href={
                     clinic.latitude && clinic.longitude
@@ -1702,6 +1828,41 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
             </div>
           </div>
         </div>
+      </div>
+
+      {/* Interactive Clinic Map Location Viewer */}
+      <div className="p-4 sm:p-5 rounded-3xl liquid-glass border border-white/60 dark:border-white/10 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <div className="p-1.5 rounded-lg bg-teal-600 text-white shrink-0">
+              <MapPin className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white">
+                Interactive Clinic Location & Directions
+              </h3>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Interactive Map • Verified GPS coordinates
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowMapModal(true)}
+            className="text-xs font-bold text-teal-600 dark:text-teal-400 hover:text-teal-700 dark:hover:text-teal-300 transition cursor-pointer"
+          >
+            Expand Map ↗
+          </button>
+        </div>
+
+        <MapLibreLocationViewer
+          mode="inline"
+          lat={clinic.latitude || 27.7052}
+          lng={clinic.longitude || 85.3193}
+          clinicName={clinic.name}
+          addressText={clinic.addressText || 'Nepal'}
+          height="280px"
+        />
       </div>
 
       {/* ========================================================= */}
@@ -3139,7 +3300,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                       <button
                         type="button"
                         disabled={submitting || isLookingUpCode}
-                        onClick={handleConfirmBookingAndPayment}
+                        onClick={() => handleConfirmBookingAndPayment()}
                         className={`flex-1 py-3 text-white font-black rounded-xl text-xs transition-all shadow-glass-base cursor-pointer active:scale-95 border-t border-white/20 disabled:opacity-50 ${
                           isReschedule
                             ? 'bg-gradient-to-r from-cyan-600 to-teal-600 hover:from-cyan-700 hover:to-teal-700'
@@ -3163,28 +3324,56 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                         Choose Payment Method
                       </label>
 
-                      {[
-                        {
-                          id: 'esewa',
-                          title: paymentConfig?.esewa?.title || 'eSewa Mobile Wallet',
-                          sub: 'Digital Wallet & NetBanking',
-                        },
-                        {
-                          id: 'khalti',
-                          title: paymentConfig?.khalti?.title || 'Khalti Digital Wallet',
-                          sub: 'Instant Wallet & Mobile Banking',
-                        },
-                        {
-                          id: 'fonepay',
-                          title: paymentConfig?.fonepay?.title || 'Fonepay QR / Direct Banking',
-                          sub: 'Nepal Interbank QR Payment',
-                        },
-                        {
-                          id: 'pay_at_desk',
-                          title: 'Pay at Desk',
-                          sub: 'Pay at clinic counter (+5% service charge applies)',
-                        },
-                      ].map((opt) => (
+                      {(() => {
+                        const isDirect = clinic?.isDirectPaymentEnabled ?? false
+                        const esewaUsable = isDirect && Boolean(paymentConfig?.esewa?.enabled && paymentConfig?.esewa?.is_verified)
+                        const khaltiUsable = isDirect && Boolean(paymentConfig?.khalti?.enabled && paymentConfig?.khalti?.is_verified)
+                        const fonepayUsable = isDirect && Boolean(paymentConfig?.fonepay?.enabled && paymentConfig?.fonepay?.is_verified)
+                        const connectIpsUsable = isDirect && Boolean(paymentConfig?.connectips?.enabled && paymentConfig?.connectips?.is_verified)
+
+                        const opts = [
+                          ...(esewaUsable
+                            ? [{
+                                id: 'esewa',
+                                title: paymentConfig?.esewa?.title || 'eSewa Mobile Wallet',
+                                sub: paymentConfig?.esewa?.subtitle || 'Digital Wallet & NetBanking',
+                                merchantId: paymentConfig?.esewa?.merchant_id || '',
+                              }]
+                            : []),
+                          ...(khaltiUsable
+                            ? [{
+                                id: 'khalti',
+                                title: paymentConfig?.khalti?.title || 'Khalti Digital Wallet',
+                                sub: paymentConfig?.khalti?.subtitle || 'Instant Wallet & Mobile Banking',
+                                merchantId: paymentConfig?.khalti?.merchant_id || '',
+                              }]
+                            : []),
+                          ...(fonepayUsable
+                            ? [{
+                                id: 'fonepay',
+                                title: paymentConfig?.fonepay?.title || 'Fonepay QR / Direct Banking',
+                                sub: paymentConfig?.fonepay?.subtitle || 'Nepal Interbank QR Payment',
+                                merchantId: paymentConfig?.fonepay?.merchant_id || '',
+                              }]
+                            : []),
+                          ...(connectIpsUsable
+                            ? [{
+                                id: 'connectips',
+                                title: paymentConfig?.connectips?.title || 'ConnectIPS Direct Bank',
+                                sub: paymentConfig?.connectips?.subtitle || 'NCHL Direct Bank Account Transfer',
+                                merchantId: paymentConfig?.connectips?.merchant_id || '',
+                              }]
+                            : []),
+                          {
+                            id: 'pay_at_desk',
+                            title: 'Pay at Desk',
+                            sub: 'Pay at clinic counter (+5% service charge applies)',
+                            merchantId: '',
+                          },
+                        ]
+
+                        return opts
+                      })().map((opt) => (
                         <div
                           key={opt.id}
                           onClick={() => setSelectedPaymentMethod(opt.id as any)}
@@ -3194,11 +3383,50 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                               : 'liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70'
                           }`}
                         >
-                          <div className="flex items-center space-x-3">
-                            <CreditCard className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0" />
-                            <div>
-                              <p className="text-xs font-black text-slate-900 dark:text-white">{opt.title}</p>
-                              <p className="text-[10px] text-slate-500 dark:text-slate-400">{opt.sub}</p>
+                          <div className="flex items-center space-x-3 min-w-0 flex-1">
+                            {opt.id === 'esewa' ? (
+                              <div className="w-10 h-10 rounded-xl bg-[#60BB46] shrink-0 flex items-center justify-center shadow-xs">
+                                <span className="text-white font-black text-xl italic select-none" style={{ fontFamily: 'system-ui, sans-serif', lineHeight: 1 }}>e</span>
+                              </div>
+                            ) : opt.id === 'khalti' ? (
+                              <div className="w-10 h-10 rounded-xl bg-[#5D2E8E] shrink-0 flex items-center justify-center shadow-xs">
+                                <span className="text-white font-black text-lg select-none" style={{ fontFamily: 'system-ui, sans-serif', lineHeight: 1 }}>K</span>
+                              </div>
+                            ) : opt.id === 'fonepay' ? (
+                              <div className="w-10 h-10 rounded-xl bg-[#C8102E] shrink-0 flex items-center justify-center shadow-xs text-white">
+                                <QrCode className="w-5 h-5 stroke-[2.2]" />
+                              </div>
+                            ) : opt.id === 'connectips' ? (
+                              <div className="w-10 h-10 rounded-xl bg-[#0B3B60] shrink-0 flex items-center justify-center shadow-xs text-white relative overflow-hidden">
+                                <Building2 className="w-5 h-5 stroke-[2.2]" />
+                                <span className="absolute bottom-1 right-1 w-1.5 h-1.5 rounded-full bg-[#E31B23]"></span>
+                              </div>
+                            ) : opt.id === 'pay_at_desk' ? (
+                              <div className="w-10 h-10 rounded-xl bg-amber-500 shrink-0 flex items-center justify-center shadow-xs text-white">
+                                <Store className="w-5 h-5 stroke-[2.2]" />
+                              </div>
+                            ) : (
+                              <div className="w-10 h-10 rounded-xl bg-teal-500/10 shrink-0 flex items-center justify-center shadow-xs text-teal-600 dark:text-teal-400">
+                                <CreditCard className="w-5 h-5" />
+                              </div>
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center space-x-1.5 flex-wrap">
+                                <p className="text-xs font-black text-slate-900 dark:text-white truncate">{opt.title}</p>
+                                <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${
+                                  opt.id === 'pay_at_desk'
+                                    ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                                    : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                }`}>
+                                  {opt.id === 'pay_at_desk' ? '+5% Charge' : '0% Fee'}
+                                </span>
+                              </div>
+                              <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate mt-0.5">{opt.sub}</p>
+                              {opt.merchantId && selectedPaymentMethod === opt.id && (
+                                <p className="text-[10px] font-mono text-teal-700 dark:text-teal-300 mt-0.5">
+                                  Verified Merchant: {opt.merchantId}
+                                </p>
+                              )}
                             </div>
                           </div>
                           <div
@@ -3258,7 +3486,7 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
                       <button
                         type="button"
                         disabled={submitting || paymentCountdown === 0}
-                        onClick={handleConfirmBookingAndPayment}
+                        onClick={() => handleConfirmBookingAndPayment()}
                         className="flex-1 py-3 bg-gradient-to-r from-teal-600 to-cyan-600 hover:from-teal-700 hover:to-cyan-700 disabled:opacity-50 text-white font-bold rounded-xl text-xs transition-all shadow-glass-base cursor-pointer active:scale-95 border-t border-white/20 flex items-center justify-center space-x-1.5"
                       >
                         <ShieldCheck className="w-4 h-4 mr-1 text-teal-200" />
@@ -3279,6 +3507,95 @@ export const ClinicDetail: React.FC<ClinicDetailProps> = ({
             )}
           </div>
         </div>
+      )}
+
+      {/* Unapproved Pay at Desk Re-Booking Detection Modal */}
+      {showPendingPayAtDeskModal && pendingPayAtDeskAppt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/70 backdrop-blur-md animate-in fade-in duration-200">
+          <div className="liquid-glass-modal rounded-3xl max-w-md w-full p-6 relative max-h-[90vh] overflow-y-auto space-y-4">
+            <div className="flex items-center space-x-3 text-amber-600 dark:text-amber-400">
+              <div className="w-10 h-10 rounded-2xl bg-amber-500/20 flex items-center justify-center shrink-0">
+                <AlertCircle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-slate-900 dark:text-white">
+                  Unapproved Pay at Desk Request
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Waiting for clinic counter approval
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-slate-100/70 dark:bg-slate-800/60 rounded-2xl border border-slate-200/80 dark:border-slate-700/60 text-xs space-y-1.5">
+              <p className="font-bold text-slate-800 dark:text-slate-100">
+                Patient: {pendingPayAtDeskAppt.patientName}
+              </p>
+              <p className="text-slate-600 dark:text-slate-300">
+                Date: {pendingPayAtDeskAppt.appointmentDate} ({pendingPayAtDeskAppt.appointmentTime})
+              </p>
+              <p className="font-mono font-bold text-teal-600 dark:text-teal-400">
+                Tracking Code: #{pendingPayAtDeskAppt.trackingCode10Digit}
+              </p>
+              <p className="text-amber-600 dark:text-amber-400 font-semibold">
+                Status: Waiting for Counter Approval
+              </p>
+            </div>
+
+            <p className="text-xs text-blue-800 dark:text-blue-300 bg-blue-50/80 dark:bg-blue-950/40 p-3 rounded-xl border border-blue-200 dark:border-blue-900/50">
+              Pay at Desk does not hold your slot until approved by clinic counter staff. To book fresh or pay online (eSewa) to secure your spot, you can cancel this pending request.
+            </p>
+
+            <div className="space-y-2 pt-2">
+              <button
+                type="button"
+                disabled={isCancellingPendingDesk}
+                onClick={handleCancelPendingDeskAndProceed}
+                className="w-full py-3 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white font-bold rounded-xl text-xs transition-colors cursor-pointer active:scale-98 flex items-center justify-center space-x-2 shadow-xs"
+              >
+                {isCancellingPendingDesk ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Cancelling & Continuing...</span>
+                  </>
+                ) : (
+                  <span>Cancel Request & Continue</span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPendingPayAtDeskModal(false)
+                  window.location.href = `/?clinic=${clinicId}&trackingCode=${pendingPayAtDeskAppt.trackingCode10Digit}#live-tracker`
+                }}
+                className="w-full py-2.5 bg-teal-50 dark:bg-teal-950/30 border border-teal-300 dark:border-teal-700 text-teal-700 dark:text-teal-300 hover:bg-teal-100 font-bold rounded-xl text-xs transition-colors cursor-pointer"
+              >
+                Track Current Request
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowPendingPayAtDeskModal(false)}
+                className="w-full py-2 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 font-medium text-xs transition-colors cursor-pointer"
+              >
+                Keep Request & Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Fullscreen Interactive Map Viewer Modal */}
+      {clinic && (
+        <MapLibreLocationViewer
+          mode="modal"
+          isOpen={showMapModal}
+          onClose={() => setShowMapModal(false)}
+          lat={clinic.latitude || 27.7052}
+          lng={clinic.longitude || 85.3193}
+          clinicName={clinic.name}
+          addressText={clinic.addressText || 'Nepal'}
+        />
       )}
     </div>
   )
