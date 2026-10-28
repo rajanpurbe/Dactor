@@ -53,6 +53,7 @@ import {
   calculateMultiSlotDailyPosition,
   getLinkedConsultations,
   LinkedConsultationsResult,
+  requestGuestLabReportUrl,
   resolveStorageUrl,
   resolveClinicLogoUrl,
   resolveClinicCoverUrl,
@@ -84,6 +85,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
   const [doctor, setDoctor] = useState<Doctor | null>(null)
   const [clinicQueue, setClinicQueue] = useState<Appointment[]>([])
   const [labReports, setLabReports] = useState<LabReport[]>([])
+  const [publicQueueStatus, setPublicQueueStatus] = useState<any | null>(null)
   const [multiSlotResult, setMultiSlotResult] = useState<MultiSlotPositionResult | null>(null)
   const [linkedConsultations, setLinkedConsultations] = useState<LinkedConsultationsResult | null>(null)
   const [loading, setLoading] = useState(false)
@@ -109,7 +111,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
   const [pendingVerificationAction, setPendingVerificationAction] = useState<
     'view_report' | 'download_report' | 'reschedule' | 'cancel'
   >('view_report')
-  const [verifyMethod, setVerifyMethod] = useState<'name' | 'phone'>('name')
+  const [verifyMethod, setVerifyMethod] = useState<'name' | 'phone'>('phone')
   const [verificationInput, setVerificationInput] = useState('')
   const [verifyError, setVerifyError] = useState('')
 
@@ -140,7 +142,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     return () => clearInterval(timer)
   }, [])
 
-  // Main data loader by 10-digit code, Gmail address, or phone number
+  // Public tracking codes return only operational queue status. Private
+  // appointment details require a verified signed-in patient session.
   const fetchQueueData = async (targetCode: string, silent = false) => {
     const clean = targetCode.trim()
     if (!clean) return
@@ -148,13 +151,42 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     setErrorMsg('')
 
     try {
-      const [appt, linked] = await Promise.all([
-        getAppointmentByTrackingCodeOrContact(clean),
-        getLinkedConsultations(clean),
-      ])
+      if (!/^\d{10}$/.test(clean)) {
+        setAppointment(null)
+        setPublicQueueStatus(null)
+        setLabReports([])
+        if (!silent) setErrorMsg('Enter the 10-digit tracking code to view queue status.')
+        return
+      }
+
+      const appt = await getAppointmentByTrackingCodeOrContact(clean)
+      if (!appt) {
+        const { data: publicRows, error: publicError } = await supabase.rpc('get_public_queue_status', {
+          p_tracking_code: clean,
+        })
+        const status = !publicError && Array.isArray(publicRows) ? publicRows[0] : null
+        setAppointment(null)
+        setLinkedConsultations(null)
+        setClinicQueue([])
+        setLabReports([])
+        setMultiSlotResult(null)
+        setPublicQueueStatus(status || null)
+        if (status?.clinic_id) {
+          setClinic(await getClinicById(status.clinic_id))
+          setDoctor(status.doctor_id ? await getDoctorById(status.doctor_id) : null)
+        } else {
+          setClinic(null)
+          setDoctor(null)
+          if (!silent) setErrorMsg('No booking record found. Check the code and try again.')
+        }
+        return
+      }
+
+      const linked = await getLinkedConsultations(clean)
       const effectiveAppt = appt || linked?.targetAppointment || null
       setAppointment(effectiveAppt)
       setLinkedConsultations(linked)
+      setPublicQueueStatus(null)
 
       if (effectiveAppt) {
         const appt = effectiveAppt
@@ -214,13 +246,19 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
   }, [activeCode])
 
   useEffect(() => {
+    const queueNum = appointment?.queueNumber || publicQueueStatus?.token_number || ''
+    const clinicName = clinic?.name || publicQueueStatus?.clinic_name || 'Clinic'
+    const titleText = isUnlocked && appointment?.patientName
+      ? `Live OPD Queue #${queueNum} • ${appointment.patientName} | Dactor`
+      : queueNum
+      ? `Live OPD Queue #${queueNum} • ${clinicName} | Dactor`
+      : 'Real-Time Live OPD Queue Tracker Nepal | Dactor'
+
     updatePageSEO({
-      title: appointment
-        ? `Live OPD Queue #${appointment.queueNumber || ''} • ${appointment.patientName} | Dactor`
-        : 'Real-Time Live OPD Queue Tracker Nepal | Dactor',
+      title: titleText,
       description: 'Track live doctor consultation token numbers, doctor cabin status, estimated wait times, and delays in real-time at clinics across Nepal with your 10-digit Dactor code.',
     })
-  }, [appointment])
+  }, [appointment, publicQueueStatus, clinic, isUnlocked])
 
   // Live auto-refresh every 4 seconds (matching Android QueueStatusScreen.kt)
   useEffect(() => {
@@ -233,7 +271,9 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
 
   // Active Supabase Realtime WebSocket subscription for instant alerts & queue changes
   useEffect(() => {
-    if (!activeCode && !appointment) return
+    // Do not subscribe to private notification/appointment streams for a
+    // public tracking code. The public queue RPC is polled separately.
+    if (!appointment) return
 
     const apptId = appointment?.id
     const trackingCode = appointment?.trackingCode10Digit || activeCode
@@ -325,8 +365,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     const clean = inputCode.trim()
-    if (!clean) {
-      setErrorMsg('Please enter your 10-digit tracking code, Gmail address, or mobile number.')
+    if (!/^\d{10}$/.test(clean)) {
+      setErrorMsg('Please enter a valid 10-digit tracking code.')
       return
     }
     setActiveCode(clean)
@@ -339,14 +379,29 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     setTimeout(() => setCopyFeedback(false), 2000)
   }
 
-  // Calculations for live queue status
+  // Calculations for live queue status: scoped strictly to this appointment's doctor
   const waitingPatients = useMemo(
-    () => clinicQueue.filter((a) => a.checkinStatus === 'waiting' && a.status !== 'WAITING_FOR_APPROVAL' && a.status !== 'UNAPPROVED' && a.status !== 'EXPIRED'),
-    [clinicQueue]
+    () => clinicQueue.filter((a) => {
+      const matchDoc = appointment?.doctorId ? a.doctorId === appointment.doctorId : !a.doctorId
+      const st = (a.status || '').toUpperCase()
+      return (
+        matchDoc &&
+        a.checkinStatus === 'waiting' &&
+        st === 'APPROVED' &&
+        a.status !== 'WAITING_FOR_APPROVAL' &&
+        a.status !== 'pending_payment' &&
+        a.status !== 'UNAPPROVED' &&
+        a.status !== 'EXPIRED'
+      )
+    }),
+    [clinicQueue, appointment?.doctorId]
   )
   const inConsultationPatient = useMemo(
-    () => clinicQueue.find((a) => a.checkinStatus === 'in_consultation'),
-    [clinicQueue]
+    () => clinicQueue.find((a) => {
+      const matchDoc = appointment?.doctorId ? a.doctorId === appointment.doctorId : !a.doctorId
+      return matchDoc && a.checkinStatus === 'in_consultation'
+    }),
+    [clinicQueue, appointment?.doctorId]
   )
 
   // Check if the appointment is tomorrow or a future date
@@ -396,14 +451,21 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
     patientsAhead = multiSlotResult ? Math.max(0, multiSlotResult.patientsAheadInDay) : 0
     displayTokenNumber = multiSlotResult?.cumulativePosition || appointment?.queueNumber || 1
   } else if (appointment) {
-    // For today: count active queue patients ahead
+    // For today: count active queue patients ahead for this doctor
     const activeWaiting = clinicQueue.filter(
-      (a) =>
-        a.id !== inConsultationPatient?.id &&
-        !['completed', 'done', 'cancelled', 'no_show'].includes(a.checkinStatus?.toLowerCase() || '') &&
-        a.status !== 'WAITING_FOR_APPROVAL' &&
-        a.status !== 'UNAPPROVED' &&
-        a.status !== 'EXPIRED'
+      (a) => {
+        const matchDoc = appointment?.doctorId ? a.doctorId === appointment.doctorId : !a.doctorId
+        return (
+          matchDoc &&
+          a.id !== inConsultationPatient?.id &&
+          !['completed', 'done', 'cancelled', 'no_show'].includes(a.checkinStatus?.toLowerCase() || '') &&
+          (a.status || '').toUpperCase() === 'APPROVED' &&
+          a.status !== 'WAITING_FOR_APPROVAL' &&
+          a.status !== 'pending_payment' &&
+          a.status !== 'UNAPPROVED' &&
+          a.status !== 'EXPIRED'
+        )
+      }
     )
     const myPos = appointment.queuePosition || appointment.queueNumber || 0
     let aheadCount = 0
@@ -451,64 +513,90 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
 
   const hasPreparedReport = labReports.some((r) => r.status === 'prepared' || r.status === 'delivered')
   const hasProcessingReport = labReports.some((r) => r.status === 'processing')
+  const isLabOrderProcessing =
+    ['processing', 'sample_collected', 'in_lab'].includes(
+      appointment?.checkinStatus?.toLowerCase() || ''
+    ) ||
+    ['processing', 'sample_collected', 'in_lab'].includes(
+      (appointment as any)?.queueStatus?.toLowerCase() || ''
+    )
 
-  const effectiveLabStatus: 'waiting' | 'processing' | 'prepared' = hasPreparedReport
+  const effectiveLabStatus: 'waiting' | 'inside' | 'processing' | 'prepared' = hasPreparedReport
     ? 'prepared'
-    : hasProcessingReport || isInsideChamber
+    : hasProcessingReport || isLabOrderProcessing
     ? 'processing'
+    : isInsideChamber
+    ? 'inside'
     : 'waiting'
 
-  // Verification handling
-  const handleVerifySubmit = (e: React.FormEvent) => {
+  // Verification handling: server-side verification using exact 10-digit mobile number
+  const handleVerifySubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!verificationInput.trim()) {
-      setVerifyError('Please enter your patient name or registered mobile number.')
+    const cleanPhone = verificationInput.trim().replace(/\D/g, '')
+    if (cleanPhone.length !== 10 || !cleanPhone.startsWith('9')) {
+      setVerifyError('Please enter your full 10-digit registered Nepal mobile number starting with 9.')
       return
     }
 
-    const inputClean = verificationInput.trim().toLowerCase()
-    const targetName = (appointment?.patientName || '').toLowerCase()
-    const targetPhone = (appointment?.patientMobile || '').toLowerCase()
+    setVerifyError('')
 
-    const nameMatches =
-      targetName.includes(inputClean) ||
-      inputClean.includes(targetName) ||
-      targetName.split(/\s+/).some((p) => p.length >= 3 && inputClean.includes(p))
-
-    const phoneMatches =
-      targetPhone.replace(/\D/g, '').includes(inputClean.replace(/\D/g, '')) &&
-      inputClean.replace(/\D/g, '').length >= 6
-
-    if (nameMatches || phoneMatches) {
-      setIsUnlocked(true)
-      setIsReportIdentityVerified(true)
-      setShowVerificationModal(false)
-      setVerifyError('')
-
-      if (pendingVerificationAction === 'view_report') {
-        const rep = labReports.find((r) => r.status === 'prepared') || labReports[0]
-        setSelectedReportToView(rep || null)
-        setShowReportModal(true)
-      } else if (pendingVerificationAction === 'reschedule') {
-        if (appointment?.clinicId) {
+    try {
+      if (pendingVerificationAction === 'view_report' || pendingVerificationAction === 'download_report') {
+        const signedUrl = await requestGuestLabReportUrl(activeCode, cleanPhone)
+        if (signedUrl) {
+          setIsUnlocked(true)
+          setIsReportIdentityVerified(true)
           setShowVerificationModal(false)
-          if (onNavigate) {
-            onNavigate('clinic-detail', {
-              clinicId: appointment.clinicId,
-              doctorId: appointment.doctorId,
-              trackingCode: appointment.trackingCode10Digit,
-              isReschedule: true,
-              autoOpenBooking: true,
-            })
+
+          setLabReports((prev) =>
+            prev.map((r) => ({ ...r, reportFileUrl: signedUrl }))
+          )
+
+          if (pendingVerificationAction === 'view_report') {
+            const rep = labReports.find((r) => r.status === 'prepared') || labReports[0]
+            setSelectedReportToView(rep ? { ...rep, reportFileUrl: signedUrl } : null)
+            setShowReportModal(true)
           } else {
-            window.location.href = `/?clinic=${appointment.clinicId}&doctor=${appointment.doctorId || ''}&rescheduleCode=${appointment.trackingCode10Digit}&reschedule=true#clinic-detail`
+            window.open(signedUrl, '_blank')
           }
+          return
         }
-      } else if (pendingVerificationAction === 'cancel') {
-        executeCancellation()
       }
-    } else {
-      setVerifyError('Identity verification failed. Name or phone does not match this booking.')
+
+      const { data: isVerified, error: rpcErr } = await supabase.rpc('verify_guest_appointment_identity', {
+        p_tracking_code: activeCode,
+        p_patient_phone: cleanPhone,
+      })
+
+      if (!rpcErr && isVerified) {
+        setIsUnlocked(true)
+        setIsReportIdentityVerified(true)
+        setShowVerificationModal(false)
+
+        if (pendingVerificationAction === 'reschedule') {
+          const targetClinicId = appointment?.clinicId || publicQueueStatus?.clinic_id
+          const targetDocId = appointment?.doctorId || publicQueueStatus?.doctor_id
+          if (targetClinicId) {
+            if (onNavigate) {
+              onNavigate('clinic-detail', {
+                clinicId: targetClinicId,
+                doctorId: targetDocId,
+                trackingCode: activeCode,
+                isReschedule: true,
+                autoOpenBooking: true,
+              })
+            } else {
+              window.location.href = `/?clinic=${targetClinicId}&doctor=${targetDocId || ''}&rescheduleCode=${activeCode}&reschedule=true#clinic-detail`
+            }
+          }
+        } else if (pendingVerificationAction === 'cancel') {
+          executeCancellation()
+        }
+      } else {
+        setVerifyError('Verification failed. The mobile number does not match this booking record, or attempt limit exceeded.')
+      }
+    } catch {
+      setVerifyError('Verification failed. Please check your connection and try again.')
     }
   }
 
@@ -716,6 +804,67 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
 
   // Formatted expected call time
   const formattedExpectedTime = approxTimeText
+
+  if (!appointment && publicQueueStatus) {
+    const publicStatus = String(publicQueueStatus.queue_status || publicQueueStatus.checkin_status || 'waiting')
+      .replace(/_/g, ' ')
+    const publicDate = publicQueueStatus.appointment_date
+      ? new Date(`${publicQueueStatus.appointment_date}T00:00:00`).toLocaleDateString()
+      : ''
+
+    return (
+      <main className="min-h-screen bg-slate-50 px-4 py-10 sm:px-6">
+        <section className="mx-auto max-w-2xl space-y-5">
+          <header className="rounded-3xl bg-slate-950 p-6 text-white shadow-xl">
+            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-teal-300">Dactor Live Queue</p>
+            <h1 className="mt-2 text-2xl font-bold">Your queue status</h1>
+            <p className="mt-2 text-sm text-slate-300">Only clinic and queue details are shown here. Patient identity and medical information stay private.</p>
+          </header>
+          <form onSubmit={(event) => {
+            event.preventDefault()
+            const code = inputCode.trim()
+            if (!/^\d{10}$/.test(code)) {
+              setErrorMsg('Please enter a valid 10-digit tracking code.')
+              return
+            }
+            setActiveCode(code)
+            void fetchQueueData(code)
+          }} className="flex gap-2 rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
+            <input
+              value={inputCode}
+              onChange={(event) => setInputCode(event.target.value.replace(/\D/g, '').slice(0, 10))}
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={10}
+              aria-label="10-digit tracking code"
+              placeholder="10-digit tracking code"
+              className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 outline-none focus:border-teal-500"
+            />
+            <button type="submit" disabled={loading} className="rounded-xl bg-teal-700 px-4 py-2 font-semibold text-white disabled:opacity-60">
+              {loading ? 'Checking…' : 'Check'}
+            </button>
+          </form>
+          {errorMsg && <p role="status" className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">{errorMsg}</p>}
+          <article className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-sm text-slate-500">Clinic</p>
+                <h2 className="mt-1 text-xl font-bold text-slate-900">{publicQueueStatus.clinic_name || clinic?.name || 'Clinic'}</h2>
+                {publicQueueStatus.doctor_name && <p className="mt-1 text-sm text-slate-600">Dr. {publicQueueStatus.doctor_name}{publicQueueStatus.doctor_specialty ? ` · ${publicQueueStatus.doctor_specialty}` : ''}</p>}
+              </div>
+              <span className="rounded-full bg-teal-50 px-3 py-1 text-sm font-semibold capitalize text-teal-800">{publicStatus}</span>
+            </div>
+            <div className="mt-6 grid grid-cols-2 gap-4">
+              <div className="rounded-2xl bg-slate-50 p-4"><p className="text-xs text-slate-500">People ahead</p><p className="mt-1 text-2xl font-bold text-slate-900">{Number(publicQueueStatus.patients_ahead || 0)}</p></div>
+              <div className="rounded-2xl bg-slate-50 p-4"><p className="text-xs text-slate-500">Your queue position</p><p className="mt-1 text-2xl font-bold text-slate-900">{Number(publicQueueStatus.queue_position || 0) || '—'}</p></div>
+            </div>
+            <p className="mt-4 text-sm text-slate-600">{publicDate}{publicQueueStatus.appointment_time ? ` · ${publicQueueStatus.appointment_time}` : ''}</p>
+            <p className="mt-4 text-xs text-slate-500">For reports, prescriptions, billing, or changes to this booking, sign in with the account used to book or contact the clinic.</p>
+          </article>
+        </section>
+      </main>
+    )
+  }
 
   return (
     <div className="min-h-screen pb-28 sm:pb-16">
@@ -1084,8 +1233,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
               </div>
             )}
 
-            {/* 2. CLINIC ON BREAK ALERT BANNER (If clinic is on break) */}
-            {appointment.paymentMode === 'PAY_AT_DESK' && appointment.status !== 'APPROVED' ? (
+            {/* 2. PENDING APPROVAL OR ONLINE PAYMENT ALERT BANNER */}
+            {appointment.status !== 'APPROVED' ? (
               <div className="liquid-glass-elevated rounded-3xl p-5 sm:p-7 space-y-5 animate-in fade-in duration-200">
                 {/* Header Status Badge & Attempt Counter */}
                 <div className="flex flex-wrap items-center justify-between gap-2.5 pb-4 border-b border-white/20 dark:border-white/5">
@@ -1093,6 +1242,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                     className={`px-3.5 py-1 rounded-full text-xs font-black uppercase tracking-wider border shadow-xs ${
                       appointment.status === 'WAITING_FOR_APPROVAL'
                         ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30'
+                        : appointment.status === 'pending_payment'
+                        ? 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30'
                         : appointment.status === 'UNAPPROVED'
                         ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30'
                         : 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border-slate-500/30'
@@ -1100,27 +1251,34 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                   >
                     {appointment.status === 'WAITING_FOR_APPROVAL'
                       ? 'Waiting for Clinic Approval'
+                      : appointment.status === 'pending_payment'
+                      ? 'Pending Online Payment'
                       : appointment.status === 'UNAPPROVED'
                       ? 'Unapproved'
                       : 'Request Expired'}
                   </span>
 
-                  <div className="flex items-center space-x-1.5 text-xs font-bold text-slate-500 dark:text-slate-400">
-                    <Clock className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
-                    <span>Attempt {appointment.attemptNumber || 1} of 3</span>
-                  </div>
+                  {appointment.paymentMode === 'PAY_AT_DESK' && (
+                    <div className="flex items-center space-x-1.5 text-xs font-bold text-slate-500 dark:text-slate-400">
+                      <Clock className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                      <span>Attempt {appointment.attemptNumber || 1} of 3</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Status Main Message */}
                 <div className="space-y-2">
                   <h3 className="text-xl sm:text-2xl font-black text-slate-900 dark:text-white">
                     {appointment.status === 'WAITING_FOR_APPROVAL' && 'Waiting for approval from clinic'}
+                    {appointment.status === 'pending_payment' && 'Online Payment Pending'}
                     {appointment.status === 'UNAPPROVED' && 'Unapproved'}
                     {appointment.status === 'EXPIRED' && 'Request expired'}
                   </h3>
                   <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300">
                     {appointment.status === 'WAITING_FOR_APPROVAL' &&
                       'Your Pay at Desk booking request has been submitted to the clinic counter. You will be assigned a live queue token as soon as reception approves your request.'}
+                    {appointment.status === 'pending_payment' &&
+                      'Your appointment slot is reserved. Please complete your online payment to enter the live OPD queue.'}
                     {appointment.status === 'UNAPPROVED' &&
                       ((appointment.attemptNumber || 1) < 3
                         ? 'The clinic unapproved your booking request. You can retry sending this request to the clinic.'
@@ -1335,7 +1493,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                     }`}
                   >
                     <div
-                      className={`w-13 h-13 sm:w-16 sm:h-16 rounded-full flex flex-col items-center justify-center text-white shadow-glass-base ${
+                      className={`w-14 h-14 sm:w-16 sm:h-16 rounded-full flex flex-col items-center justify-center text-white shadow-glass-base ${
                         isInsideChamber
                           ? 'bg-gradient-to-tr from-blue-600 to-indigo-600'
                           : isConsultancyCompleted
@@ -1378,6 +1536,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                           ? 'text-emerald-700 dark:text-emerald-300'
                           : isLabClinic && effectiveLabStatus === 'processing'
                           ? 'text-amber-700 dark:text-amber-300'
+                          : isLabClinic && effectiveLabStatus === 'inside'
+                          ? 'text-blue-700 dark:text-blue-300'
                           : isInsideChamber
                           ? 'text-blue-700 dark:text-blue-300'
                           : isConsultancyCompleted
@@ -1390,6 +1550,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                         ? 'Status: Report Prepared'
                         : effectiveLabStatus === 'processing'
                         ? 'Status: Sample Processing'
+                        : effectiveLabStatus === 'inside'
+                        ? 'Called Inside Phlebotomy Booth!'
                         : patientsAhead === 0
                         ? 'Next for Sample Collection!'
                         : `${patientsAhead} Ahead for Phlebotomy`
@@ -1407,7 +1569,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                     </h3>
 
                     <span className="px-2 sm:px-2.5 py-0.5 rounded-md liquid-glass-subtle text-slate-700 dark:text-slate-300 text-[11px] sm:text-xs font-bold">
-                      Token #{displayTokenNumber}
+                      Token #{displayTokenNumber}{doctor?.fullName && !isLabClinic ? ` • ${doctor.fullName}` : ''}
                     </span>
                   </div>
 
@@ -1417,6 +1579,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                         ? 'Certified report ready • Verify identity below to view & download file'
                         : effectiveLabStatus === 'processing'
                         ? 'Sample collected • Biochemical processing underway in laboratory'
+                        : effectiveLabStatus === 'inside'
+                        ? '🔔 Token called! Please proceed immediately into the phlebotomy collection booth'
                         : 'Booked in Live Queue • Please proceed for sample collection'
                       : isInsideChamber
                       ? 'Currently with specialist in consultation cabin'
@@ -1445,7 +1609,7 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                     const isDone = isLab
                       ? (idx === 0) ||
                         (idx === 1 && (effectiveLabStatus === 'processing' || effectiveLabStatus === 'prepared')) ||
-                        (idx === 2 && (effectiveLabStatus === 'processing' || effectiveLabStatus === 'prepared')) ||
+                        (idx === 2 && effectiveLabStatus === 'prepared') ||
                         (idx === 3 && effectiveLabStatus === 'prepared')
                       : (idx === 0) ||
                         (idx === 1 && (!isConsultancyCompleted || isInsideChamber)) ||
@@ -1455,7 +1619,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                     const isActive = isLab
                       ? (idx === 3 && effectiveLabStatus === 'prepared') ||
                         (idx === 2 && effectiveLabStatus === 'processing') ||
-                        (idx === 1 && effectiveLabStatus === 'waiting' && patientsAhead === 0)
+                        (idx === 1 && (effectiveLabStatus === 'inside' || (effectiveLabStatus === 'waiting' && patientsAhead === 0))) ||
+                        (idx === 0 && effectiveLabStatus === 'waiting' && patientsAhead > 0)
                       : (idx === 3 && isConsultancyCompleted) ||
                         (idx === 2 && isInsideChamber) ||
                         (idx === 1 && !isInsideChamber && !isConsultancyCompleted)
@@ -1707,6 +1872,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                         ? 'bg-emerald-500/10 text-emerald-800 dark:text-emerald-300 border border-emerald-500/20'
                         : effectiveLabStatus === 'processing'
                         ? 'bg-amber-500/10 text-amber-800 dark:text-amber-300 border border-amber-500/20'
+                        : effectiveLabStatus === 'inside'
+                        ? 'bg-blue-500/10 text-blue-800 dark:text-blue-300 border border-blue-500/20 animate-pulse'
                         : 'bg-teal-500/10 text-teal-800 dark:text-teal-300 border border-teal-500/20'
                     }`}
                   >
@@ -1714,6 +1881,8 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                       ? 'PREPARED'
                       : effectiveLabStatus === 'processing'
                       ? 'PROCESSING'
+                      : effectiveLabStatus === 'inside'
+                      ? 'CALLED TO BOOTH'
                       : 'LIVE QUEUE'}
                   </span>
                 </div>
@@ -1758,6 +1927,16 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
                     </div>
                     <p className="text-[11px] text-amber-700 dark:text-amber-400">
                       Your biological sample has been received and transferred to the diagnostic chamber. As soon as the certified pathologist signs off, this screen will transition to Prepared and unlock the report file.
+                    </p>
+                  </div>
+                ) : effectiveLabStatus === 'inside' ? (
+                  <div className="p-4 rounded-2xl liquid-glass-subtle border-blue-500/30 text-xs text-blue-900 dark:text-blue-300 space-y-1 animate-pulse">
+                    <div className="font-bold flex items-center space-x-1.5">
+                      <BellRing className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                      <span>Called to Phlebotomy / Sample Collection Booth</span>
+                    </div>
+                    <p className="text-[11px] text-blue-700 dark:text-blue-400">
+                      Please proceed immediately into the collection cabin. The phlebotomist is ready to collect your biological sample.
                     </p>
                   </div>
                 ) : (
@@ -1836,15 +2015,15 @@ export const LiveQueue: React.FC<LiveQueueProps> = ({
             </div>
 
             <p className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-              For privacy and medical data protection, please confirm the registered Patient's Full Name or Mobile Number.
+              For privacy and medical data protection, please enter the registered 10-digit mobile number for this booking.
             </p>
 
             <form onSubmit={handleVerifySubmit} className="space-y-3">
               <input
-                type="text"
+                type="tel"
                 value={verificationInput}
                 onChange={(e) => setVerificationInput(e.target.value)}
-                placeholder="Enter Patient Name or Mobile..."
+                placeholder="Enter 10-digit mobile number (e.g. 98XXXXXXXX)..."
                 className="w-full px-3.5 sm:px-4 py-2.5 sm:py-3 liquid-glass-input rounded-xl font-bold text-slate-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-teal-500"
               />
 

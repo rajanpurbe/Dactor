@@ -53,6 +53,8 @@ import {
   HelpCircle,
   LifeBuoy,
   MessageSquare,
+  QrCode,
+  Store,
 } from 'lucide-react'
 function triggerConfettiBurst() {
   try {
@@ -130,6 +132,8 @@ import {
   PatientProfile,
   PatientTransactionRecord,
   PaymentGatewaysConfig,
+  OnlineGatewayId,
+  PAY_AT_DESK_SERVICE_CHARGE_PERCENT,
   SupportTicket,
   BillingInvoice,
 } from '../types'
@@ -157,6 +161,8 @@ import {
   isSlotTimeExpired,
   recordPaymentTransaction,
   getLabReportsByTrackingCode,
+  requestGuestLabReportUrl,
+  requestAuthorizedDocumentUrl,
   getPatientNotifications,
   markNotificationAsRead,
   markAllNotificationsAsRead,
@@ -168,8 +174,10 @@ import {
   getSupportTickets,
   getSupportTicketByCodeOrContact,
   getAppointmentById,
-  startEsewaPayment,
-  refreshEsewaPayment,
+  startOnlinePayment,
+  refreshOnlinePayment,
+  initiateOnlinePaymentPhase,
+  cancelPendingAppointment,
 } from '../services/db'
 import {
   firebaseSignOut,
@@ -189,6 +197,7 @@ import {
   extractCleanClinicalRemarks,
   WebPaymentRecord,
 } from '../utils/paymentLedger'
+import { escapeHtml } from '../utils/html'
 
 // ==========================================
 // CLINIC & DOCTOR PROFILE CARD SUBCOMPONENTS
@@ -661,8 +670,8 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
   // Payment State
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<
-    'esewa' | 'khalti' | 'fonepay' | 'cash'
-  >('esewa')
+    OnlineGatewayId | 'pay_at_desk' | 'cash'
+  >('pay_at_desk')
   const [clinicPaymentConfig, setClinicPaymentConfig] = useState<PaymentGatewaysConfig | null>(null)
   const [isPaymentProcessing, setIsPaymentProcessing] = useState(false)
   const [isVerifyingEsewa, setIsVerifyingEsewa] = useState(false)
@@ -791,10 +800,12 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   const [isSearchingReport, setIsSearchingReport] = useState(false)
   const [reportSearchError, setReportSearchError] = useState<string | null>(null)
   const [unlockedReportIds, setUnlockedReportIds] = useState<string[]>([])
+  const [unlockedReportUrls, setUnlockedReportUrls] = useState<Record<string, string>>({})
   const [verifyingReport, setVerifyingReport] = useState<LabReport | null>(null)
-  const [verifyMethod, setVerifyMethod] = useState<'name' | 'phone'>('name')
+  const [verifyMethod, setVerifyMethod] = useState<'name' | 'phone'>('phone')
   const [verificationInput, setVerificationInput] = useState('')
   const [verificationError, setVerificationError] = useState<string | null>(null)
+  const [isVerifyingReport, setIsVerifyingReport] = useState(false)
 
   // ==========================================
   // INITIALIZATION & SESSION RESTORE
@@ -1207,20 +1218,40 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   // ==========================================
   // ESEWA SERVER-VERIFIED PAYMENT RESTORE & RETURN HANDLER
   // ==========================================
+  // Ensure selectedPaymentMethod always stays aligned with clinic's verified gateways (or defaults to pay_at_desk)
+  useEffect(() => {
+    const isDirect = selectedClinic?.isDirectPaymentEnabled === true
+    const usableIds: Array<OnlineGatewayId | 'pay_at_desk'> = [
+      ...(isDirect && clinicPaymentConfig?.esewa?.enabled && clinicPaymentConfig?.esewa?.is_verified ? (['esewa'] as const) : []),
+      ...(isDirect && clinicPaymentConfig?.khalti?.enabled && clinicPaymentConfig?.khalti?.is_verified ? (['khalti'] as const) : []),
+      ...(isDirect && clinicPaymentConfig?.fonepay?.enabled && clinicPaymentConfig?.fonepay?.is_verified ? (['fonepay'] as const) : []),
+      ...(isDirect && clinicPaymentConfig?.connectips?.enabled && clinicPaymentConfig?.connectips?.is_verified ? (['connectips'] as const) : []),
+      'pay_at_desk',
+    ]
+    if (!usableIds.includes(selectedPaymentMethod as any)) {
+      setSelectedPaymentMethod(usableIds[0] || 'pay_at_desk')
+    }
+  }, [selectedClinic?.id, selectedClinic?.isDirectPaymentEnabled, clinicPaymentConfig])
+
   const verifyEsewaPaymentOnReturn = async (overrideApptId?: string) => {
     try {
       const urlParams = new URLSearchParams(window.location.search)
       const apptIdFromUrl = urlParams.get('appointmentId') || urlParams.get('appointment_id')
       const paymentResult = urlParams.get('payment_result') || urlParams.get('status')
+      const gatewayFromUrl = urlParams.get('gateway')
 
       let apptIdToVerify = overrideApptId || apptIdFromUrl
+      let pendingGateway = gatewayFromUrl || ''
       if (!apptIdToVerify) {
         try {
-          const pendingRaw = localStorage.getItem('dactor_pending_esewa_payment')
+          const pendingRaw =
+            localStorage.getItem('dactor_pending_online_payment') ||
+            localStorage.getItem('dactor_pending_esewa_payment')
           if (pendingRaw) {
             const parsed = JSON.parse(pendingRaw)
-            if (parsed.appointmentId && (Date.now() - (parsed.createdAt || 0)) < 3600000) {
+            if (parsed.appointmentId && (Date.now() - (parsed.createdAt || 0)) < 86400000) {
               apptIdToVerify = parsed.appointmentId
+              pendingGateway = parsed.gateway || pendingGateway
             }
           }
         } catch {}
@@ -1229,17 +1260,19 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       if (!apptIdToVerify) return
 
       setIsVerifyingEsewa(true)
-      setEsewaVerifyMessage('Verifying eSewa payment status with server...')
+      setEsewaVerifyMessage('Verifying online payment status with server...')
 
-      // Query server edge function to independently verify eSewa status and finalize if COMPLETE
-      const refreshResult = await refreshEsewaPayment(apptIdToVerify)
+      // Query server edge function to independently verify gateway status and finalize if COMPLETE
+      const refreshResult = await refreshOnlinePayment(apptIdToVerify)
       const appt = await getAppointmentById(apptIdToVerify)
+      const gwLabel = (refreshResult.gateway || pendingGateway || 'online').toUpperCase()
 
       if (appt && (appt.paymentStatus === 'paid' || refreshResult.status === 'complete')) {
         setConfirmedBooking(appt)
         setActiveTab('book')
         setBookingStep(5)
         triggerConfettiBurst()
+        localStorage.removeItem('dactor_pending_online_payment')
         localStorage.removeItem('dactor_pending_esewa_payment')
         localStorage.removeItem('dactor_patient_payment_session')
         if (appt.trackingCode10Digit) {
@@ -1252,17 +1285,20 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           const url = new URL(window.location.href)
           url.searchParams.delete('payment_result')
           url.searchParams.delete('status')
+          url.searchParams.delete('gateway')
           url.searchParams.delete('appointmentId')
           url.searchParams.delete('appointment_id')
           window.history.replaceState({}, '', url.toString())
         } catch {}
       } else if (refreshResult.status === 'failed' || paymentResult === 'failed') {
-        setTransactionFailedNotice('eSewa transaction was cancelled or failed server verification. Your appointment fee was not charged.')
+        setTransactionFailedNotice(`${gwLabel} transaction was cancelled or failed server verification. Your appointment fee was not charged.`)
+        localStorage.removeItem('dactor_pending_online_payment')
         localStorage.removeItem('dactor_pending_esewa_payment')
         try {
           const url = new URL(window.location.href)
           url.searchParams.delete('payment_result')
           url.searchParams.delete('status')
+          url.searchParams.delete('gateway')
           url.searchParams.delete('appointmentId')
           url.searchParams.delete('appointment_id')
           window.history.replaceState({}, '', url.toString())
@@ -1271,7 +1307,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         setEsewaVerifyMessage('Payment verification in progress on server. You can click Refresh to check status.')
       }
     } catch (err: any) {
-      console.error('Error verifying eSewa payment:', err)
+      console.error('Error verifying online payment:', err)
       setEsewaVerifyMessage(null)
     } finally {
       setIsVerifyingEsewa(false)
@@ -1741,8 +1777,13 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           slotId: selectedSlot?.id,
           checkinStatus: 'waiting',
         }
-      } else if (selectedPaymentMethod === 'esewa' && calculatedFee > 0 && !isBypass) {
-        // eSewa server-verified payment flow: create pending appointment and redirect to server checkout
+      } else if (
+        (['esewa', 'khalti', 'fonepay', 'connectips'] as const).includes(selectedPaymentMethod as any) &&
+        calculatedFee > 0 &&
+        !isBypass
+      ) {
+        // Server-verified online payment flow (eSewa, Khalti, Fonepay, ConnectIPS): create pending appointment and redirect to server checkout
+        const gateway = selectedPaymentMethod as OnlineGatewayId
         code10 = generate10DigitTrackingCode()
         const newAppt = await createAppointment({
           trackingCode10Digit: code10,
@@ -1770,28 +1811,30 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
         saveTrackingCodeLocally(code10)
         try {
-          localStorage.setItem(
-            'dactor_pending_esewa_payment',
-            JSON.stringify({
-              appointmentId: newAppt.id,
-              trackingCode: code10,
-              clinicId: selectedClinic!.id,
-              doctorId: isLabClinic ? undefined : selectedDoctor?.id,
-              amount: calculatedFee,
-              createdAt: Date.now(),
-            })
-          )
+          const pendingSession = JSON.stringify({
+            appointmentId: newAppt.id,
+            trackingCode: code10,
+            clinicId: selectedClinic!.id,
+            doctorId: isLabClinic ? undefined : selectedDoctor?.id,
+            gateway,
+            amount: calculatedFee,
+            createdAt: Date.now(),
+          })
+          localStorage.setItem('dactor_pending_online_payment', pendingSession)
+          localStorage.setItem('dactor_pending_esewa_payment', pendingSession)
+          sessionStorage.setItem('dactor_pending_payment_phone', targetPatientMobile.trim())
         } catch {}
 
-        const returnUrl = `${window.location.origin}${window.location.pathname}?tab=patient-portal&payment_result=checking&appointmentId=${newAppt.id}`
-        const checkout = await startEsewaPayment(newAppt.id, returnUrl)
+        await initiateOnlinePaymentPhase(newAppt.id, gateway).catch(() => {})
+        const returnUrl = `${window.location.origin}${window.location.pathname}?tab=patient-portal&payment_result=checking&gateway=${gateway}&appointmentId=${newAppt.id}`
+        const checkout = await startOnlinePayment(newAppt.id, gateway, returnUrl, code10, targetPatientMobile)
 
         window.location.href = checkout.checkoutUrl
         return
       } else {
         code10 = generate10DigitTrackingCode()
-        const isCash = selectedPaymentMethod === 'cash'
-        const initialPaymentStatus = isCash ? 'pending' : 'paid'
+        const isPayAtDesk = selectedPaymentMethod === 'pay_at_desk' || selectedPaymentMethod === 'cash'
+        const initialPaymentStatus = isPayAtDesk ? 'pending' : 'paid'
 
         const newAppt = await createAppointment({
           trackingCode10Digit: code10,
@@ -1806,8 +1849,9 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           patientEmail: patientUser?.email,
           appointmentDate: bookingDate,
           appointmentTime: slotTimeStr,
-          checkinStatus: 'waiting',
+          checkinStatus: isPayAtDesk ? 'not_checked_in' : 'waiting',
           paymentStatus: initialPaymentStatus,
+          paymentMode: isPayAtDesk ? 'PAY_AT_DESK' : 'ONLINE',
           feeAmount: calculatedFee,
           notes: isLabClinic ? 'Diagnostic Lab Sample Collection' : (bookPatientNotes.trim() || undefined),
           selectedTests: isLabClinic ? selectedLabTests.map((t) => t.serviceName) : [],
@@ -1820,13 +1864,13 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       }
 
       // 2. Record Transaction & Billing Invoice in Supabase
-      const isCash = selectedPaymentMethod === 'cash'
+      const isCash = selectedPaymentMethod === 'pay_at_desk' || selectedPaymentMethod === 'cash'
       const methodLabel = isFreeFollowup
         ? 'FREE FOLLOW-UP'
         : isBypass
         ? 'Bypass Test'
         : isCash
-        ? 'PAY AT RECEPTION'
+        ? 'Pay at Desk'
         : selectedPaymentMethod.toUpperCase()
 
       await recordPaymentTransaction({
@@ -1942,7 +1986,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       <!DOCTYPE html>
       <html>
         <head>
-          <title>℞ Prescription - #${appt.trackingCode10Digit}</title>
+          <title>℞ Prescription - #${escapeHtml(appt.trackingCode10Digit)}</title>
           <style>
             body { font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif; padding: 28px; color: #0f172a; background: #fff; }
             .box { max-width: 680px; margin: 0 auto; border: 2px solid #2563eb; border-radius: 16px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.06); }
@@ -1970,26 +2014,26 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
             </div>
 
             <div class="token-bar">
-              <span><strong>Token:</strong> #${appt.trackingCode10Digit}</span>
-              <span><strong>Date:</strong> ${appt.appointmentDate} (${appt.appointmentTime || 'OPD'})</span>
+              <span><strong>Token:</strong> #${escapeHtml(appt.trackingCode10Digit)}</span>
+              <span><strong>Date:</strong> ${escapeHtml(appt.appointmentDate)} (${escapeHtml(appt.appointmentTime || 'OPD')})</span>
             </div>
 
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 12px; margin-bottom: 12px;">
               <div style="background: #f8fafc; padding: 10px; border-radius: 8px; border: 1px solid #f1f5f9;">
                 <span style="font-size: 10px; text-transform: uppercase; color: #64748b; font-weight: 700; display: block;">Attending Doctor</span>
-                <strong style="color: #0f172a;">${appt.doctor?.fullName || 'OPD Specialist'}</strong>
-                <span style="display: block; color: #2563eb; font-size: 11px;">${appt.doctor?.specialty || 'General Medicine'}</span>
+                <strong style="color: #0f172a;">${escapeHtml(appt.doctor?.fullName || 'OPD Specialist')}</strong>
+                <span style="display: block; color: #2563eb; font-size: 11px;">${escapeHtml(appt.doctor?.specialty || 'General Medicine')}</span>
               </div>
               <div style="background: #f8fafc; padding: 10px; border-radius: 8px; border: 1px solid #f1f5f9;">
                 <span style="font-size: 10px; text-transform: uppercase; color: #64748b; font-weight: 700; display: block;">Patient Details</span>
-                <strong style="color: #0f172a;">${appt.patientName}</strong>
-                <span style="display: block; color: #64748b; font-size: 11px;">${appt.patientAge || '-'} Yrs • ${appt.patientGender || '-'} • ${appt.patientMobile || ''}</span>
+                <strong style="color: #0f172a;">${escapeHtml(appt.patientName)}</strong>
+                <span style="display: block; color: #64748b; font-size: 11px;">${escapeHtml(appt.patientAge || '-')} Yrs • ${escapeHtml(appt.patientGender || '-')} • ${escapeHtml(appt.patientMobile || '')}</span>
               </div>
             </div>
 
             <div class="section">
               <div class="section-title">Clinical Diagnosis / Impression</div>
-              <div style="font-weight: 600; color: #0f172a;">${diagnosisText}</div>
+              <div style="font-weight: 600; color: #0f172a;">${escapeHtml(diagnosisText)}</div>
             </div>
 
             ${
@@ -2014,11 +2058,11 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                           (m, i) => `
                         <tr>
                           <td>${i + 1}</td>
-                          <td style="font-weight: 700; color: #0f172a;">${m.name}</td>
-                          <td>${m.dosage || '-'}</td>
-                          <td>${m.frequency || '-'}</td>
-                          <td>${m.duration || '-'}</td>
-                          <td style="color: #2563eb;">${m.instructions || '-'}</td>
+                          <td style="font-weight: 700; color: #0f172a;">${escapeHtml(m.name)}</td>
+                          <td>${escapeHtml(m.dosage || '-')}</td>
+                          <td>${escapeHtml(m.frequency || '-')}</td>
+                          <td>${escapeHtml(m.duration || '-')}</td>
+                          <td style="color: #2563eb;">${escapeHtml(m.instructions || '-')}</td>
                         </tr>
                       `
                         )
@@ -2035,7 +2079,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 ? `
               <div class="section">
                 <div class="section-title">Doctor's Clinical Advice & Follow-Up</div>
-                <div style="color: #334155; white-space: pre-wrap;">${adviceText}</div>
+                <div style="color: #334155; white-space: pre-wrap;">${escapeHtml(adviceText)}</div>
               </div>
             `
                 : ''
@@ -2044,7 +2088,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
             <div class="footer">
               <div>
                 <span>Digitally signed via Dactor Platform</span><br/>
-                <span style="font-size: 9px; color: #94a3b8;">Ref ID: ${appt.id}</span>
+                <span style="font-size: 9px; color: #94a3b8;">Ref ID: ${escapeHtml(appt.id)}</span>
               </div>
               <div class="signature">
                 Doctor Signature / Seal
@@ -2320,56 +2364,71 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     }
   }
 
-  const handleExecuteReportVerification = (e: React.FormEvent) => {
+  const handleExecuteReportVerification = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!verifyingReport) return
     const rawInput = verificationInput.trim()
     if (!rawInput) {
-      setVerificationError(
-        verifyMethod === 'name'
-          ? "Please enter the patient's registered name"
-          : "Please enter the patient's registered mobile number"
-      )
+      setVerificationError("Please enter the patient's registered mobile number")
       return
     }
 
-    if (verifyMethod === 'name') {
-      const expected = (verifyingReport.patientName || '').trim().toLowerCase().replace(/\s+/g, ' ')
-      const entered = rawInput.toLowerCase().replace(/\s+/g, ' ')
-      if (
-        !expected ||
-        expected === entered ||
-        (expected.length >= 3 && expected.includes(entered)) ||
-        (entered.length >= 3 && entered.includes(expected))
-      ) {
-        setUnlockedReportIds((prev) => [...prev, verifyingReport.id])
-        if (verifyingReport.reportFileUrl) {
-          window.open(verifyingReport.reportFileUrl, '_blank')
-        }
-        setVerifyingReport(null)
-        setVerificationError(null)
-      } else {
-        setVerificationError('Name does not match records. Please check spelling.')
+    const cleanPhone = rawInput.replace(/\D/g, '')
+    if (cleanPhone.length < 7) {
+      setVerificationError('Please enter a valid mobile number (at least 7 digits).')
+      return
+    }
+
+    setIsVerifyingReport(true)
+    setVerificationError(null)
+
+    try {
+      let signedUrl: string | null = null
+
+      if (verifyingReport.trackingCode10Digit) {
+        signedUrl = await requestGuestLabReportUrl(verifyingReport.trackingCode10Digit, cleanPhone)
       }
-    } else {
-      const enteredDigits = rawInput.replace(/\D/g, '')
-      const expectedPhone = (patientUser?.phone || '').replace(/\D/g, '')
-      if (
-        enteredDigits.length >= 7 &&
-        (!expectedPhone ||
-          enteredDigits.slice(-10) === expectedPhone.slice(-10) ||
-          enteredDigits === expectedPhone)
-      ) {
+
+      if (!signedUrl && verifyingReport.id) {
+        signedUrl = await requestAuthorizedDocumentUrl('lab_report', verifyingReport.id, verifyingReport.reportFileUrl || '')
+      }
+
+      if (signedUrl) {
         setUnlockedReportIds((prev) => [...prev, verifyingReport.id])
-        if (verifyingReport.reportFileUrl) {
-          window.open(verifyingReport.reportFileUrl, '_blank')
-        }
+        setUnlockedReportUrls((prev) => ({ ...prev, [verifyingReport.id]: signedUrl! }))
+        window.open(signedUrl, '_blank')
         setVerifyingReport(null)
         setVerificationError(null)
       } else {
-        setVerificationError('Mobile number does not match the appointment record.')
+        setVerificationError('Verification failed: Mobile number does not match clinic appointment records.')
+      }
+    } catch {
+      setVerificationError('Verification request failed. Please try again.')
+    } finally {
+      setIsVerifyingReport(false)
+    }
+  }
+
+  const handleOpenOrUnlockReport = async (rep: LabReport) => {
+    if (unlockedReportUrls[rep.id]) {
+      window.open(unlockedReportUrls[rep.id], '_blank')
+      return
+    }
+
+    if (patientUser?.id) {
+      const signed = await requestAuthorizedDocumentUrl('lab_report', rep.id, rep.reportFileUrl || '')
+      if (signed) {
+        setUnlockedReportIds((prev) => [...prev, rep.id])
+        setUnlockedReportUrls((prev) => ({ ...prev, [rep.id]: signed }))
+        window.open(signed, '_blank')
+        return
       }
     }
+
+    setVerifyingReport(rep)
+    setVerifyMethod('phone')
+    setVerificationInput('')
+    setVerificationError(null)
   }
 
   // ==========================================
@@ -2548,7 +2607,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       <!DOCTYPE html>
       <html>
         <head>
-          <title>Dactor Receipt - ${tx.trackingCode}</title>
+          <title>Dactor Receipt - ${escapeHtml(tx.trackingCode)}</title>
           <style>
             body { font-family: 'Plus Jakarta Sans', Arial, sans-serif; padding: 36px; color: #0f172a; }
             .box { max-width: 680px; margin: 0 auto; border: 2px solid #0284c7; border-radius: 16px; padding: 28px; }
@@ -2565,22 +2624,22 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           <div class="box">
             <div class="header">
               <div>
-                <h2 style="margin:0;font-size:22px;">${tx.clinicName}</h2>
+                <h2 style="margin:0;font-size:22px;">${escapeHtml(tx.clinicName)}</h2>
                 <p style="margin:4px 0 0;font-size:12px;color:#64748b;">Official Payment & Appointment Invoice</p>
               </div>
-              <span class="badge">${tx.paymentStatus}</span>
+              <span class="badge">${escapeHtml(tx.paymentStatus)}</span>
             </div>
             <div>
               <div style="font-size:11px;text-transform:uppercase;color:#64748b;font-weight:700;">10-Digit Universal Tracking Code</div>
-              <div class="code">${tx.trackingCode}</div>
+              <div class="code">${escapeHtml(tx.trackingCode)}</div>
             </div>
             <table>
-              <tr><th>Transaction ID</th><td><strong>${tx.transactionId}</strong></td></tr>
-              <tr><th>Patient Name</th><td><strong>${tx.patientName}</strong></td></tr>
-              <tr><th>Doctor / Service</th><td>${tx.doctorName}</td></tr>
-              <tr><th>Appointment Date & Time</th><td>${tx.appointmentDate} • ${tx.appointmentTime}</td></tr>
-              <tr><th>Payment Method</th><td>${tx.paymentMethod}</td></tr>
-              <tr><th>Total Amount</th><td class="total">NPR ${tx.amount}</td></tr>
+              <tr><th>Transaction ID</th><td><strong>${escapeHtml(tx.transactionId)}</strong></td></tr>
+              <tr><th>Patient Name</th><td><strong>${escapeHtml(tx.patientName)}</strong></td></tr>
+              <tr><th>Doctor / Service</th><td>${escapeHtml(tx.doctorName)}</td></tr>
+              <tr><th>Appointment Date & Time</th><td>${escapeHtml(tx.appointmentDate)} • ${escapeHtml(tx.appointmentTime)}</td></tr>
+              <tr><th>Payment Method</th><td>${escapeHtml(tx.paymentMethod)}</td></tr>
+              <tr><th>Total Amount</th><td class="total">NPR ${escapeHtml(tx.amount)}</td></tr>
             </table>
             <p style="margin-top:24px;font-size:11px;color:#64748b;text-align:center;">
               Synced from Cloud Billing Invoices • Dactor Healthcare Ecosystem
@@ -2603,20 +2662,22 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
     const inv = invoice || viewingInvoice
     const effectiveTotal = inv?.totalAmount && inv.totalAmount > 0 ? inv.totalAmount : (appt.feeAmount || 0)
-    const effectivePaid = inv ? inv.paidAmount : (appt.paymentStatus === 'paid' ? effectiveTotal : 0)
+    const effectivePaid = inv ? (inv.paidAmount ?? (inv.paymentStatus === 'paid' ? effectiveTotal : 0)) : (appt.paymentStatus === 'paid' ? effectiveTotal : 0)
     const effectiveBalance = Math.max(0, effectiveTotal - effectivePaid)
     const isPaid = effectiveBalance <= 0 && effectiveTotal > 0
 
     const paymentLogs = parsePaymentRecords(inv?.remarks, effectivePaid, inv?.paidAt)
     const cleanRemarks = extractCleanClinicalRemarks(inv?.remarks)
 
-    const rawItems = inv?.items && inv.items.length > 0 ? inv.items : []
+    const rawItems = (inv?.items && inv.items.length > 0 ? inv.items : []).filter(
+      (it: any) => !(it.itemName || it.name || it.item_name || '').toLowerCase().startsWith('payment received')
+    )
     const items = rawItems.length > 0
-      ? rawItems.map((it) => ({
-          name: it.itemName || it.name || 'Clinical Service',
+      ? rawItems.map((it: any) => ({
+          name: it.itemName || it.name || it.item_name || 'Clinical Service',
           quantity: it.quantity || 1,
-          price: it.price || 0,
-          total: it.total || (it.price * (it.quantity || 1)),
+          price: Number(it.price || 0),
+          total: Number(it.total || ((it.price || 0) * (it.quantity || 1))),
         }))
       : [
           {
@@ -2632,10 +2693,10 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         (it, idx) => `
         <tr>
           <td>${idx + 1}</td>
-          <td><strong>${it.name}</strong></td>
-          <td style="text-align:center;">${it.quantity}</td>
-          <td style="text-align:right;">Rs. ${it.price}</td>
-          <td style="text-align:right;font-weight:700;">Rs. ${it.total}</td>
+          <td><strong>${escapeHtml(it.name)}</strong></td>
+          <td style="text-align:center;">${escapeHtml(it.quantity)}</td>
+          <td style="text-align:right;">Rs. ${escapeHtml(it.price)}</td>
+          <td style="text-align:right;font-weight:700;">Rs. ${escapeHtml(it.total)}</td>
         </tr>`
       )
       .join('')
@@ -2657,9 +2718,9 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 .map(
                   (p) => `
                 <tr style="font-size:12px;border-bottom:1px solid #e2e8f0;">
-                  <td style="padding:6px;font-family:monospace;">${p.dateTime}</td>
-                  <td style="padding:6px;color:#475569;">${p.note || 'Payment Received'}</td>
-                  <td style="padding:6px;text-align:right;font-weight:700;color:#15803d;">Rs. ${p.amount}</td>
+                  <td style="padding:6px;font-family:monospace;">${escapeHtml(p.dateTime)}</td>
+                  <td style="padding:6px;color:#475569;">${escapeHtml(p.note || 'Payment Received')}</td>
+                  <td style="padding:6px;text-align:right;font-weight:700;color:#15803d;">Rs. ${escapeHtml(p.amount)}</td>
                 </tr>`
                 )
                 .join('')}
@@ -2672,7 +2733,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       ? `
         <div style="margin-top:14px;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:11px;">
           <strong style="color:#0f172a;">Doctor Clinical Remarks & Prescriptions:</strong>
-          <p style="margin:4px 0 0;color:#334155;white-space:pre-wrap;">${cleanRemarks}</p>
+          <p style="margin:4px 0 0;color:#334155;white-space:pre-wrap;">${escapeHtml(cleanRemarks)}</p>
         </div>`
       : ''
 
@@ -2680,7 +2741,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       <!DOCTYPE html>
       <html>
         <head>
-          <title>Dactor Official Bill - #${appt.trackingCode10Digit}</title>
+          <title>Dactor Official Bill - #${escapeHtml(appt.trackingCode10Digit)}</title>
           <style>
             body { font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif; padding: 28px; color: #0f172a; background: #fff; }
             .box { max-width: 680px; margin: 0 auto; border: 2px solid #0d9488; border-radius: 16px; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.06); }
@@ -2698,8 +2759,8 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
           <div class="box">
             <div class="header">
               <div>
-                <h2 style="margin:0;font-size:20px;color:#0f172a;">${clinicTitle}</h2>
-                <p style="margin:3px 0 0;font-size:12px;color:#64748b;">${clinicAddr}</p>
+                <h2 style="margin:0;font-size:20px;color:#0f172a;">${escapeHtml(clinicTitle)}</h2>
+                <p style="margin:3px 0 0;font-size:12px;color:#64748b;">${escapeHtml(clinicAddr)}</p>
                 <p style="margin:2px 0 0;font-size:11px;font-weight:700;color:#0d9488;">Official Medical Invoice & OPD Receipt</p>
               </div>
               <span class="badge">${isPaid ? 'PAID FULL' : (effectivePaid > 0 ? 'PARTIAL PAID' : 'PAYABLE AT CLINIC')}</span>
@@ -2707,16 +2768,16 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
             <div class="code-box">
               <div style="font-size:10px;text-transform:uppercase;color:#0f766e;font-weight:800;letter-spacing:1px;">10-Digit Live OPD Queue Token</div>
-              <div class="code">#${appt.trackingCode10Digit}</div>
+              <div class="code">#${escapeHtml(appt.trackingCode10Digit)}</div>
               <div style="font-size:11px;color:#475569;margin-top:2px;">Present this token at the reception desk for instant check-in</div>
             </div>
 
             <!-- Patient & Visit Details -->
             <table style="margin-bottom:16px;">
-              <tr><th style="width:30%;">Patient Name</th><td><strong>${appt.patientName}</strong> (${appt.patientAge || '–'} Yrs, ${appt.patientGender || '–'})</td></tr>
-              <tr><th>Attending Doctor</th><td>Dr. ${docTitle} (${docSpec})</td></tr>
-              <tr><th>Date & Time</th><td><strong>${appt.appointmentDate}</strong> • ${appt.appointmentTime}</td></tr>
-              <tr><th>Contact Phone</th><td><span style="font-family:monospace;">${appt.patientMobile || '–'}</span></td></tr>
+              <tr><th style="width:30%;">Patient Name</th><td><strong>${escapeHtml(appt.patientName)}</strong> (${escapeHtml(appt.patientAge || '–')} Yrs, ${escapeHtml(appt.patientGender || '–')})</td></tr>
+              <tr><th>Attending Doctor</th><td>Dr. ${escapeHtml(docTitle)} (${escapeHtml(docSpec)})</td></tr>
+              <tr><th>Date & Time</th><td><strong>${escapeHtml(appt.appointmentDate)}</strong> • ${escapeHtml(appt.appointmentTime)}</td></tr>
+              <tr><th>Contact Phone</th><td><span style="font-family:monospace;">${escapeHtml(appt.patientMobile || '–')}</span></td></tr>
             </table>
 
             <!-- Services & Procedures Table -->
@@ -2839,7 +2900,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 </h2>
                 <p className="text-xs text-rose-200 max-w-2xl leading-relaxed">
                   Your patient account is scheduled for permanent deletion on{' '}
-                  <strong>{patientUser.deletionScheduledAt?.split('T')[0] || '30 days from archive'}</strong>. You can restore full account access, health records, and booking history anytime before the countdown expires.
+                  <strong>{patientUser.deletionScheduledAt?.split('T')[0] || '30 days from archive'}</strong>. You can reactivate or reclaim your full account access, health records, and booking history anytime before the 30-day countdown expires.
                 </p>
               </div>
             </div>
@@ -2848,7 +2909,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
               onClick={handleCancelPatientArchive}
               className="w-full md:w-auto px-5 py-3 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white font-black rounded-2xl text-xs shadow-lg shadow-emerald-500/25 cursor-pointer shrink-0 transition active:scale-[0.98]"
             >
-              Cancel Deletion &amp; Restore Account
+              Reactivate / Reclaim Account
             </button>
           </div>
         )}
@@ -3145,6 +3206,8 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                           className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider border ${
                             appt.paymentMode === 'PAY_AT_DESK' && appt.status === 'WAITING_FOR_APPROVAL'
                               ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/30'
+                              : appt.status === 'pending_payment'
+                              ? 'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30'
                               : appt.paymentMode === 'PAY_AT_DESK' && appt.status === 'UNAPPROVED'
                               ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30'
                               : appt.paymentMode === 'PAY_AT_DESK' && appt.status === 'EXPIRED'
@@ -3160,6 +3223,8 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                         >
                           {appt.paymentMode === 'PAY_AT_DESK' && appt.status === 'WAITING_FOR_APPROVAL'
                             ? 'Waiting Approval'
+                            : appt.status === 'pending_payment'
+                            ? 'Payment Pending'
                             : appt.paymentMode === 'PAY_AT_DESK' && appt.status === 'UNAPPROVED'
                             ? 'Unapproved'
                             : appt.paymentMode === 'PAY_AT_DESK' && appt.status === 'EXPIRED'
@@ -4929,82 +4994,165 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                   </div>
                 ) : (
                   <>
-                    {/* Select Payment Method */}
-                    <div className="space-y-3">
-                      <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
-                        Select Digital Payment Method
-                      </label>
-                      <div className="grid grid-cols-2 gap-3">
-                        {[
-                          { id: 'esewa', name: 'eSewa Wallet', color: 'bg-brand-500' },
-                          { id: 'khalti', name: 'Khalti Digital', color: 'bg-purple-600' },
-                          { id: 'fonepay', name: 'Fonepay QR', color: 'bg-rose-500' },
-                          { id: 'cash', name: 'Pay at Clinic', color: 'bg-slate-700' },
-                        ].map((pm) => (
-                          <button
-                            key={pm.id}
-                            type="button"
-                            onClick={() => setSelectedPaymentMethod(pm.id as any)}
-                            className={`p-4 rounded-2xl border text-left transition flex items-center space-x-3 cursor-pointer ${
-                              selectedPaymentMethod === pm.id
-                                ? 'border-brand-600 bg-brand-50/50 ring-2 ring-brand-500/20'
-                                : 'border-slate-200 bg-white hover:border-slate-300'
-                            }`}
-                          >
-                            <div className={`w-3.5 h-3.5 rounded-full ${pm.color}`} />
-                            <div>
-                              <div className="text-xs font-bold text-slate-900">{pm.name}</div>
-                              <div className="text-[10px] text-slate-400">Instant verification</div>
+                    {/* Select Payment Method (Strictly filtered to clinic-verified gateways + always-available Pay at Desk) */}
+                    {(() => {
+                      const isDirect = selectedClinic?.isDirectPaymentEnabled === true
+                      const verifiedOnlineOptions = [
+                        ...(isDirect && clinicPaymentConfig?.esewa?.enabled && clinicPaymentConfig?.esewa?.is_verified
+                          ? [{ id: 'esewa', name: 'eSewa Wallet', sub: 'Instant eSewa Checkout', color: 'bg-brand-500', merchantCode: clinicPaymentConfig.esewa.merchantCode || '' }]
+                          : []),
+                        ...(isDirect && clinicPaymentConfig?.khalti?.enabled && clinicPaymentConfig?.khalti?.is_verified
+                          ? [{ id: 'khalti', name: 'Khalti Digital', sub: 'Wallet & Mobile Banking', color: 'bg-purple-600', merchantCode: clinicPaymentConfig.khalti.merchantCode || '' }]
+                          : []),
+                        ...(isDirect && clinicPaymentConfig?.fonepay?.enabled && clinicPaymentConfig?.fonepay?.is_verified
+                          ? [{ id: 'fonepay', name: 'Fonepay QR', sub: 'Interbank QR & Banking', color: 'bg-rose-500', merchantCode: clinicPaymentConfig.fonepay.merchantCode || '' }]
+                          : []),
+                        ...(isDirect && clinicPaymentConfig?.connectips?.enabled && clinicPaymentConfig?.connectips?.is_verified
+                          ? [{ id: 'connectips', name: 'ConnectIPS', sub: 'NCHL Direct Bank Transfer', color: 'bg-indigo-600', merchantCode: clinicPaymentConfig.connectips.merchantCode || '' }]
+                          : []),
+                      ]
+                      const allOptions = [
+                        ...verifiedOnlineOptions,
+                        { id: 'pay_at_desk', name: 'Pay at Desk (+5%)', sub: 'Pay at clinic counter', color: 'bg-slate-700', merchantCode: '' },
+                      ]
+                      const activeOnline = verifiedOnlineOptions.find((o) => o.id === selectedPaymentMethod)
+                      const serviceChargeAmt = Number((calculatedFee * (PAY_AT_DESK_SERVICE_CHARGE_PERCENT / 100)).toFixed(2))
+                      const totalAtDesk = Number((calculatedFee + serviceChargeAmt).toFixed(2))
+
+                      return (
+                        <>
+                          <div className="space-y-3">
+                            <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider">
+                              Select Payment Method
+                            </label>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              {allOptions.map((pm) => (
+                                <button
+                                  key={pm.id}
+                                  type="button"
+                                  onClick={() => setSelectedPaymentMethod(pm.id as any)}
+                                  className={`p-3.5 rounded-2xl border text-left transition flex items-center justify-between cursor-pointer ${
+                                    selectedPaymentMethod === pm.id
+                                      ? 'border-teal-600 bg-teal-50/60 ring-2 ring-teal-500/20 shadow-sm'
+                                      : 'border-slate-200 bg-white hover:border-slate-300'
+                                  }`}
+                                >
+                                  <div className="flex items-center space-x-3 min-w-0 flex-1">
+                                    {pm.id === 'esewa' ? (
+                                      <div className="w-10 h-10 rounded-xl bg-[#60BB46] shrink-0 flex items-center justify-center shadow-xs">
+                                        <span className="text-white font-black text-xl italic select-none" style={{ fontFamily: 'system-ui, sans-serif', lineHeight: 1 }}>e</span>
+                                      </div>
+                                    ) : pm.id === 'khalti' ? (
+                                      <div className="w-10 h-10 rounded-xl bg-[#5D2E8E] shrink-0 flex items-center justify-center shadow-xs">
+                                        <span className="text-white font-black text-lg select-none" style={{ fontFamily: 'system-ui, sans-serif', lineHeight: 1 }}>K</span>
+                                      </div>
+                                    ) : pm.id === 'fonepay' ? (
+                                      <div className="w-10 h-10 rounded-xl bg-[#C8102E] shrink-0 flex items-center justify-center shadow-xs text-white">
+                                        <QrCode className="w-5 h-5 stroke-[2.2]" />
+                                      </div>
+                                    ) : pm.id === 'connectips' ? (
+                                      <div className="w-10 h-10 rounded-xl bg-[#0B3B60] shrink-0 flex items-center justify-center shadow-xs text-white relative overflow-hidden">
+                                        <Building2 className="w-5 h-5 stroke-[2.2]" />
+                                        <span className="absolute bottom-1 right-1 w-1.5 h-1.5 rounded-full bg-[#E31B23]"></span>
+                                      </div>
+                                    ) : (
+                                      <div className="w-10 h-10 rounded-xl bg-amber-500 shrink-0 flex items-center justify-center shadow-xs text-white">
+                                        <Store className="w-5 h-5 stroke-[2.2]" />
+                                      </div>
+                                    )}
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center space-x-1.5 flex-wrap">
+                                        <div className="text-xs font-bold text-slate-900 truncate">{pm.name}</div>
+                                        <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${
+                                          pm.id === 'pay_at_desk'
+                                            ? 'bg-amber-500/15 text-amber-700'
+                                            : 'bg-emerald-500/15 text-emerald-700'
+                                        }`}>
+                                          {pm.id === 'pay_at_desk' ? '+5% Fee' : '0% Fee'}
+                                        </span>
+                                      </div>
+                                      <div className="text-[10px] text-slate-500 truncate mt-0.5">{pm.sub}</div>
+                                    </div>
+                                  </div>
+                                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ml-2 shrink-0 ${
+                                    selectedPaymentMethod === pm.id
+                                      ? 'border-teal-600 bg-teal-600'
+                                      : 'border-slate-300'
+                                  }`}>
+                                    {selectedPaymentMethod === pm.id && (
+                                      <div className="w-1.5 h-1.5 rounded-full bg-white" />
+                                    )}
+                                  </div>
+                                </button>
+                              ))}
                             </div>
-                          </button>
-                        ))}
-                      </div>
 
-                      {/* Real Gateway Credential display from clinic config */}
-                      <div className="p-4 bg-slate-100 rounded-xl text-xs space-y-1 text-slate-600">
-                        <div className="font-semibold text-slate-800">
-                          Merchant Account: {selectedClinic?.name}
-                        </div>
-                        <div>
-                          Gateway ID:{' '}
-                          <code className="font-mono text-slate-800 bg-white px-1.5 py-0.5 rounded">
-                            {clinicPaymentConfig?.esewa?.merchantCode || 'EPAYTEST'}
-                          </code>
-                        </div>
-                      </div>
-                    </div>
+                            {/* Only display gateway merchant details if a verified online gateway is selected */}
+                            {activeOnline ? (
+                              <div className="p-4 bg-slate-100 rounded-xl text-xs space-y-1 text-slate-600">
+                                <div className="font-semibold text-slate-800">
+                                  Merchant Account: {selectedClinic?.name}
+                                </div>
+                                {activeOnline.merchantCode && (
+                                  <div>
+                                    Verified Gateway ID:{' '}
+                                    <code className="font-mono text-slate-800 bg-white px-1.5 py-0.5 rounded">
+                                      {activeOnline.merchantCode}
+                                    </code>
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 space-y-2 text-xs text-amber-900">
+                                <div className="font-bold">
+                                  A {PAY_AT_DESK_SERVICE_CHARGE_PERCENT}% service charge applies when paying at the clinic desk
+                                </div>
+                                <div className="flex justify-between text-slate-700">
+                                  <span>Consultation / Lab Fee:</span>
+                                  <span className="font-semibold">NPR {calculatedFee}</span>
+                                </div>
+                                <div className="flex justify-between text-slate-700">
+                                  <span>{PAY_AT_DESK_SERVICE_CHARGE_PERCENT}% Service Charge:</span>
+                                  <span className="font-semibold">NPR {serviceChargeAmt}</span>
+                                </div>
+                                <div className="border-t border-amber-200 pt-1.5 flex justify-between font-black text-slate-900">
+                                  <span>Total Payable at Desk:</span>
+                                  <span className="text-brand-700">NPR {totalAtDesk}</span>
+                                </div>
+                              </div>
+                            )}
+                          </div>
 
-                    {/* ACTION BUTTONS (With double-click prevention) */}
-                    <div className="space-y-3 pt-2">
-                      {/* Standard Pay & Confirm Button */}
-                      <button
-                        type="button"
-                        disabled={isPaymentProcessing || isVerifyingEsewa}
-                        onClick={() => handleExecutePayment(false)}
-                        className="w-full py-3.5 bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl shadow-md shadow-brand-600/20 transition flex items-center justify-center space-x-2 cursor-pointer"
-                      >
-                        <ShieldCheck className="w-4 h-4" />
-                        <span>
-                          {isPaymentProcessing || isVerifyingEsewa
-                            ? 'Processing Payment...'
-                            : selectedPaymentMethod === 'esewa'
-                            ? `Pay NPR ${calculatedFee} via eSewa (Secure Checkout)`
-                            : selectedPaymentMethod === 'cash'
-                            ? `Confirm & Pay NPR ${calculatedFee} at Reception`
-                            : `Pay NPR ${calculatedFee} via ${selectedPaymentMethod.toUpperCase()} & Book`}
-                        </span>
-                      </button>
+                          {/* ACTION BUTTONS (With double-click prevention) */}
+                          <div className="space-y-3 pt-2">
+                            <button
+                              type="button"
+                              disabled={isPaymentProcessing || isVerifyingEsewa}
+                              onClick={() => handleExecutePayment(false)}
+                              className="w-full py-3.5 bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white font-bold text-sm rounded-xl shadow-md shadow-brand-600/20 transition flex items-center justify-center space-x-2 cursor-pointer"
+                            >
+                              <ShieldCheck className="w-4 h-4" />
+                              <span>
+                                {isPaymentProcessing || isVerifyingEsewa
+                                  ? 'Processing Payment...'
+                                  : selectedPaymentMethod === 'pay_at_desk' || selectedPaymentMethod === 'cash'
+                                  ? `Confirm Pay at Desk (NPR ${totalAtDesk})`
+                                  : `Pay NPR ${calculatedFee} via ${activeOnline?.name || selectedPaymentMethod.toUpperCase()} (Secure Checkout)`}
+                              </span>
+                            </button>
 
-                      {/* Cancel Transaction Button */}
-                      <button
-                        type="button"
-                        onClick={() => handleCancelPaymentSession('User clicked cancel button')}
-                        disabled={isPaymentProcessing}
-                        className="w-full py-2.5 text-xs font-bold text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition cursor-pointer"
-                      >
-                        Cancel Transaction & Choose Different Slot
-                      </button>
-                    </div>
+                            <button
+                              type="button"
+                              onClick={() => handleCancelPaymentSession('User clicked cancel button')}
+                              disabled={isPaymentProcessing}
+                              className="w-full py-2.5 text-xs font-bold text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition cursor-pointer"
+                            >
+                              Cancel Transaction & Choose Different Slot
+                            </button>
+                          </div>
+                        </>
+                      )
+                    })()}
                   </>
                 )}
               </div>
@@ -5444,11 +5592,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                         {filteredLabReports.map((rep) => {
                           const isUnlocked =
                             unlockedReportIds.includes(rep.id) ||
-                            Boolean(
-                              patientUser?.fullName &&
-                                rep.patientName &&
-                                rep.patientName.toLowerCase().includes(patientUser.fullName.toLowerCase())
-                            )
+                            Boolean(unlockedReportUrls[rep.id])
 
                           return (
                             <div
@@ -5502,36 +5646,25 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                                 <span className="text-[11px] text-slate-400 font-mono">
                                   {rep.uploadedAt?.split('T')[0] || 'Recent'}
                                 </span>
-                                {rep.reportFileUrl ? (
-                                  isUnlocked ? (
-                                    <a
-                                      href={rep.reportFileUrl}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 text-white rounded-xl text-xs font-bold transition shadow-xs active:scale-95"
-                                    >
-                                      <Download className="w-3.5 h-3.5" />
-                                      <span>Download PDF</span>
-                                    </a>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setVerifyingReport(rep)
-                                        setVerifyMethod('name')
-                                        setVerificationInput('')
-                                        setVerificationError(null)
-                                      }}
-                                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-900 dark:bg-slate-800 hover:bg-teal-600 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer active:scale-95"
-                                    >
-                                      <Lock className="w-3.5 h-3.5 text-amber-300" />
-                                      <span>Unlock & Download</span>
-                                    </button>
-                                  )
+                                {unlockedReportUrls[rep.id] ? (
+                                  <a
+                                    href={unlockedReportUrls[rep.id]}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-gradient-to-r from-teal-500 to-cyan-500 hover:from-teal-600 hover:to-cyan-600 text-white rounded-xl text-xs font-bold transition shadow-xs active:scale-95"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                    <span>Download PDF</span>
+                                  </a>
                                 ) : (
-                                  <span className="text-xs text-amber-600 dark:text-amber-400 font-semibold">
-                                    Processing at Lab
-                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenOrUnlockReport(rep)}
+                                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-900 dark:bg-slate-800 hover:bg-teal-600 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer active:scale-95"
+                                  >
+                                    <Lock className="w-3.5 h-3.5 text-amber-300" />
+                                    <span>Unlock & Download</span>
+                                  </button>
                                 )}
                               </div>
                             </div>
@@ -6413,14 +6546,60 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                       </p>
                     </div>
 
+                    {/* Official Privacy Policy Card */}
+                    <div className="p-4 rounded-2xl bg-teal-500/10 border border-teal-500/20 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                      <div>
+                        <div className="font-bold text-teal-900 dark:text-teal-200">
+                          Official Patient &amp; Guardian Privacy Policy
+                        </div>
+                        <div className="text-[11px] text-slate-600 dark:text-slate-400">
+                          Statutory disclosure under Nepal Individual Privacy Act 2075 &amp; Google Play Store Health Apps Policies. Zero data selling guarantee.
+                        </div>
+                      </div>
+                      <a
+                        href="./privacy-patient.html"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-3.5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs whitespace-nowrap transition cursor-pointer self-start sm:self-center"
+                      >
+                        Read Policy &rarr;
+                      </a>
+                    </div>
+
+                    {/* Official Account Deletion & Data Erasure Portal URL (Google Play Compliant) */}
+                    <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                      <div>
+                        <div className="flex items-center gap-2 font-bold text-rose-900 dark:text-rose-200">
+                          <Trash2 className="w-4 h-4 text-rose-600 dark:text-rose-400" />
+                          <span>Official Account &amp; Data Deletion Portal URL</span>
+                        </div>
+                        <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-0.5">
+                          In compliance with Google Play Developer Policies and Nepal Individual Privacy Act 2075. Submit an instant or web-based erasure request.
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0 self-start sm:self-center">
+                        <a
+                          href="./data-deletion.html"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs whitespace-nowrap transition cursor-pointer shadow-xs"
+                          title="Open official Google Play compliant account deletion URL"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Account Deletion URL</span>
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      </div>
+                    </div>
+
                     {/* Account Deletion Control */}
                     <div className="p-5 rounded-2xl border border-rose-500/20 liquid-glass-subtle space-y-3">
                       <div>
                         <h4 className="text-sm font-bold text-slate-900 dark:text-white">
-                          Account Lifecycle & Deletion Grace Period
+                          Account Lifecycle &amp; 30-Day Reversible Archive Policy
                         </h4>
                         <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                          You may schedule your patient profile for permanent deletion. A 30-day grace period is provided during which you can restore full access at any time.
+                          When deletion is requested, your account is placed into a 30-day reversible archive. During these 30 days you can reactivate or reclaim your account anytime. After 30 days, personal data is permanently purged.
                         </p>
                       </div>
 
@@ -6431,14 +6610,14 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                             <span>Account Scheduled for Permanent Deletion</span>
                           </div>
                           <p className="text-[11px]">
-                            Scheduled deletion date: {patientUser.deletionScheduledAt?.split('T')[0] || 'In 30 days'}.
+                            Scheduled deletion date: {patientUser.deletionScheduledAt?.split('T')[0] || 'In 30 days'}. You can reactivate or reclaim your account before the 30-day countdown expires.
                           </p>
                           <button
                             type="button"
                             onClick={handleCancelPatientArchive}
                             className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer active:scale-95"
                           >
-                            Cancel Deletion & Restore Account
+                            Reactivate / Reclaim Account
                           </button>
                         </div>
                       ) : (
@@ -6448,7 +6627,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                             onClick={() => setShowDeleteConfirmModal(true)}
                             className="px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-800 dark:text-amber-300 rounded-xl text-xs font-bold border border-amber-500/30 transition cursor-pointer active:scale-95"
                           >
-                            Schedule 30-Day Account Deletion
+                            Schedule 30-Day Account Archive &amp; Deletion
                           </button>
                           <button
                             type="button"
@@ -6742,15 +6921,28 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 </a>
               </div>
 
-              <div className="pt-3 border-t border-white/40 dark:border-white/10 flex items-center justify-between">
+              <div className="pt-3 border-t border-white/40 dark:border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Account Settings</span>
-                <button
-                  type="button"
-                  onClick={() => setShowDeleteConfirmModal(true)}
-                  className="text-xs font-bold text-rose-600 dark:text-rose-400 hover:text-rose-700 hover:underline cursor-pointer"
-                >
-                  Schedule 30-Day Account Deletion
-                </button>
+                <div className="flex items-center gap-3">
+                  <a
+                    href="./data-deletion.html"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-xs font-bold text-rose-600 dark:text-rose-400 hover:underline cursor-pointer"
+                    title="Official Google Play compliant account & data deletion URL"
+                  >
+                    <span>Account Deletion URL</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                  <span className="text-slate-300 dark:text-slate-700">•</span>
+                  <button
+                    type="button"
+                    onClick={() => setShowDeleteConfirmModal(true)}
+                    className="text-xs font-bold text-slate-600 dark:text-slate-300 hover:text-rose-600 dark:hover:text-rose-400 hover:underline cursor-pointer"
+                  >
+                    Schedule 30-Day Account Archive &amp; Deletion
+                  </button>
+                </div>
               </div>
             </form>
           </div>
@@ -6807,7 +6999,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
               </button>
             </div>
 
-            <div className="pt-2 border-t border-white/40 dark:border-white/10">
+            <div className="pt-2 border-t border-white/40 dark:border-white/10 space-y-2">
               <button
                 type="button"
                 disabled={isDeletingPermanently}
@@ -6817,6 +7009,17 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 <Trash2 className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
                 <span>{isDeletingPermanently ? 'Deleting Profile...' : 'Permanent Delete (Immediate)'}</span>
               </button>
+              <div className="text-center pt-1">
+                <a
+                  href="./data-deletion.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-[11px] font-bold text-slate-500 dark:text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:underline"
+                >
+                  <span>Statutory Web Deletion Portal URL</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
             </div>
           </div>
         </div>
@@ -7050,48 +7253,15 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
               </div>
             )}
 
-            <div className="flex items-center space-x-2 liquid-glass-subtle p-1 rounded-xl text-xs font-bold">
-              <button
-                type="button"
-                onClick={() => {
-                  setVerifyMethod('name')
-                  setVerificationInput('')
-                  setVerificationError(null)
-                }}
-                className={`flex-1 py-1.5 rounded-lg transition cursor-pointer ${
-                  verifyMethod === 'name'
-                    ? 'bg-gradient-to-r from-brand-600 to-teal-500 text-white shadow-glass-brand'
-                    : 'text-slate-600 dark:text-slate-300 hover:bg-white/40'
-                }`}
-              >
-                Patient Name
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setVerifyMethod('phone')
-                  setVerificationInput('')
-                  setVerificationError(null)
-                }}
-                className={`flex-1 py-1.5 rounded-lg transition cursor-pointer ${
-                  verifyMethod === 'phone'
-                    ? 'bg-gradient-to-r from-brand-600 to-teal-500 text-white shadow-glass-brand'
-                    : 'text-slate-600 dark:text-slate-300 hover:bg-white/40'
-                }`}
-              >
-                Mobile Number
-              </button>
-            </div>
-
             <form onSubmit={handleExecuteReportVerification} className="space-y-4">
               <div className="space-y-1">
                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300">
-                  {verifyMethod === 'name' ? "Enter Patient's Full Name" : "Enter Patient's Mobile Number (10 digits)"}
+                  Enter Patient's Registered Mobile Number (10 digits)
                 </label>
                 <input
-                  type={verifyMethod === 'name' ? 'text' : 'tel'}
+                  type="tel"
                   required
-                  placeholder={verifyMethod === 'name' ? 'e.g. Ram Bahadur' : '98xxxxxxxx'}
+                  placeholder="98xxxxxxxx"
                   value={verificationInput}
                   onChange={(e) => setVerificationInput(e.target.value)}
                   className="w-full px-4 py-2.5 liquid-glass-input rounded-xl text-xs font-semibold text-slate-900 dark:text-white outline-none"
@@ -7111,9 +7281,10 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 py-3 bg-gradient-to-r from-brand-600 to-teal-500 hover:from-brand-500 hover:to-teal-400 text-white rounded-xl text-xs font-bold transition shadow-glass-brand border border-white/25 active:scale-[0.98] cursor-pointer"
+                  disabled={isVerifyingReport}
+                  className="flex-1 py-3 bg-gradient-to-r from-brand-600 to-teal-500 hover:from-brand-500 hover:to-teal-400 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition shadow-glass-brand border border-white/25 active:scale-[0.98] cursor-pointer"
                 >
-                  Verify & Unlock
+                  {isVerifyingReport ? 'Verifying with Server...' : 'Verify & Unlock'}
                 </button>
               </div>
             </form>
@@ -7259,7 +7430,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                     {viewingInvoice?.items && viewingInvoice.items.length > 0 ? (
                       viewingInvoice.items.map((it, idx) => (
                         <tr key={idx}>
-                          <td className="p-2 text-slate-800 dark:text-slate-100">{it.itemName || it.name}</td>
+                          <td className="p-2 text-slate-800 dark:text-slate-100">{it.itemName || it.name || (it as any).item_name || 'Clinical Service'}</td>
                           <td className="p-2 text-center font-mono text-slate-500">{it.quantity || 1}</td>
                           <td className="p-2 text-right font-mono text-slate-600 dark:text-slate-300">Rs. {it.price}</td>
                           <td className="p-2 text-right font-mono font-bold text-slate-900 dark:text-white">
@@ -7325,7 +7496,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                 ? viewingInvoice.totalAmount
                 : Number(viewingBillAppt.feeAmount || 0)
               const totalP = viewingInvoice
-                ? viewingInvoice.paidAmount
+                ? (viewingInvoice.paidAmount ?? (viewingInvoice.paymentStatus === 'paid' ? totalB : 0))
                 : (viewingBillAppt.paymentStatus === 'paid' ? totalB : 0)
               const bal = Math.max(0, totalB - totalP)
               const cleanRem = extractCleanClinicalRemarks(viewingInvoice?.remarks)
@@ -8126,12 +8297,11 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                       {detailLabReports.map((report) => {
                         const isUnlocked =
                           unlockedReportIds.includes(report.id) ||
-                          Boolean(
-                            patientUser?.fullName &&
-                              report.patientName &&
-                              report.patientName.toLowerCase().includes(patientUser.fullName.toLowerCase())
-                          )
-                        const isReady = report.status === 'delivered' || report.status === 'prepared' || Boolean(report.reportFileUrl || (report as any).fileUrl)
+                          Boolean(unlockedReportUrls[report.id])
+                        const isReady =
+                          report.status === 'delivered' ||
+                          report.status === 'prepared' ||
+                          Boolean(report.reportFileUrl || (report as any).fileUrl || unlockedReportUrls[report.id])
 
                         return (
                           <div
@@ -8147,10 +8317,10 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                               </p>
                             </div>
                             <div className="flex items-center space-x-2 shrink-0">
-                              {report.reportFileUrl || (report as any).fileUrl ? (
-                                isUnlocked ? (
+                              {isReady ? (
+                                isUnlocked && unlockedReportUrls[report.id] ? (
                                   <a
-                                    href={report.reportFileUrl || (report as any).fileUrl}
+                                    href={unlockedReportUrls[report.id]}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-xs font-bold transition flex items-center space-x-1 shadow-xs"
@@ -8161,12 +8331,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                                 ) : (
                                   <button
                                     type="button"
-                                    onClick={() => {
-                                      setVerifyingReport(report)
-                                      setVerifyMethod('name')
-                                      setVerificationInput('')
-                                      setVerificationError(null)
-                                    }}
+                                    onClick={() => handleOpenOrUnlockReport(report)}
                                     className="px-3 py-1.5 bg-slate-900 dark:bg-slate-700 hover:bg-purple-600 text-white rounded-lg text-xs font-bold transition flex items-center space-x-1 cursor-pointer"
                                   >
                                     <Lock className="w-3.5 h-3.5 text-amber-300" />
@@ -8237,8 +8402,8 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
                       </span>
                       {dInvoice.items.map((itm, i) => (
                         <div key={i} className="flex items-center justify-between text-xs">
-                          <span className="text-slate-700 dark:text-slate-300">{itm.itemName}</span>
-                          <span className="font-bold text-slate-900 dark:text-white">Rs. {itm.total}</span>
+                          <span className="text-slate-700 dark:text-slate-300">{itm.itemName || itm.name || (itm as any).item_name || 'Clinical Service'}</span>
+                          <span className="font-bold text-slate-900 dark:text-white">Rs. {itm.total || ((itm.price || 0) * (itm.quantity || 1))}</span>
                         </div>
                       ))}
                     </div>

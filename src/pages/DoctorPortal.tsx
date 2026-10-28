@@ -17,6 +17,7 @@ import {
   Sparkles,
   Phone,
   ShieldCheck,
+  Trash2,
   FileText,
   Send,
   MessageSquare,
@@ -36,6 +37,9 @@ import {
   LifeBuoy,
   Receipt,
   CreditCard,
+  Plus,
+  FlaskConical,
+  Lock,
 } from 'lucide-react'
 import {
   Doctor,
@@ -57,6 +61,8 @@ import {
   respondToDoctorInvitation,
   createDoctor,
   updateDoctor,
+  scheduleDoctorArchive,
+  cancelDoctorArchive,
   uploadClinicDocument,
   getMedicalSpecialties,
   getMedicalQualifications,
@@ -70,7 +76,13 @@ import { compressImage } from '../utils/imageCompressor'
 import { extractCleanClinicalRemarks } from '../utils/paymentLedger'
 import { playChimeSound } from '../utils/audioChime'
 import { supabase } from '../lib/supabase'
-import { signInWithFirebaseGoogle, signOutFirebase } from '../lib/firebase'
+import {
+  signInWithFirebaseGoogle,
+  signOutFirebase,
+  checkRedirectGoogleUser,
+  onFirebaseAuthStateChanged,
+} from '../lib/firebase'
+import dactorLogo from '../assets/logo.svg'
 
 interface DoctorPortalProps {
   onLogout?: () => void
@@ -194,19 +206,83 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   const [invitationClinics, setInvitationClinics] = useState<Record<string, Clinic>>({})
   const [respondingInviteId, setRespondingInviteId] = useState<string | null>(null)
 
+  // Doctor 30-Day Reversible Archive & Reclaim State
+  const [showDoctorArchiveModal, setShowDoctorArchiveModal] = useState(false)
+  const [archivingDoctor, setArchivingDoctor] = useState(false)
+
+  const doctorArchiveDaysLeft = useMemo(() => {
+    if (!currentDoctor?.deletionScheduledAt) return 30
+    try {
+      const scheduled = new Date(currentDoctor.deletionScheduledAt).getTime()
+      const now = Date.now()
+      const diff = Math.ceil((scheduled - now) / (1000 * 60 * 60 * 24))
+      return Math.max(0, diff)
+    } catch {
+      return 30
+    }
+  }, [currentDoctor?.deletionScheduledAt])
+
+  const handleScheduleDoctorArchive = async () => {
+    if (!currentDoctor) return
+    setArchivingDoctor(true)
+    try {
+      const ok = await scheduleDoctorArchive(currentDoctor.id)
+      if (ok) {
+        const updated: Doctor = {
+          ...currentDoctor,
+          isArchived: true,
+          deletionScheduledAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          archivedAt: new Date().toISOString(),
+        }
+        setCurrentDoctor(updated)
+        saveDoctorSession(updated)
+        setShowDoctorArchiveModal(false)
+        alert('Doctor account has been archived. You have 30 days to reactivate or reclaim your account before permanent deletion.')
+      } else {
+        alert('Could not schedule account archive. Please try again.')
+      }
+    } catch {
+      alert('Error scheduling account archive.')
+    } finally {
+      setArchivingDoctor(false)
+    }
+  }
+
+  const handleCancelDoctorArchive = async () => {
+    if (!currentDoctor) return
+    try {
+      const ok = await cancelDoctorArchive(currentDoctor.id)
+      if (ok) {
+        const updated: Doctor = {
+          ...currentDoctor,
+          isArchived: false,
+          deletionScheduledAt: undefined,
+          archivedAt: undefined,
+        }
+        setCurrentDoctor(updated)
+        saveDoctorSession(updated)
+        alert('Welcome back! Your doctor account has been reactivated and reclaimed successfully.')
+      } else {
+        alert('Could not reactivate account. Please try again.')
+      }
+    } catch {
+      alert('Error reactivating account.')
+    }
+  }
+
   // ==========================================
-  // REGISTRATION & KYC FORM FIELDS
+  // REGISTRATION & KYC FORM FIELDS (Parity with ClinicLoginScreen.kt)
   // ==========================================
+  const [regPractitionerRole, setRegPractitionerRole] = useState<'doctor' | 'lab_technician'>('doctor')
   const [regName, setRegName] = useState('')
   const [regGender, setRegGender] = useState('Male')
   const [regAge, setRegAge] = useState('')
-  const [regStartingYear, setRegStartingYear] = useState<number>(2020)
+  const [regStartingYear, setRegStartingYear] = useState<number>(() => new Date().getFullYear())
   const [regSpecialty, setRegSpecialty] = useState('General Physician')
-  const [regEducation, setRegEducation] = useState('MBBS, MD')
+  const [regEducations, setRegEducations] = useState<string[]>(['MBBS'])
   const [regNmc, setRegNmc] = useState('')
   const [regPersonalPhone, setRegPersonalPhone] = useState('')
   const [regPublicPhone, setRegPublicPhone] = useState('')
-  const [regFee, setRegFee] = useState(500)
   const [regDesc, setRegDesc] = useState('')
   const [regPhotoFile, setRegPhotoFile] = useState<File | null>(null)
   const [regLicenseFile, setRegLicenseFile] = useState<File | null>(null)
@@ -216,23 +292,84 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   const [submittingReg, setSubmittingReg] = useState(false)
   const [regStatusMsg, setRegStatusMsg] = useState<string | null>(null)
 
+  // Lab technician taxonomy fallbacks (Parity with ClinicLoginScreen.kt)
+  const labSpecializations = useMemo(
+    () => [
+      'MRI Specialist & Radiographer',
+      'CT Scan Specialist & Technologist',
+      'Digital X-Ray Technologist',
+      'Ultrasound (USG) Sonographer',
+      'Medical Lab Technician (MLT)',
+      'Histopathology & Cytology Technician',
+      'Clinical Biochemistry & Hematology',
+      'Microbiology & Immunology Lab Tech',
+    ],
+    []
+  )
+
+  const labTechnicianEducations = useMemo(
+    () => [
+      'CMLT (Certificate in Medical Lab Technology)',
+      'DMLT (Diploma in Medical Lab Technology)',
+      'BMLT / B.Sc. MLT (Bachelor in Medical Lab Technology)',
+      'M.Sc. MLT / Clinical Biochemistry',
+      'M.Sc. Medical Microbiology',
+      'Certified Phlebotomy & Lab Technician',
+    ],
+    []
+  )
+
+  const doctorDefaultEducations = useMemo(
+    () => [
+      'MBBS',
+      'MBBS, MD',
+      'MBBS, MS',
+      'MD - Internal Medicine',
+      'MS - General Surgery',
+      'MD - Pediatrics',
+      'MS - Orthopedics',
+      'MD - Dermatology',
+      'MD - Obstetrics & Gynecology',
+      'BDS',
+      'BDS, MDS',
+      'BAMS',
+      'BHMS',
+      'BPT / MPT (Physiotherapy)',
+    ],
+    []
+  )
+
+  // Practicing years list from current year down to 1960 (Parity with ClinicLoginScreen.kt)
+  const practicingYears = useMemo(() => {
+    const curr = new Date().getFullYear()
+    const list: number[] = []
+    for (let y = curr; y >= 1960; y--) {
+      list.push(y)
+    }
+    return list
+  }, [])
+
   // Taxonomies
   const [specialtiesList, setSpecialtiesList] = useState<MedicalSpecialty[]>([])
   const [qualificationsList, setQualificationsList] = useState<MedicalQualification[]>([])
-  const [allClinics, setAllClinics] = useState<Clinic[]>([])
 
   // Load initial taxonomies and existing session
   useEffect(() => {
     async function init() {
       try {
-        const [specs, quals, cls] = await Promise.all([
+        const [specs, quals] = await Promise.all([
           getMedicalSpecialties(),
           getMedicalQualifications(),
-          getClinics(),
         ])
         setSpecialtiesList(specs)
         setQualificationsList(quals)
-        setAllClinics(cls)
+
+        // Check if returning from Google OAuth redirect
+        const redirected = await checkRedirectGoogleUser()
+        if (redirected && redirected.email) {
+          await processDoctorLoginForEmail(redirected.email)
+          return
+        }
 
         // If saved doctor session exists, reload fresh doctor record
         const savedDocRaw = localStorage.getItem('dactor_doctor_session')
@@ -342,21 +479,14 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
     } catch {}
   }
 
-  // Pure Google Sign-In with Role Exclusivity Check
-  const handleGoogleSignIn = async () => {
+  // Process Login & Verification for Doctor Email
+  const processDoctorLoginForEmail = async (email: string) => {
+    const trimmedEmail = email.trim().toLowerCase()
     setFirebaseLoading(true)
     setAuthError(null)
+    setVerifiedEmail(trimmedEmail)
 
     try {
-      await signOutFirebase().catch(() => {})
-      const googleUser = await signInWithFirebaseGoogle()
-      if (!googleUser || !googleUser.email) {
-        throw new Error('Google sign-in did not return user credentials.')
-      }
-
-      const trimmedEmail = googleUser.email.trim().toLowerCase()
-      setVerifiedEmail(trimmedEmail)
-
       // 1. Enforce strict single-account exclusivity
       const assoc = await checkEmailPortalAssociation(trimmedEmail)
       if (assoc && assoc.portal !== 'doctor') {
@@ -395,8 +525,39 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
         }
       } else {
         // Unregistered doctor -> open KYC registration form
-        setRegName(googleUser.displayName ? `Dr. ${googleUser.displayName.replace(/^Dr\.?\s*/i, '')}` : '')
         setCurrentView('register_form')
+      }
+    } catch (err: any) {
+      console.error('Error verifying doctor account:', err)
+      setAuthError(err.message || 'Error communicating with database')
+    } finally {
+      setFirebaseLoading(false)
+    }
+  }
+
+  // Reactive listener for Firebase auth state changes
+  useEffect(() => {
+    let isMounted = true
+    const unsub = onFirebaseAuthStateChanged((u) => {
+      if (isMounted && u && u.email && !currentDoctor && currentView === 'auth_screen') {
+        processDoctorLoginForEmail(u.email)
+      }
+    })
+    return () => {
+      isMounted = false
+      if (typeof unsub === 'function') unsub()
+    }
+  }, [currentDoctor, currentView])
+
+  // Pure Google Sign-In with Role Exclusivity Check
+  const handleGoogleSignIn = async () => {
+    setFirebaseLoading(true)
+    setAuthError(null)
+
+    try {
+      const googleUser = await signInWithFirebaseGoogle('doctor')
+      if (googleUser && googleUser.email) {
+        await processDoctorLoginForEmail(googleUser.email)
       }
     } catch (err: any) {
       console.warn('Doctor Google sign-in notice:', err)
@@ -450,21 +611,36 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
     }
   }
 
-  // Submit Doctor Registration Form
+  // Submit Doctor / Practitioner Registration Form (Parity with ClinicLoginScreen.kt)
   const handleSubmitRegistration = async (e: React.FormEvent) => {
     e.preventDefault()
     const errors: { [key: string]: string } = {}
 
-    if (regName.trim().length < 3) errors.name = 'Full name must be at least 3 characters.'
+    if (regName.trim().length < 2) errors.name = 'Full name must be at least 2 characters.'
     const parsedAge = parseInt(regAge, 10)
     if (isNaN(parsedAge) || parsedAge < 20 || parsedAge > 100) errors.age = 'Age must be between 20 and 100.'
-    if (regNmc.trim().length < 3) errors.nmc = 'Nepal Medical Council (NMC) license number is required.'
+    if (regNmc.trim().length < 3) {
+      errors.nmc =
+        regPractitionerRole === 'lab_technician'
+          ? 'NHPC / Lab Council license ID is required (at least 3 characters).'
+          : 'Nepal Medical Council (NMC) license number is required.'
+    }
+    if (regEducations.length === 0) {
+      errors.education = 'Please select at least one qualification / degree.'
+    }
     const cleanPersonal = regPersonalPhone.replace(/\D/g, '')
     if (cleanPersonal.length !== 10 || !cleanPersonal.startsWith('9')) {
       errors.personalPhone = 'Personal mobile must be a valid 10-digit number starting with 9.'
     }
+    const cleanPublic = regPublicPhone.replace(/\D/g, '')
+    if (cleanPublic && (cleanPublic.length !== 10 || !cleanPublic.startsWith('9'))) {
+      errors.publicPhone = 'Public mobile must be a valid 10-digit number starting with 9.'
+    }
     if (!regTermsAccepted) {
-      errors.terms = 'You must accept the NMC Code of Ethics & Telehealth terms.'
+      errors.terms =
+        regPractitionerRole === 'lab_technician'
+          ? 'You must accept the NHPC Code of Ethics & Privacy standards.'
+          : 'You must accept the NMC Code of Ethics & Telehealth terms.'
     }
 
     if (Object.keys(errors).length > 0) {
@@ -500,24 +676,31 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
           undefined
       }
 
-      const cleanPublic = regPublicPhone.replace(/\D/g, '')
+      const formattedName =
+        regPractitionerRole === 'doctor'
+          ? regName.trim().startsWith('Dr.')
+            ? regName.trim()
+            : `Dr. ${regName.trim()}`
+          : regName.trim()
 
       const payload: Partial<Doctor> = {
-        fullName: regName.trim().startsWith('Dr.') ? regName.trim() : `Dr. ${regName.trim()}`,
+        fullName: formattedName,
         email: verifiedEmail.trim(),
         gender: regGender,
         age: parsedAge,
         startingPracticingYear: regStartingYear,
         specialty: regSpecialty,
         specialties: [regSpecialty],
-        education: regEducation,
+        education: regEducations.join(', '),
         nmcLicenseNumber: regNmc.trim(),
         personalMobileNumber: cleanPersonal,
         publicMobileNumber: cleanPublic || undefined,
-        clinicId: undefined,
+        clinicId: undefined, // Strictly null: independent practitioner registration
         activeClinicId: undefined,
-        consultationFee: regFee || 500,
+        consultationFee: 500,
         description: regDesc.trim() || undefined,
+        practitionerRole: regPractitionerRole,
+        isLabTechnician: regPractitionerRole === 'lab_technician',
         profilePictureUrl: photoUrl,
         licenseDocUrl,
         certificatesDocUrl,
@@ -554,7 +737,8 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
     const nextState = !isInCabin
     setUpdatingPresence(true)
     try {
-      const ok = await updateDoctorPresence(currentDoctor.id, nextState)
+      const effectiveClinicId = selectedClinic?.id || currentDoctor.activeClinicId || currentDoctor.clinicId
+      const ok = await updateDoctorPresence(currentDoctor.id, nextState, effectiveClinicId)
       if (ok) {
         setIsInCabin(nextState)
         setCurrentDoctor({ ...currentDoctor, isInClinic: nextState })
@@ -678,10 +862,18 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
     try {
       const ok = await respondToDoctorInvitation(invite.id, accept, currentDoctor.id, invite.clinicId)
       if (ok) {
+        if (accept) {
+          alert('✓ Clinic affiliation invitation accepted! You can now publish OPD slots and consult patients for this clinic.')
+        } else {
+          alert('Invitation declined.')
+        }
         await loadDoctorClinicsAndAppointments(currentDoctor)
+      } else {
+        alert('Could not update invitation. Please try again.')
       }
     } catch (err) {
       console.error('Error responding to invitation:', err)
+      alert('Error updating invitation.')
     } finally {
       setRespondingInviteId(null)
     }
@@ -805,7 +997,17 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   // Queue Analytics
   const todayDateStr = new Date().toISOString().split('T')[0]
   const todayAppointments = useMemo(() => {
-    const list = appointments.filter((a) => a.appointmentDate === todayDateStr)
+    const list = appointments.filter((a) => {
+      if (a.appointmentDate !== todayDateStr) return false
+      const st = (a.status || '').toUpperCase()
+      return (
+        st === 'APPROVED' &&
+        a.status !== 'WAITING_FOR_APPROVAL' &&
+        a.status !== 'pending_payment' &&
+        a.status !== 'UNAPPROVED' &&
+        a.status !== 'EXPIRED'
+      )
+    })
     return [...list].sort((a, b) => {
       const aInside = a.checkinStatus === 'in_consultation' || a.checkinStatus === 'inside' ? 0 : 1
       const bInside = b.checkinStatus === 'in_consultation' || b.checkinStatus === 'inside' ? 0 : 1
@@ -829,11 +1031,22 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
     [todayAppointments]
   )
   const futureAppointments = useMemo(
-    () => appointments.filter((a) => a.appointmentDate === selectedFutureDate),
+    () =>
+      appointments.filter((a) => {
+        if (a.appointmentDate !== selectedFutureDate) return false
+        const st = (a.status || '').toUpperCase()
+        return (
+          st === 'APPROVED' &&
+          a.status !== 'WAITING_FOR_APPROVAL' &&
+          a.status !== 'pending_payment' &&
+          a.status !== 'UNAPPROVED' &&
+          a.status !== 'EXPIRED'
+        )
+      }),
     [appointments, selectedFutureDate]
   )
 
-  // Grouped patients for patient directory
+  // Grouped patients for patient directory (Strictly APPROVED appointments only)
   const doctorPatientsList = useMemo(() => {
     const map = new Map<string, {
       patientName: string
@@ -848,8 +1061,21 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
       allVisits: Appointment[]
     }>()
 
-    appointments.forEach((a) => {
-      const key = (a.patientMobile?.trim() || a.patientName?.trim() || a.id).toLowerCase()
+    const approvedAppts = appointments.filter((a) => {
+      const st = (a.status || '').toUpperCase()
+      return (
+        st === 'APPROVED' &&
+        a.status !== 'WAITING_FOR_APPROVAL' &&
+        a.status !== 'pending_payment' &&
+        a.status !== 'UNAPPROVED' &&
+        a.status !== 'EXPIRED'
+      )
+    })
+
+    approvedAppts.forEach((a) => {
+      const cleanMobile = (a.patientMobile || '').replace(/\D/g, '')
+      const cleanName = (a.patientName || '').trim().toLowerCase()
+      const key = cleanMobile.length >= 7 ? cleanMobile : (cleanName || a.id)
       const existing = map.get(key)
       if (existing) {
         existing.totalVisits += 1
@@ -924,9 +1150,11 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
           <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-cyan-400/50 to-transparent" />
 
           {/* Brand Icon */}
-          <div className="w-16 h-16 rounded-3xl bg-teal-500/10 dark:bg-teal-400/10 text-teal-600 dark:text-teal-400 flex items-center justify-center mx-auto shadow-inner border border-teal-500/20">
-            <Stethoscope className="w-8 h-8 stroke-[2.5]" />
-          </div>
+          <img
+            src={dactorLogo}
+            alt="Dactor Logo"
+            className="w-16 h-16 rounded-3xl object-contain mx-auto shadow-xl shadow-teal-500/20 bg-white/95 p-1.5 border border-white/60"
+          />
 
           <div className="space-y-1.5">
             <span className="text-xs font-bold uppercase tracking-wider text-teal-600 dark:text-teal-400">
@@ -1136,10 +1364,12 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               Step 2 of 2: Medical Accreditation
             </span>
             <h2 className="text-2xl sm:text-3xl font-black text-slate-900 dark:text-white">
-              Doctor Registration & NMC KYC Form
+              {regPractitionerRole === 'lab_technician'
+                ? 'Lab Technician / Pathologist Registration & KYC'
+                : 'Doctor Registration & NMC KYC Form'}
             </h2>
             <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-              Submit your medical qualifications and NMC registration number. Verified doctors receive full desk access and high trust rating on patient discovery cards.
+              Submit your medical qualifications and licensing credentials. All practitioners register independently without clinic affiliations; partner clinics can invite you via your verified email.
             </p>
           </div>
 
@@ -1164,54 +1394,130 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
           )}
 
           <form onSubmit={handleSubmitRegistration} className="space-y-6 text-left">
+            {/* Practitioner Role Switcher (Parity with ClinicLoginScreen.kt) */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
+                Select Practitioner Role *
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRegPractitionerRole('doctor')
+                    if (
+                      regEducations.length === 0 ||
+                      regEducations.some((e) => e.includes('MLT') || e.includes('CMLT'))
+                    ) {
+                      setRegEducations(['MBBS'])
+                    }
+                    if (labSpecializations.includes(regSpecialty)) {
+                      setRegSpecialty(specialtiesList[0]?.name || 'General Physician')
+                    }
+                  }}
+                  className={`py-3 px-4 rounded-2xl text-xs font-black border transition-all cursor-pointer flex items-center justify-center space-x-2 ${
+                    regPractitionerRole === 'doctor'
+                      ? 'bg-gradient-to-r from-teal-500 to-cyan-500 text-white border-teal-400 shadow-md shadow-teal-500/25'
+                      : 'liquid-glass-card text-slate-700 dark:text-slate-300 hover:bg-white/80 dark:hover:bg-slate-800/80 border-white/40 dark:border-white/10'
+                  }`}
+                >
+                  <Stethoscope className="w-4 h-4" />
+                  <span>Medical Doctor</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRegPractitionerRole('lab_technician')
+                    if (regEducations.length === 0 || regEducations.includes('MBBS')) {
+                      setRegEducations(['BMLT / B.Sc. MLT (Bachelor in Medical Lab Technology)'])
+                    }
+                    if (!labSpecializations.includes(regSpecialty)) {
+                      setRegSpecialty('Medical Lab Technician (MLT)')
+                    }
+                  }}
+                  className={`py-3 px-4 rounded-2xl text-xs font-black border transition-all cursor-pointer flex items-center justify-center space-x-2 ${
+                    regPractitionerRole === 'lab_technician'
+                      ? 'bg-gradient-to-r from-teal-500 to-cyan-500 text-white border-teal-400 shadow-md shadow-teal-500/25'
+                      : 'liquid-glass-card text-slate-700 dark:text-slate-300 hover:bg-white/80 dark:hover:bg-slate-800/80 border-white/40 dark:border-white/10'
+                  }`}
+                >
+                  <FlaskConical className="w-4 h-4" />
+                  <span>Lab Technician / Pathologist</span>
+                </button>
+              </div>
+            </div>
+
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
-                  Doctor Full Name (with Dr. prefix) *
+                  {regPractitionerRole === 'doctor'
+                    ? 'Doctor Full Name (with Dr. prefix) *'
+                    : 'Practitioner Full Name *'}
                 </label>
                 <input
                   type="text"
                   value={regName}
                   onChange={(e) => setRegName(e.target.value)}
-                  placeholder="e.g. Dr. Anubhav Sharma"
+                  placeholder={
+                    regPractitionerRole === 'doctor'
+                      ? 'e.g. Dr. Anubhav Sharma'
+                      : 'e.g. Bikram Shrestha'
+                  }
                   className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white"
                 />
-                {regErrors.name && <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.name}</p>}
+                {regErrors.name && (
+                  <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.name}</p>
+                )}
               </div>
 
               <div>
                 <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
-                  NMC License Registration Number *
+                  {regPractitionerRole === 'lab_technician'
+                    ? 'NHPC / Lab Council License ID *'
+                    : 'NMC License Registration Number *'}
                 </label>
                 <input
                   type="text"
                   value={regNmc}
                   onChange={(e) => setRegNmc(e.target.value)}
-                  placeholder="e.g. 18452-MED"
+                  placeholder={
+                    regPractitionerRole === 'lab_technician' ? 'e.g. NHPC-A-4520' : 'e.g. 18452-MED'
+                  }
                   className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white font-mono"
                 />
-                {regErrors.nmc && <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.nmc}</p>}
+                {regErrors.nmc && (
+                  <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.nmc}</p>
+                )}
               </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div>
-                <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">Medical Specialty *</label>
+                <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                  {regPractitionerRole === 'lab_technician' ? 'Lab Specialization *' : 'Medical Specialty *'}
+                </label>
                 <select
                   value={regSpecialty}
                   onChange={(e) => setRegSpecialty(e.target.value)}
                   className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white bg-white/70 dark:bg-slate-900/80"
                 >
-                  {specialtiesList.map((s) => (
-                    <option key={s.id} value={s.name} className="dark:bg-slate-900 text-slate-900 dark:text-white">
-                      {s.name}
-                    </option>
-                  ))}
-                  {specialtiesList.length === 0 && (
+                  {regPractitionerRole === 'lab_technician' ? (
+                    labSpecializations.map((spec) => (
+                      <option key={spec} value={spec} className="dark:bg-slate-900 text-slate-900 dark:text-white">
+                        {spec}
+                      </option>
+                    ))
+                  ) : specialtiesList.length > 0 ? (
+                    specialtiesList.map((s) => (
+                      <option key={s.id} value={s.name} className="dark:bg-slate-900 text-slate-900 dark:text-white">
+                        {s.name}
+                      </option>
+                    ))
+                  ) : (
                     <>
                       <option value="General Physician" className="text-slate-900">General Physician & Internal Medicine</option>
                       <option value="Cardiology (Heart Care)" className="text-slate-900">Cardiology (Heart Specialist)</option>
-                      <option value="Dermatology & Skin Care" className="text-slate-900">Dermatology & Venereology (Skin, Hair & Cosmetology)</option>
+                      <option value="Dermatology & Skin Care" className="text-slate-900">Dermatology & Venereology (Skin & Hair)</option>
                       <option value="Pediatrics & Child Health" className="text-slate-900">Pediatrics & Neonatology (Child Specialist)</option>
                       <option value="Orthopedics & Joint Care" className="text-slate-900">Orthopedics & Joint Replacement (Bone & Spine)</option>
                       <option value="Gynecology & Obstetrics" className="text-slate-900">Gynecology & Obstetrics (Women's Health)</option>
@@ -1219,58 +1525,14 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                       <option value="ENT (Ear, Nose & Throat)" className="text-slate-900">ENT (Ear, Nose & Throat Specialist)</option>
                       <option value="Dental Surgery & Orthodontics" className="text-slate-900">Dental Surgery & Oral Health</option>
                       <option value="Neurology & Neurosurgery" className="text-slate-900">Neurology & Neurosurgery (Brain & Nerve)</option>
-                      <option value="Gastroenterology & Hepatology" className="text-slate-900">Gastroenterology (Stomach, Liver & Digestion)</option>
+                      <option value="Gastroenterology & Hepatology" className="text-slate-900">Gastroenterology (Stomach & Liver)</option>
                       <option value="Pulmonology (Chest & Lungs)" className="text-slate-900">Pulmonology & Respiratory Medicine</option>
-                      <option value="Nephrology & Urology" className="text-slate-900">Nephrology & Urology (Kidney & Urinary)</option>
                       <option value="Psychiatry & Behavioral Health" className="text-slate-900">Psychiatry & Mental Health</option>
-                      <option value="Diagnostic Radiology (MRI, CT, USG, X-Ray)" className="text-slate-900">Diagnostic Radiology (MRI, CT Scan, Ultrasound, X-Ray)</option>
-                      <option value="Clinical Pathology & Lab Medicine" className="text-slate-900">Clinical Pathology & Diagnostic Laboratory Medicine</option>
-                      <option value="Endocrinology & Diabetology" className="text-slate-900">Endocrinology & Diabetes Specialist</option>
-                      <option value="General & Laparoscopic Surgery" className="text-slate-900">General & Laparoscopic Surgery</option>
-                      <option value="Physiotherapy & Rehabilitation" className="text-slate-900">Physiotherapy & Physical Rehabilitation</option>
-                      <option value="Oncology (Cancer Care)" className="text-slate-900">Oncology (Cancer Specialist)</option>
                     </>
                   )}
                 </select>
               </div>
 
-              <div>
-                <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">Qualification / Degree *</label>
-                <select
-                  value={regEducation}
-                  onChange={(e) => setRegEducation(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white bg-white/70 dark:bg-slate-900/80"
-                >
-                  {qualificationsList.map((q) => (
-                    <option key={q.id} value={q.degreeName} className="dark:bg-slate-900 text-slate-900 dark:text-white">
-                      {q.degreeName} ({q.fullTitle})
-                    </option>
-                  ))}
-                  {qualificationsList.length === 0 && (
-                    <>
-                      <option value="MBBS" className="dark:bg-slate-900 text-slate-900 dark:text-white">MBBS</option>
-                      <option value="MBBS, MD" className="dark:bg-slate-900 text-slate-900 dark:text-white">MBBS, MD</option>
-                      <option value="MS - General Surgery" className="dark:bg-slate-900 text-slate-900 dark:text-white">MS - General Surgery</option>
-                      <option value="BDS" className="dark:bg-slate-900 text-slate-900 dark:text-white">BDS</option>
-                    </>
-                  )}
-                </select>
-              </div>
-
-              <div>
-                <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">Practicing Since Year</label>
-                <input
-                  type="number"
-                  min="1970"
-                  max={new Date().getFullYear()}
-                  value={regStartingYear}
-                  onChange={(e) => setRegStartingYear(parseInt(e.target.value, 10))}
-                  className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div>
                 <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">Gender *</label>
                 <select
@@ -1288,6 +1550,8 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                 <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">Age *</label>
                 <input
                   type="number"
+                  min="20"
+                  max="100"
                   value={regAge}
                   onChange={(e) => setRegAge(e.target.value)}
                   placeholder="e.g. 36"
@@ -1295,16 +1559,111 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                 />
                 {regErrors.age && <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.age}</p>}
               </div>
+            </div>
 
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
-                <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">Standard OPD Fee (NPR)</label>
-                <input
-                  type="number"
-                  value={regFee}
-                  onChange={(e) => setRegFee(parseInt(e.target.value, 10) || 500)}
-                  placeholder="500"
-                  className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white"
-                />
+                <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                  Practicing Since Year *
+                </label>
+                <select
+                  value={regStartingYear}
+                  onChange={(e) => setRegStartingYear(parseInt(e.target.value, 10))}
+                  className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white bg-white/70 dark:bg-slate-900/80"
+                >
+                  {practicingYears.map((yr) => {
+                    const exp = new Date().getFullYear() - yr
+                    return (
+                      <option key={yr} value={yr} className="dark:bg-slate-900 text-slate-900 dark:text-white">
+                        {yr} {exp > 0 ? `(${exp} Yrs Experience)` : '(Starting Practice)'}
+                      </option>
+                    )
+                  })}
+                </select>
+              </div>
+
+              {/* COUNT OF QUALIFICATION / DEGREE SECTION */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                    {regPractitionerRole === 'lab_technician'
+                      ? 'Qualifications & Degrees'
+                      : 'Medical Degrees & Qualifications *'}
+                  </label>
+                  <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-teal-500/15 text-teal-800 dark:text-teal-300 border border-teal-500/30">
+                    {regEducations.length} Selected
+                  </span>
+                </div>
+
+                {/* Selected Qualifications Badges */}
+                {regEducations.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 py-1">
+                    {regEducations.map((deg) => (
+                      <span
+                        key={deg}
+                        className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-xl bg-teal-500/15 border border-teal-500/30 text-teal-900 dark:text-teal-200 text-[11px] font-bold"
+                      >
+                        <span>{deg}</span>
+                        {regEducations.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => setRegEducations(regEducations.filter((d) => d !== deg))}
+                            className="hover:text-rose-500 cursor-pointer ml-1"
+                            title="Remove degree"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Dropdown to add more degrees with count indicator */}
+                <div className="flex items-center space-x-2">
+                  <select
+                    onChange={(e) => {
+                      const val = e.target.value
+                      if (val && !regEducations.includes(val)) {
+                        setRegEducations([...regEducations, val])
+                      }
+                      e.target.value = ''
+                    }}
+                    defaultValue=""
+                    className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white bg-white/70 dark:bg-slate-900/80"
+                  >
+                    <option value="" disabled>
+                      + Add Degree / Qualification ({regPractitionerRole === 'lab_technician' ? labTechnicianEducations.length : (qualificationsList.length || doctorDefaultEducations.length)} Available)
+                    </option>
+                    {regPractitionerRole === 'lab_technician'
+                      ? labTechnicianEducations.map((qual) => (
+                          <option
+                            key={qual}
+                            value={qual}
+                            disabled={regEducations.includes(qual)}
+                            className="dark:bg-slate-900 text-slate-900 dark:text-white"
+                          >
+                            {regEducations.includes(qual) ? `✓ ${qual}` : qual}
+                          </option>
+                        ))
+                      : (qualificationsList.length > 0
+                          ? qualificationsList.map((q) => q.degreeName)
+                          : doctorDefaultEducations
+                        ).map((deg) => (
+                          <option
+                            key={deg}
+                            value={deg}
+                            disabled={regEducations.includes(deg)}
+                            className="dark:bg-slate-900 text-slate-900 dark:text-white"
+                          >
+                            {regEducations.includes(deg) ? `✓ ${deg}` : deg}
+                          </option>
+                        ))}
+                  </select>
+                </div>
+                {regErrors.education && (
+                  <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.education}</p>
+                )}
               </div>
             </div>
 
@@ -1325,17 +1684,34 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                 )}
               </div>
 
-              <div className="p-3.5 rounded-2xl liquid-glass-subtle border border-teal-500/20 bg-teal-500/5 dark:bg-teal-900/10 flex items-start space-x-3">
-                <Building2 className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0 mt-0.5" />
-                <div className="text-xs space-y-0.5">
-                  <p className="font-bold text-slate-800 dark:text-slate-200">
-                    Independent Practitioner Registration
-                  </p>
-                  <p className="text-[11px] text-slate-600 dark:text-slate-400">
-                    All practitioners register as independent doctors without automatic clinic affiliations. Partner clinics can invite you to their OPD roster using your email, and you can accept or decline invitations anytime in your Consultation Desk.
-                  </p>
-                </div>
+              <div>
+                <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                  Public Mobile Number (For Patients)
+                </label>
+                <input
+                  type="tel"
+                  value={regPublicPhone}
+                  onChange={(e) => setRegPublicPhone(e.target.value)}
+                  placeholder="98XXXXXXXX (10 digits, optional)"
+                  className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white"
+                />
+                {regErrors.publicPhone && (
+                  <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.publicPhone}</p>
+                )}
               </div>
+            </div>
+
+            <div>
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                Practitioner Bio & Clinical Experience (Optional)
+              </label>
+              <textarea
+                rows={2}
+                value={regDesc}
+                onChange={(e) => setRegDesc(e.target.value)}
+                placeholder="Years of clinical practice, hospital attachments, special procedures..."
+                className="w-full px-3.5 py-2.5 rounded-xl liquid-glass-input text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-teal-500 text-slate-900 dark:text-white resize-none"
+              />
             </div>
 
             {/* Document Uploads */}
@@ -1343,7 +1719,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               <div className="p-4 rounded-2xl liquid-glass-subtle border border-white/40 dark:border-white/10 space-y-2">
                 <label className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center space-x-1.5">
                   <Camera className="w-4 h-4 text-teal-600 dark:text-teal-400" />
-                  <span>Doctor Profile Picture (Optional)</span>
+                  <span>Profile Photo (Optional)</span>
                 </label>
                 <input
                   type="file"
@@ -1356,7 +1732,11 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               <div className="p-4 rounded-2xl liquid-glass-subtle border border-white/40 dark:border-white/10 space-y-2">
                 <label className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center space-x-1.5">
                   <Award className="w-4 h-4 text-teal-600 dark:text-teal-400" />
-                  <span>NMC Certificate / Photo *</span>
+                  <span>
+                    {regPractitionerRole === 'lab_technician'
+                      ? 'NHPC Certificate / Photo *'
+                      : 'NMC Certificate / Photo *'}
+                  </span>
                 </label>
                 <input
                   type="file"
@@ -1369,7 +1749,11 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               <div className="p-4 rounded-2xl liquid-glass-subtle border border-white/40 dark:border-white/10 space-y-2">
                 <label className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center space-x-1.5">
                   <FileText className="w-4 h-4 text-teal-600 dark:text-teal-400" />
-                  <span>Degree Certificate (MBBS/MD)</span>
+                  <span>
+                    {regPractitionerRole === 'lab_technician'
+                      ? 'Lab Degree / Diploma Certificate'
+                      : 'Degree Certificate (MBBS / MD / MS)'}
+                  </span>
                 </label>
                 <input
                   type="file"
@@ -1390,10 +1774,24 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                   className="mt-0.5 rounded text-teal-600 focus:ring-teal-500"
                 />
                 <span>
-                  I declare under penalty of law that I am an actively registered medical practitioner with the Nepal Medical Council (NMC) and agree to Dactor's ethical code and live OPD privacy standards.
+                  {regPractitionerRole === 'lab_technician'
+                    ? "I declare under penalty of law that I am an actively registered laboratory practitioner with the Nepal Health Professional Council (NHPC) and agree to Dactor's ethical code and live diagnostic standards."
+                    : "I declare under penalty of law that I am an actively registered medical practitioner with the Nepal Medical Council (NMC) and agree to Dactor's ethical code and live OPD privacy standards."}
                 </span>
               </label>
-              {regErrors.terms && <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.terms}</p>}
+              <div className="pl-6 pt-1">
+                <a
+                  href="./privacy-clinic.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-teal-600 dark:text-teal-400 font-semibold hover:underline text-[11px] inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <span>Read Official Clinic &amp; Medical Provider Privacy Policy &rarr;</span>
+                </a>
+              </div>
+              {regErrors.terms && (
+                <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">{regErrors.terms}</p>
+              )}
             </div>
 
             {regStatusMsg && (
@@ -1431,6 +1829,42 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
   // ==========================================
   return (
     <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 py-5 sm:py-8 space-y-5 sm:space-y-6 pb-28 sm:pb-12">
+      {/* 30-DAY ARCHIVE LOCK BANNER */}
+      {currentDoctor?.isArchived && (
+        <div className="p-4 sm:p-6 rounded-2xl sm:rounded-3xl liquid-glass-elevated bg-rose-950/80 text-white border border-rose-500/40 shadow-xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4 relative overflow-hidden backdrop-blur-xl">
+          <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-rose-400/50 to-transparent" />
+          <div className="flex items-start space-x-3 sm:space-x-4">
+            <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-2xl bg-rose-600/80 flex items-center justify-center shrink-0 border border-rose-400/30">
+              <Lock className="w-5 h-5 sm:w-6 sm:h-6 text-white" />
+            </div>
+            <div className="space-y-1 text-left">
+              <div className="flex items-center space-x-2">
+                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-rose-500 text-white">
+                  30-Day Deletion Grace Period
+                </span>
+                <span className="text-xs font-mono font-bold text-rose-200">
+                  {doctorArchiveDaysLeft} Days Remaining
+                </span>
+              </div>
+              <h2 className="text-base sm:text-lg font-black">
+                Doctor Account Archived &amp; Hidden from Patient Search
+              </h2>
+              <p className="text-xs text-rose-200 max-w-2xl leading-relaxed">
+                Your doctor profile is scheduled for permanent deletion on{' '}
+                <strong>{currentDoctor.deletionScheduledAt?.split('T')[0] || 'in 30 days'}</strong>. You can reactivate or reclaim your account anytime before the countdown expires with full restoration of records.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleCancelDoctorArchive}
+            className="w-full md:w-auto px-5 py-3 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white font-black rounded-2xl text-xs shadow-lg shadow-emerald-500/25 cursor-pointer shrink-0 transition active:scale-[0.98]"
+          >
+            Reactivate / Reclaim Doctor Account
+          </button>
+        </div>
+      )}
+
       {/* Top Banner / Doctor Context Bar */}
       <div className="liquid-glass-elevated rounded-2xl sm:rounded-3xl border border-white/40 dark:border-white/10 p-4 sm:p-6 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4 relative overflow-hidden">
         {/* Top specular refraction sheen */}
@@ -1606,7 +2040,7 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
                     type="button"
                     disabled={isResponding}
                     onClick={() => handleRespondInvitation(inv, true)}
-                    className="px-4 py-2 rounded-xl bg-gradient-to-r from-blue-600 to-blue-700 hover:brightness-110 text-white font-bold text-xs shadow-sm transition-all cursor-pointer flex items-center space-x-1.5 disabled:opacity-50"
+                    className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:brightness-110 text-white font-bold text-xs shadow-md transition-all cursor-pointer flex items-center space-x-1.5 disabled:opacity-50"
                   >
                     <CheckCircle2 className="w-4 h-4" />
                     <span>{isResponding ? 'Accepting...' : 'Accept Invite'}</span>
@@ -2360,6 +2794,96 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               </div>
             </div>
           </div>
+
+          {/* Account Governance & 30-Day Reversible Archive / Deletion Option */}
+          <div className="liquid-glass-card rounded-3xl p-6 border border-rose-500/20 space-y-4 text-left mt-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-black text-slate-900 dark:text-white">
+                    Account Security &amp; 30-Day Reversible Deletion
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Request 30-day reversible account archive or access the statutory Google Play &amp; Nepal Privacy Act 2075 deletion portal.
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <a
+                  href="./data-deletion.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-rose-600 to-rose-500 hover:from-rose-500 hover:to-rose-400 text-white font-bold text-xs shadow-md shadow-rose-600/20 transition cursor-pointer"
+                  title="Official Google Play compliant account & data deletion portal URL"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>Account Deletion URL</span>
+                  <ExternalLink className="w-3.5 h-3.5 ml-1 opacity-80" />
+                </a>
+              </div>
+            </div>
+
+            {currentDoctor?.isArchived ? (
+              <div className="p-3.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-900 dark:text-amber-200 text-xs space-y-2">
+                <div className="flex items-center space-x-2 font-bold">
+                  <AlertTriangle className="w-4 h-4 text-amber-600" />
+                  <span>Doctor Account Archived &amp; Scheduled for Deletion</span>
+                </div>
+                <p className="text-[11px]">
+                  Deletion scheduled date: {currentDoctor.deletionScheduledAt?.split('T')[0] || 'In 30 days'}. You can reactivate or reclaim your account anytime during these 30 days before permanent erasure.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleCancelDoctorArchive}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer active:scale-95"
+                >
+                  Reactivate / Reclaim Doctor Account
+                </button>
+              </div>
+            ) : (
+              <div className="pt-3 border-t border-white/40 dark:border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="text-xs text-rose-700 dark:text-rose-400">
+                  <strong>30-Day Reversible Deletion Policy:</strong> Initiating deletion archives your doctor profile for 30 days. You can reactivate or reclaim your account anytime before the 30-day window expires.
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowDoctorArchiveModal(true)}
+                  className="px-4 py-2 bg-rose-600/10 hover:bg-rose-600/20 text-rose-700 dark:text-rose-300 rounded-xl text-xs font-bold border border-rose-500/30 transition cursor-pointer shrink-0"
+                >
+                  Schedule 30-Day Account Archive &amp; Deletion
+                </button>
+              </div>
+            )}
+
+            <div className="pt-3 border-t border-white/40 dark:border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                Submit an instant or web-based request to purge practitioner profile, NMC records, and credentials.
+              </span>
+              <div className="flex items-center gap-3 shrink-0">
+                <a
+                  href="./data-deletion.html#web-request"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-bold text-rose-600 dark:text-rose-400 hover:underline flex items-center gap-1"
+                >
+                  <span>Web Deletion Form</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+                <span className="text-slate-300 dark:text-slate-700">•</span>
+                <a
+                  href="./privacy-clinic.html"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-semibold text-slate-600 dark:text-slate-400 hover:underline"
+                >
+                  Doctor Privacy Policy
+                </a>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -2725,6 +3249,70 @@ export const DoctorPortal: React.FC<DoctorPortalProps> = ({ onLogout }) => {
               >
                 Close History
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: 30-DAY REVERSIBLE DOCTOR ACCOUNT ARCHIVE & DELETION */}
+      {showDoctorArchiveModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="liquid-glass-modal rounded-3xl max-w-md w-full p-6 shadow-2xl border border-white/40 dark:border-white/10 space-y-4 relative overflow-hidden">
+            <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-rose-400/50 to-transparent" />
+            <div className="flex items-center justify-between border-b border-white/20 dark:border-white/5 pb-3">
+              <div className="flex items-center space-x-2">
+                <Trash2 className="w-5 h-5 text-rose-600 dark:text-rose-400" />
+                <h3 className="text-base font-black text-slate-900 dark:text-white">
+                  Schedule Doctor Account Deletion?
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowDoctorArchiveModal(false)}
+                className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3.5 bg-rose-500/10 border border-rose-300/60 dark:border-rose-500/30 rounded-2xl text-xs text-rose-900 dark:text-rose-200 space-y-1.5 leading-relaxed text-left">
+              <p className="font-bold">What happens during the 30-day archive:</p>
+              <ul className="list-disc pl-4 space-y-1">
+                <li>Your doctor profile is placed into a <strong>30-day reversible archive</strong>.</li>
+                <li>Your profile is hidden from active patient OPD search.</li>
+                <li>You can <strong>Reactivate / Reclaim your account anytime</strong> during these 30 days with 1 click.</li>
+                <li>After 30 days of inactivity, account credentials and KYC data are permanently purged.</li>
+              </ul>
+            </div>
+
+            <div className="flex items-center space-x-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowDoctorArchiveModal(false)}
+                className="flex-1 py-2.5 liquid-glass-subtle hover:bg-white/70 dark:hover:bg-slate-800/70 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-bold border border-white/50 dark:border-white/10 transition cursor-pointer"
+              >
+                Keep Account Active
+              </button>
+              <button
+                type="button"
+                disabled={archivingDoctor}
+                onClick={handleScheduleDoctorArchive}
+                className="flex-1 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold shadow-sm transition active:scale-[0.98] cursor-pointer disabled:opacity-50"
+              >
+                {archivingDoctor ? 'Archiving...' : 'Schedule 30-Day Archive'}
+              </button>
+            </div>
+
+            <div className="pt-2 text-center border-t border-white/40 dark:border-white/10">
+              <a
+                href="./data-deletion.html"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-[11px] font-bold text-slate-500 dark:text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 hover:underline"
+              >
+                <span>Statutory Web Deletion Portal URL</span>
+                <ExternalLink className="w-3 h-3" />
+              </a>
             </div>
           </div>
         </div>
